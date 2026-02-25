@@ -19,6 +19,23 @@ use xenwooting::rgb::parse_hex_rgb;
 use xenwooting::rgb_worker::{spawn_rgb_worker, try_send_drop, RgbCmd, RgbKey};
 use xenwooting::wtn::Wtn;
 
+fn reserved_bar_led_loc(hid: &HIDCodes) -> Option<(u8, u8)> {
+    // Reserved/control bar is physical LED row 5.
+    // Best-effort ANSI bottom-row mapping.
+    let row = 5u8;
+    let col = match hid {
+        HIDCodes::LeftCtrl => 0,
+        HIDCodes::LeftAlt => 1,
+        HIDCodes::LeftMeta => 2,
+        HIDCodes::Space => 6,
+        HIDCodes::RightAlt => 10,
+        HIDCodes::ContextMenu => 12,
+        HIDCodes::RightCtrl => 13,
+        _ => return None,
+    };
+    Some((row, col))
+}
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn handle_signal(_sig: libc::c_int) {
@@ -287,6 +304,7 @@ fn main() -> Result<()> {
     let log_midi = args.iter().any(|a| a.starts_with("--log-midi"));
     let log_edges = args.iter().any(|a| a == "--log-edges");
     let log_poll = args.iter().any(|a| a == "--log-poll");
+    let log_led = args.iter().any(|a| a == "--log-led");
     let no_rgb = args.iter().any(|a| a == "--no-rgb");
     let no_aftertouch = args.iter().any(|a| a == "--no-aftertouch");
     if args.iter().any(|a| a == "--print-devices") {
@@ -308,6 +326,9 @@ fn main() -> Result<()> {
     }
     if log_poll {
         eprintln!("--log-poll enabled: printing raw SDK poll stats");
+    }
+    if log_led {
+        eprintln!("--log-led enabled: printing HID->LED mapping info");
     }
     if no_rgb {
         eprintln!("--no-rgb enabled: skipping RGB output");
@@ -661,6 +682,21 @@ fn main() -> Result<()> {
 
         if kind == "down" {
             if let Some(action) = actions_by_hid.get(&hid) {
+                // Flash action/control-bar keys to white on press.
+                if rgb_enabled {
+                    let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+                    if let Some((lr, lc)) = reserved_bar_led_loc(&hid) {
+                        try_send_drop(
+                            &rgb_tx,
+                            RgbCmd::SetKey(RgbKey {
+                                device_index: dev_idx,
+                                row: lr,
+                                col: lc,
+                                rgb: highlight_rgb,
+                            }),
+                        );
+                    }
+                }
                 match action.as_str() {
                     "layout_next" => {
                         layout_index = (layout_index + 1) % cfg.layouts.len();
@@ -700,6 +736,26 @@ fn main() -> Result<()> {
             }
         }
 
+        // Restore action/control-bar keys back to red on release.
+        if kind == "up" {
+            if actions_by_hid.contains_key(&hid) {
+                if rgb_enabled {
+                    let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+                    if let Some((lr, lc)) = reserved_bar_led_loc(&hid) {
+                        try_send_drop(
+                            &rgb_tx,
+                            RgbCmd::SetKey(RgbKey {
+                                device_index: dev_idx,
+                                row: lr,
+                                col: lc,
+                                rgb: (255, 0, 0),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+
         if let Some(loc) = hid_map.loc_for(hid.clone()) {
             let loc = mirror_cols_4x14(rotate_4x14(loc, rotation)?, bcfg.mirror_cols)?;
             let idx = (loc.midi_row as usize) * 14 + (loc.midi_col as usize);
@@ -734,6 +790,13 @@ fn main() -> Result<()> {
                             }),
                         );
                     }
+                    if log_led {
+                        let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+                        eprintln!(
+                            "led dev_idx={} hid={:?} lr={} lc={} (midi r={} c={} idx={})",
+                            dev_idx, hid, loc.led_row, loc.led_col, loc.midi_row, loc.midi_col, idx
+                        );
+                    }
                 } else if kind == "up" {
                     if log_midi {
                         let lay = &cfg.layouts[layout_index];
@@ -756,6 +819,13 @@ fn main() -> Result<()> {
                                 col: loc.led_col,
                                 rgb: cell.col_rgb,
                             }),
+                        );
+                    }
+                    if log_led {
+                        let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+                        eprintln!(
+                            "led dev_idx={} hid={:?} lr={} lc={} (midi r={} c={} idx={})",
+                            dev_idx, hid, loc.led_row, loc.led_col, loc.midi_row, loc.midi_col, idx
                         );
                     }
                 } else if kind == "update" {
