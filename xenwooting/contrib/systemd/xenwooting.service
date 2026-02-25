@@ -1,0 +1,26 @@
+[Unit]
+Description=XenWooting (Wooting -> WTN -> MTS-ESP + MIDI + RGB)
+After=local-fs.target
+Wants=local-fs.target
+
+# If MODEP is present, start before the audio host so clients see the master at boot.
+Before=modep-mod-ui.service
+Before=modep-mod-host.service
+
+# Avoid running multiple masters / conflicting consumers.
+Conflicts=tun.service
+Conflicts=wooting-analog-midi-headless.service
+
+[Service]
+Type=simple
+User=patch
+Group=patch
+WorkingDirectory=/home/patch/wooting-xen/xenwooting
+Environment=RUST_LOG=info
+
+ExecStart=/usr/local/bin/xenwooting
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

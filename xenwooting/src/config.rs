@@ -1,0 +1,167 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default = "default_midi_out_name")]
+    pub midi_out_name: String,
+
+    #[serde(default = "default_refresh_hz")]
+    pub refresh_hz: f32,
+
+    #[serde(default = "default_press_threshold")]
+    pub press_threshold: f32,
+
+    #[serde(default)]
+    pub boards: Vec<BoardConfig>,
+
+    #[serde(default)]
+    pub layouts: Vec<LayoutConfig>,
+
+    #[serde(default)]
+    pub actions: ActionBindings,
+
+    #[serde(default)]
+    pub rgb: RgbConfig,
+
+    #[serde(default)]
+    pub hid_overrides: Vec<HidOverride>,
+}
+
+fn default_midi_out_name() -> String {
+    "XenWooting".to_string()
+}
+
+fn default_refresh_hz() -> f32 {
+    250.0
+}
+
+fn default_press_threshold() -> f32 {
+    0.5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardConfig {
+    /// Wooting Analog device_id (u64), as string.
+    ///
+    /// TOML integers are signed (i64) and cannot represent the full u64 range, so we store it
+    /// as a string in config (e.g. "16353264950129218108").
+    pub device_id: Option<String>,
+
+    /// Which .wtn board section to use for this device, e.g. 0 or 1.
+    pub wtn_board: u8,
+
+    /// Rotation of the playable 4x14 grid in degrees. Supported: 0 or 180.
+    #[serde(default)]
+    pub rotation_deg: u16,
+
+    /// Mirror the playable 4x14 grid left-right for .wtn lookup.
+    /// This only affects the logical mapping (pitch/color), not the physical LED coordinates.
+    #[serde(default)]
+    pub mirror_cols: bool,
+
+    /// Meta-grid placement (MIDI-only logical space). Not used for .wtn lookup yet,
+    /// but carried for future expansion.
+    #[serde(default)]
+    pub meta_x: i32,
+    #[serde(default)]
+    pub meta_y: i32,
+}
+
+impl BoardConfig {
+    pub fn device_id_u64(&self) -> anyhow::Result<Option<u64>> {
+        let Some(s) = self.device_id.as_deref() else {
+            return Ok(None);
+        };
+        let id: u64 = s
+            .trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid device_id '{}': {}", s, e))?;
+        Ok(Some(id))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutConfig {
+    pub id: String,
+    pub name: String,
+    pub wtn_path: String,
+    pub edo_divisions: i32,
+    #[serde(default)]
+    pub pitch_offset: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActionBindings {
+    /// Map action name -> HID key name, e.g. "layout_next" -> "Fn".
+    #[serde(default)]
+    pub by_action: HashMap<String, String>,
+}
+
+impl ActionBindings {
+    pub fn default_with_sane_keys() -> Self {
+        let mut by_action = HashMap::new();
+        // NOTE: HIDCodes does not include a dedicated "Fn" key. On some layouts the physical
+        // key labeled Fn may present as another HID code (often RightAlt/RightMeta/etc.).
+        // Treat these as defaults only; override in config after you confirm what your device emits.
+        by_action.insert("layout_prev".to_string(), "RightCtrl".to_string());
+        by_action.insert("layout_next".to_string(), "RightAlt".to_string());
+        by_action.insert("octave_down".to_string(), "LeftAlt".to_string());
+        by_action.insert("octave_up".to_string(), "ContextMenu".to_string());
+        Self { by_action }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RgbConfig {
+    /// If true, xenwooting will attempt to drive Wooting RGB SDK.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Map wtn_board -> rgb_sdk_device_index (0-based). If missing, uses wtn_board as index.
+    ///
+    /// TOML table keys are strings, so we store keys as strings (e.g. "0" = 1).
+    #[serde(default)]
+    pub device_index_by_wtn_board: HashMap<String, u8>,
+
+    /// Highlight color for pressed keys.
+    #[serde(default = "default_highlight_hex")]
+    pub highlight_hex: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_highlight_hex() -> String {
+    "FFFFFF".to_string()
+}
+
+impl Default for RgbConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            device_index_by_wtn_board: HashMap::new(),
+            highlight_hex: default_highlight_hex(),
+        }
+    }
+}
+
+impl RgbConfig {
+    pub fn rgb_device_index_for_wtn_board(&self, wtn_board: u8) -> u8 {
+        let k = wtn_board.to_string();
+        self.device_index_by_wtn_board
+            .get(&k)
+            .copied()
+            .unwrap_or(wtn_board)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HidOverride {
+    pub hid: String,
+    pub midi_row: u8,
+    pub midi_col: u8,
+    pub led_row: u8,
+    pub led_col: u8,
+}

@@ -1,0 +1,20 @@
+[package]
+name = "xenwooting"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+alsa = "0.6"
+crossbeam-channel = "0.5"
+env_logger = "0.11"
+libc = "0.2"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+wooting-analog-wrapper = { git = "https://github.com/WootingKb/wooting-analog-sdk", branch = "develop", features = ["serdes"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
