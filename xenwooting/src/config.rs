@@ -25,7 +25,68 @@ pub struct Config {
     pub rgb: RgbConfig,
 
     #[serde(default)]
+    pub control_bar: ControlBarConfig,
+
+    #[serde(default)]
     pub hid_overrides: Vec<HidOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlBarConfig {
+    /// Physical LED row to treat as the reserved/control bar.
+    ///
+    /// NOTE: This is the device's LED matrix row index (0..5), not your desk orientation.
+    #[serde(default = "default_control_bar_row")]
+    pub row: u8,
+
+    /// Map HID key name -> LED column(s) (0..13) on the control bar.
+    ///
+    /// Accepts either a single integer or an array of integers in TOML:
+    /// - `Space = 7`
+    /// - `Space = [5, 6, 7, 8]`
+    #[serde(default)]
+    pub led_cols_by_hid: HashMap<String, OneOrManyU8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrManyU8 {
+    One(u8),
+    Many(Vec<u8>),
+}
+
+impl OneOrManyU8 {
+    pub fn as_vec(&self) -> Vec<u8> {
+        match self {
+            OneOrManyU8::One(v) => vec![*v],
+            OneOrManyU8::Many(vs) => vs.clone(),
+        }
+    }
+}
+
+fn default_control_bar_row() -> u8 {
+    5
+}
+
+impl Default for ControlBarConfig {
+    fn default() -> Self {
+        // Best-effort 60HE ANSI bottom-row guess.
+        // Users can (and should) override this per device if their LEDs are shifted.
+        let mut led_cols_by_hid = HashMap::new();
+        led_cols_by_hid.insert("LeftCtrl".to_string(), OneOrManyU8::One(0));
+        led_cols_by_hid.insert("LeftMeta".to_string(), OneOrManyU8::One(1));
+        led_cols_by_hid.insert("LeftAlt".to_string(), OneOrManyU8::One(2));
+        // Spacebar tends to span multiple LEDs.
+        led_cols_by_hid.insert("Space".to_string(), OneOrManyU8::Many(vec![4, 5, 6, 7, 8]));
+        led_cols_by_hid.insert("RightAlt".to_string(), OneOrManyU8::One(10));
+        // Common right-side positions on 60HE ANSI.
+        led_cols_by_hid.insert("ContextMenu".to_string(), OneOrManyU8::One(11));
+        led_cols_by_hid.insert("RightCtrl".to_string(), OneOrManyU8::One(12));
+        Self {
+            row: default_control_bar_row(),
+            led_cols_by_hid,
+        }
+    }
 }
 
 fn default_midi_out_name() -> String {

@@ -51,6 +51,9 @@ Edit `~/.config/xenwooting/config.toml`:
 - Set `boards[].device_id` to bind each keyboard deterministically.
 - Set `layouts[].wtn_path` to your `.wtn` files.
 - Fix any HID-to-matrix mistakes with `hid_overrides`.
+- If action-key LEDs flash on the wrong key (or not at all), adjust `control_bar.row` and `control_bar.led_cols_by_hid`.
+
+`control_bar.led_cols_by_hid` supports multi-LED keys (e.g. Spacebar) using an array of columns.
 
 ## Install As System Service
 
