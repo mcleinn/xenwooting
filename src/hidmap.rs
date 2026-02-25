@@ -116,30 +116,36 @@ impl HidMap {
         // Row 4 (physical RGB row 4) -> MIDI row 3
         let r_led = 4u8;
         let r_midi = 3u8;
-        let row4: &[(HIDCodes, u8)] = &[
-            (HIDCodes::LeftShift, 0),
-            (HIDCodes::Z, 1),
-            (HIDCodes::X, 2),
-            (HIDCodes::C, 3),
-            (HIDCodes::V, 4),
-            (HIDCodes::B, 5),
-            (HIDCodes::N, 6),
-            (HIDCodes::M, 7),
-            (HIDCodes::Comma, 8),
-            (HIDCodes::Period, 9),
-            (HIDCodes::Slash, 10),
-            (HIDCodes::RightShift, 11),
+        // Wide keys create holes in the LED grid columns. This is a best-effort ANSI guess.
+        let row4: &[(HIDCodes, u8, u8)] = &[
+            (HIDCodes::LeftShift, 0, 0),
+            (HIDCodes::Z, 1, 2),
+            (HIDCodes::X, 2, 3),
+            (HIDCodes::C, 3, 4),
+            (HIDCodes::V, 4, 5),
+            (HIDCodes::B, 5, 6),
+            (HIDCodes::N, 6, 7),
+            (HIDCodes::M, 7, 8),
+            (HIDCodes::Comma, 8, 9),
+            (HIDCodes::Period, 9, 10),
+            (HIDCodes::Slash, 10, 11),
+            (HIDCodes::RightShift, 11, 13),
         ];
-        for (hid, c) in row4 {
+        for (hid, midi_c, led_c) in row4 {
             m.insert(
                 hid.clone(),
                 KeyLoc {
                     midi_row: r_midi,
-                    midi_col: *c,
+                    midi_col: *midi_c,
                     led_row: r_led,
-                    led_col: *c,
+                    led_col: *led_c,
                 },
             );
+        }
+
+        // Wide Enter key tends to be the last LED column.
+        if let Some(loc) = m.get_mut(&HIDCodes::Enter) {
+            loc.led_col = 13;
         }
 
         Self { loc_by_hid: m }
