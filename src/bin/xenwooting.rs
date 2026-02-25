@@ -19,23 +19,6 @@ use xenwooting::rgb::parse_hex_rgb;
 use xenwooting::rgb_worker::{spawn_rgb_worker, try_send_drop, RgbCmd, RgbKey};
 use xenwooting::wtn::Wtn;
 
-fn reserved_bar_led_loc(hid: &HIDCodes) -> Option<(u8, u8)> {
-    // Reserved/control bar is physical LED row 5.
-    // Best-effort ANSI bottom-row mapping.
-    let row = 5u8;
-    let col = match hid {
-        HIDCodes::LeftCtrl => 0,
-        HIDCodes::LeftAlt => 1,
-        HIDCodes::LeftMeta => 2,
-        HIDCodes::Space => 6,
-        HIDCodes::RightAlt => 10,
-        HIDCodes::ContextMenu => 12,
-        HIDCodes::RightCtrl => 13,
-        _ => return None,
-    };
-    Some((row, col))
-}
-
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn handle_signal(_sig: libc::c_int) {
@@ -174,8 +157,9 @@ fn write_default_config(path: &Path) -> Result<()> {
         let mut out = String::new();
         for board in 0..=1u8 {
             out.push_str(&format!("[Board{}]\n", board));
+            let start_key = if board == 0 { 12u8 } else { 68u8 };
             for i in 0..56u8 {
-                let key = 60u8.saturating_add(i);
+                let key = start_key.saturating_add(i);
                 out.push_str(&format!("Key_{}={}\n", i, key));
                 out.push_str(&format!("Chan_{}=1\n", i));
                 out.push_str(&format!("Col_{}=303030\n", i));
@@ -211,6 +195,7 @@ fn write_default_config(path: &Path) -> Result<()> {
         layouts: vec![],
         actions: ActionBindings::default_with_sane_keys(),
         rgb: xenwooting::config::RgbConfig::default(),
+        control_bar: xenwooting::config::ControlBarConfig::default(),
         hid_overrides: vec![],
     };
 
@@ -368,6 +353,13 @@ fn main() -> Result<()> {
     for (action, hid_name) in cfg.actions.by_action.iter() {
         let hid = parse_hid_name(hid_name)?;
         actions_by_hid.insert(hid, action.clone());
+    }
+
+    let control_bar_row = cfg.control_bar.row;
+    let mut control_bar_cols_by_hid: HashMap<HIDCodes, Vec<u8>> = HashMap::new();
+    for (hid_name, cols) in cfg.control_bar.led_cols_by_hid.iter() {
+        let hid = parse_hid_name(hid_name)?;
+        control_bar_cols_by_hid.insert(hid, cols.as_vec());
     }
 
     let highlight_rgb = parse_hex_rgb(&cfg.rgb.highlight_hex).unwrap_or((255, 255, 255));
@@ -555,7 +547,7 @@ fn main() -> Result<()> {
         }
     });
 
-    let paint_base = |wtn: &Wtn| {
+    let paint_base = |wtn: &Wtn, paint_control_bar: bool| {
         if !rgb_enabled {
             return;
         }
@@ -600,19 +592,22 @@ fn main() -> Result<()> {
             }
             info!("Queued base LEDs for wtn_board {}", wtn_board);
 
-            // Paint reserved control bar (physical row 5) as red.
-            // This row is outside the MIDI meta-grid.
-            let red = (255u8, 0u8, 0u8);
-            for c in 0..14u8 {
-                try_send_drop(
-                    &rgb_tx,
-                    RgbCmd::SetKey(RgbKey {
-                        device_index: dev_idx,
-                        row: 5,
-                        col: c,
-                        rgb: red,
-                    }),
-                );
+            // Paint reserved control bar as red.
+            // Note: layout changes repaint the 4x14 grid only; we intentionally do NOT repaint
+            // the control bar during layout switching so action flashes are not overridden.
+            if paint_control_bar {
+                let red = (255u8, 0u8, 0u8);
+                for c in 0..14u8 {
+                    try_send_drop(
+                        &rgb_tx,
+                        RgbCmd::SetKey(RgbKey {
+                            device_index: dev_idx,
+                            row: control_bar_row,
+                            col: c,
+                            rgb: red,
+                        }),
+                    );
+                }
             }
         }
         if log_edges || log_poll || log_midi {
@@ -620,7 +615,7 @@ fn main() -> Result<()> {
         }
     };
 
-    paint_base(&wtn);
+    paint_base(&wtn, true);
 
     if log_edges || log_poll || log_midi {
         eprintln!("ready: waiting for key edges");
@@ -651,22 +646,57 @@ fn main() -> Result<()> {
             } => (device_id, hid, analog, "up"),
         };
 
+        let Some(bcfg) = board_by_device.get(&device_id) else {
+            continue;
+        };
+        let wtn_board = bcfg.wtn_board;
+        let rotation = bcfg.rotation_deg;
+
+        let is_control_bar = control_bar_cols_by_hid.contains_key(&hid);
+
+        // Compute debug LED coordinates (either from control bar mapping or hid_map).
+        let dev_idx_dbg = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+        let mut lrow_dbg: Option<u8> = None;
+        let mut lcol_dbg: Option<String> = None;
+        if is_control_bar {
+            if let Some(cs) = control_bar_cols_by_hid.get(&hid) {
+                lrow_dbg = Some(control_bar_row);
+                lcol_dbg = Some(
+                    cs.iter()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<String>>()
+                        .join(","),
+                );
+            }
+        } else if let Some(loc0) = hid_map.loc_for(hid.clone()) {
+            if let Ok(loc) =
+                rotate_4x14(loc0, rotation).and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
+            {
+                lrow_dbg = Some(loc.led_row);
+                lcol_dbg = Some(loc.led_col.to_string());
+            }
+        }
+
         if dump_hid || log_edges {
+            let (lr_s, lc_s) = match (lrow_dbg, lcol_dbg.as_deref()) {
+                (Some(lr), Some(lc)) => (lr.to_string(), lc.to_string()),
+                _ => ("<none>".to_string(), "<none>".to_string()),
+            };
             if kind == "down" {
                 println!(
-                    "DOWN device_id={} hid={:?} analog={:.3}",
-                    device_id, hid, analog
+                    "DOWN device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
+                    device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
                 );
             } else if kind == "up" {
                 println!(
-                    "UP   device_id={} hid={:?} analog={:.3}",
-                    device_id, hid, analog
+                    "UP   device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
+                    device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
                 );
             } else if log_edges {
                 // keep updates quiet unless explicitly requested
                 println!(
-                    "UPD  device_id={} hid={:?} analog={:.3}",
-                    device_id, hid, analog
+                    "UPD  device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
+                    device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
                 );
             }
             if dump_hid {
@@ -674,29 +704,40 @@ fn main() -> Result<()> {
             }
         }
 
-        let Some(bcfg) = board_by_device.get(&device_id) else {
-            continue;
-        };
-        let wtn_board = bcfg.wtn_board;
-        let rotation = bcfg.rotation_deg;
-
-        if kind == "down" {
-            if let Some(action) = actions_by_hid.get(&hid) {
-                // Flash action/control-bar keys to white on press.
-                if rgb_enabled {
-                    let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
-                    if let Some((lr, lc)) = reserved_bar_led_loc(&hid) {
+        // Control bar LED feedback (independent of whether a key is bound to an action).
+        if rgb_enabled && is_control_bar {
+            let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+            if let Some(cols) = control_bar_cols_by_hid.get(&hid) {
+                if kind == "down" {
+                    for &lc in cols {
                         try_send_drop(
                             &rgb_tx,
                             RgbCmd::SetKey(RgbKey {
                                 device_index: dev_idx,
-                                row: lr,
+                                row: control_bar_row,
                                 col: lc,
                                 rgb: highlight_rgb,
                             }),
                         );
                     }
+                } else if kind == "up" {
+                    for &lc in cols {
+                        try_send_drop(
+                            &rgb_tx,
+                            RgbCmd::SetKey(RgbKey {
+                                device_index: dev_idx,
+                                row: control_bar_row,
+                                col: lc,
+                                rgb: (255, 0, 0),
+                            }),
+                        );
+                    }
                 }
+            }
+        }
+
+        if kind == "down" {
+            if let Some(action) = actions_by_hid.get(&hid) {
                 match action.as_str() {
                     "layout_next" => {
                         layout_index = (layout_index + 1) % cfg.layouts.len();
@@ -706,7 +747,7 @@ fn main() -> Result<()> {
                         eprintln!("loading wtn: {}", wtn_path.display());
                         wtn = Wtn::load(&wtn_path)
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
-                        paint_base(&wtn);
+                        paint_base(&wtn, false);
                     }
                     "layout_prev" => {
                         if layout_index == 0 {
@@ -720,7 +761,7 @@ fn main() -> Result<()> {
                         eprintln!("loading wtn: {}", wtn_path.display());
                         wtn = Wtn::load(&wtn_path)
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
-                        paint_base(&wtn);
+                        paint_base(&wtn, false);
                     }
                     "octave_up" => {
                         octave_shift = (octave_shift + 1).min(15);
@@ -736,24 +777,9 @@ fn main() -> Result<()> {
             }
         }
 
-        // Restore action/control-bar keys back to red on release.
-        if kind == "up" {
-            if actions_by_hid.contains_key(&hid) {
-                if rgb_enabled {
-                    let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
-                    if let Some((lr, lc)) = reserved_bar_led_loc(&hid) {
-                        try_send_drop(
-                            &rgb_tx,
-                            RgbCmd::SetKey(RgbKey {
-                                device_index: dev_idx,
-                                row: lr,
-                                col: lc,
-                                rgb: (255, 0, 0),
-                            }),
-                        );
-                    }
-                }
-            }
+        // Control bar keys never produce MIDI notes.
+        if is_control_bar {
+            continue;
         }
 
         if let Some(loc) = hid_map.loc_for(hid.clone()) {
