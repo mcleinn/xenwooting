@@ -302,11 +302,11 @@ fn write_default_config(path: &Path) -> Result<()> {
     let mut cfg = Config {
         midi_out_name: "XenWooting".to_string(),
         refresh_hz: 250.0,
-        press_threshold: 0.10,
+        press_threshold: 0.45,
         press_threshold_step: 0.01,
-        velocity_start_threshold: 0.03,
-        velocity_dt_min_ms: 12.0,
-        velocity_dt_max_ms: 140.0,
+        velocity_start_threshold: 0.01,
+        velocity_dt_min_ms: 8.0,
+        velocity_dt_max_ms: 240.0,
         aftertouch_delta: 0.01,
         boards: vec![
             xenwooting::config::BoardConfig {
