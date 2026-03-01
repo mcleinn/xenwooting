@@ -12,6 +12,25 @@ pub struct Config {
     #[serde(default = "default_press_threshold")]
     pub press_threshold: f32,
 
+    #[serde(default = "default_press_threshold_step")]
+    pub press_threshold_step: f32,
+
+    /// Analog threshold used to start measuring key press speed for velocity.
+    #[serde(default = "default_velocity_start_threshold")]
+    pub velocity_start_threshold: f32,
+
+    /// Speed-based velocity mapping lower/upper bounds.
+    /// Faster than dt_min_ms maps to velocity near 127; slower than dt_max_ms maps near 1.
+    #[serde(default = "default_velocity_dt_min_ms")]
+    pub velocity_dt_min_ms: f32,
+    #[serde(default = "default_velocity_dt_max_ms")]
+    pub velocity_dt_max_ms: f32,
+
+    /// Minimum analog delta (0..1) needed to emit an Update edge.
+    /// This affects aftertouch smoothness and MIDI bandwidth.
+    #[serde(default = "default_aftertouch_delta")]
+    pub aftertouch_delta: f32,
+
     #[serde(default)]
     pub boards: Vec<BoardConfig>,
 
@@ -98,7 +117,27 @@ fn default_refresh_hz() -> f32 {
 }
 
 fn default_press_threshold() -> f32 {
-    0.5
+    0.10
+}
+
+fn default_press_threshold_step() -> f32 {
+    0.01
+}
+
+fn default_velocity_start_threshold() -> f32 {
+    0.03
+}
+
+fn default_velocity_dt_min_ms() -> f32 {
+    12.0
+}
+
+fn default_velocity_dt_max_ms() -> f32 {
+    140.0
+}
+
+fn default_aftertouch_delta() -> f32 {
+    0.01
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
