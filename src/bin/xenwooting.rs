@@ -60,12 +60,6 @@ fn analog_to_u7_curved(v: f32, gamma: f32) -> u8 {
 
 #[derive(Debug, Clone)]
 enum KeyEdge {
-    Start {
-        device_id: u64,
-        hid: HIDCodes,
-        analog: f32,
-        ts: Instant,
-    },
     Down {
         device_id: u64,
         hid: HIDCodes,
@@ -88,73 +82,69 @@ enum KeyEdge {
 
 #[derive(Debug, Clone)]
 enum VelocityProfile {
-    // Position-based velocity (fallback)
-    ScaledPosition { gamma: f32 },
-    // Speed-based velocity
-    SpeedLinear,
-    SpeedGamma { gamma: f32 },
-    SpeedLog { k: f32 },
-    SpeedInvLog { k: f32 },
+    Linear,
+    Gamma { gamma: f32 },
+    Log { k: f32 },
+    InvLog { k: f32 },
 }
 
 impl VelocityProfile {
     fn name(&self) -> String {
         match self {
-            VelocityProfile::ScaledPosition { gamma } => format!("scaled-pos gamma={}", gamma),
-            VelocityProfile::SpeedLinear => "speed linear".to_string(),
-            VelocityProfile::SpeedGamma { gamma } => format!("speed gamma={}", gamma),
-            VelocityProfile::SpeedLog { k } => format!("speed log k={}", k),
-            VelocityProfile::SpeedInvLog { k } => format!("speed invlog k={}", k),
+            VelocityProfile::Linear => "linear".to_string(),
+            VelocityProfile::Gamma { gamma } => format!("gamma={}", gamma),
+            VelocityProfile::Log { k } => format!("log k={}", k),
+            VelocityProfile::InvLog { k } => format!("invlog k={}", k),
         }
     }
 
-    fn compute(
-        &self,
-        analog: f32,
-        press_threshold: f32,
-        dt_ms: Option<f32>,
-        dt_min_ms: f32,
-        dt_max_ms: f32,
-    ) -> u8 {
+    fn apply(&self, n: f32) -> f32 {
+        let n = n.clamp(0.0, 1.0);
         match self {
-            VelocityProfile::ScaledPosition { gamma } => {
-                // Scale velocity relative to the actuation point.
-                let t = press_threshold.clamp(0.0, 0.99);
-                let x = ((analog - t) / (1.0 - t)).clamp(0.0, 1.0);
-                analog_to_u7_curved(x, *gamma).max(1)
+            VelocityProfile::Linear => n,
+            VelocityProfile::Gamma { gamma } => n.powf(gamma.max(0.01)),
+            VelocityProfile::Log { k } => {
+                let kk = k.max(0.01);
+                (1.0 + kk * n).ln() / (1.0 + kk).ln()
             }
-            _ => {
-                // Speed-based.
-                let Some(dt_ms) = dt_ms else {
-                    return 1;
-                };
-                let lo = dt_min_ms.max(1.0);
-                let hi = dt_max_ms.max(lo + 1.0);
-                let t = ((dt_ms - lo) / (hi - lo)).clamp(0.0, 1.0);
-                let mut n = 1.0 - t; // fast press -> 1, slow -> 0
-
-                match self {
-                    VelocityProfile::SpeedLinear => {}
-                    VelocityProfile::SpeedGamma { gamma } => {
-                        n = n.powf(gamma.max(0.01));
-                    }
-                    VelocityProfile::SpeedLog { k } => {
-                        let kk = k.max(0.01);
-                        n = (1.0 + kk * n).ln() / (1.0 + kk).ln();
-                    }
-                    VelocityProfile::SpeedInvLog { k } => {
-                        let kk = k.max(0.01);
-                        // compress near 0, expand near 1
-                        let x = 1.0 - n;
-                        n = 1.0 - (1.0 + kk * x).ln() / (1.0 + kk).ln();
-                    }
-                    VelocityProfile::ScaledPosition { .. } => {}
-                }
-
-                analog_to_u7(n).max(1)
+            VelocityProfile::InvLog { k } => {
+                let kk = k.max(0.01);
+                let x = 1.0 - n;
+                1.0 - (1.0 + kk * x).ln() / (1.0 + kk).ln()
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct LedState {
+    dev_idx: u8,
+    row: u8,
+    col: u8,
+    base_rgb: (u8, u8, u8),
+}
+
+#[derive(Debug, Clone)]
+enum VelState {
+    Tracking {
+        started: Instant,
+        peak: f32,
+        out_ch: u8,
+        note: u8,
+        already_playing: bool,
+        led: Option<LedState>,
+    },
+    Playing {
+        out_ch: u8,
+        note: u8,
+        led: Option<LedState>,
+    },
+    Aftershock {
+        quiet_since: Instant,
+        out_ch: u8,
+        note: u8,
+        led: Option<LedState>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -302,11 +292,11 @@ fn write_default_config(path: &Path) -> Result<()> {
     let mut cfg = Config {
         midi_out_name: "XenWooting".to_string(),
         refresh_hz: 250.0,
-        press_threshold: 0.45,
+        press_threshold: 0.10,
         press_threshold_step: 0.01,
-        velocity_start_threshold: 0.01,
-        velocity_dt_min_ms: 8.0,
-        velocity_dt_max_ms: 240.0,
+        velocity_peak_track_ms: 12,
+        aftershock_ms: 35,
+        velocity_max_swing: 1.0,
         aftertouch_delta: 0.01,
         boards: vec![
             xenwooting::config::BoardConfig {
@@ -551,12 +541,11 @@ fn main() -> Result<()> {
     let mut octave_hold: bool = false; // momentary +1 channel (Space)
 
     let velocity_profiles: Vec<VelocityProfile> = vec![
-        VelocityProfile::SpeedLinear,
-        VelocityProfile::SpeedGamma { gamma: 0.6 },
-        VelocityProfile::SpeedLog { k: 12.0 },
-        VelocityProfile::SpeedInvLog { k: 12.0 },
-        VelocityProfile::ScaledPosition { gamma: 1.0 },
-        VelocityProfile::ScaledPosition { gamma: 1.7 },
+        VelocityProfile::Linear,
+        VelocityProfile::Gamma { gamma: 1.6 },
+        VelocityProfile::Gamma { gamma: 0.7 },
+        VelocityProfile::Log { k: 12.0 },
+        VelocityProfile::InvLog { k: 12.0 },
     ];
     let mut velocity_profile_idx: usize = 0;
 
@@ -588,17 +577,14 @@ fn main() -> Result<()> {
     let press_threshold_bits = Arc::new(std::sync::atomic::AtomicU32::new(
         cfg.press_threshold.to_bits(),
     ));
-    let velocity_start_threshold = cfg.velocity_start_threshold.clamp(0.0, 0.99);
     let update_delta = cfg.aftertouch_delta.clamp(0.001, 0.2);
     let verbose = dump_hid || log_edges || log_midi || log_poll;
     let press_threshold_bits_poll = Arc::clone(&press_threshold_bits);
     std::thread::spawn(move || {
         let mut down_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
-        let mut started_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut last_analog_by_device: HashMap<u64, HashMap<HIDCodes, f32>> = HashMap::new();
         for id in &poll_ids {
             down_by_device.insert(*id, HashSet::new());
-            started_by_device.insert(*id, HashSet::new());
             last_analog_by_device.insert(*id, HashMap::new());
         }
         let mut last_report = std::time::Instant::now() - Duration::from_secs(999);
@@ -641,7 +627,6 @@ fn main() -> Result<()> {
                 }
 
                 let down = down_by_device.get_mut(device_id).unwrap();
-                let started = started_by_device.get_mut(device_id).unwrap();
                 let last_analog = last_analog_by_device.get_mut(device_id).unwrap();
                 for (code_u16, analog) in data.iter() {
                     if *code_u16 > 255 {
@@ -654,23 +639,6 @@ fn main() -> Result<()> {
                         press_threshold_bits_poll.load(std::sync::atomic::Ordering::Relaxed),
                     )
                     .clamp(0.0, 0.99);
-
-                    let is_started_now = *analog > velocity_start_threshold;
-                    let was_started = started.contains(&hid);
-                    if is_started_now && !was_started {
-                        started.insert(hid.clone());
-                        let _ = tx.send(KeyEdge::Start {
-                            device_id: *device_id,
-                            hid: hid.clone(),
-                            analog: *analog,
-                            ts: Instant::now(),
-                        });
-                    } else if !is_started_now && was_started {
-                        // Only clear if the key is not currently down.
-                        if !down.contains(&hid) {
-                            started.remove(&hid);
-                        }
-                    }
 
                     let is_down_now = *analog > press_threshold;
                     let was_down = down.contains(&hid);
@@ -698,7 +666,6 @@ fn main() -> Result<()> {
                     } else if !is_down_now && was_down {
                         down.remove(&hid);
                         last_analog.remove(&hid);
-                        started.remove(&hid);
                         if verbose {
                             eprintln!(
                                 "send UP   device_id={} hid={:?} analog={:.3}",
@@ -809,23 +776,81 @@ fn main() -> Result<()> {
         eprintln!("ready: waiting for key edges");
     }
 
-    // Speed-based velocity start times (per device + HID).
-    let mut vel_start_ts: HashMap<(u64, HIDCodes), Instant> = HashMap::new();
+    // Peak-tracked velocity state per key (device_id + HID).
+    let mut vel_state: HashMap<(u64, HIDCodes), VelState> = HashMap::new();
 
     while RUNNING.load(Ordering::SeqCst) {
-        let edge = match rx.recv_timeout(Duration::from_millis(50)) {
+        // Timer tick: fire delayed NoteOn / NoteOff.
+        {
+            let peak_track = Duration::from_millis(cfg.velocity_peak_track_ms.max(1) as u64);
+            let aftershock = Duration::from_millis(cfg.aftershock_ms.max(1) as u64);
+            let threshold =
+                f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
+            let max_swing = cfg.velocity_max_swing.clamp(0.05, 1.0);
+
+            let keys: Vec<(u64, HIDCodes)> = vel_state.keys().cloned().collect();
+            for key in keys {
+                let Some(st) = vel_state.get(&key).cloned() else {
+                    continue;
+                };
+                match st {
+                    VelState::Tracking {
+                        started,
+                        peak,
+                        out_ch,
+                        note,
+                        already_playing,
+                        led,
+                    } => {
+                        if started.elapsed() >= peak_track {
+                            let denom = (max_swing - threshold).max(0.001);
+                            let n = ((peak - threshold) / denom).clamp(0.0, 1.0);
+                            let n2 = velocity_profiles[velocity_profile_idx].apply(n);
+                            let vel = (n2 * 126.0).round().clamp(0.0, 126.0) as u8 + 1;
+
+                            if !already_playing {
+                                let _ = midi_out.send_note(true, out_ch, note, vel);
+                                vel_state.insert(key, VelState::Playing { out_ch, note, led });
+                            } else {
+                                let _ = midi_out.send_polytouch(out_ch, note, vel);
+                                vel_state.insert(key, VelState::Playing { out_ch, note, led });
+                            }
+                        }
+                    }
+                    VelState::Aftershock {
+                        quiet_since,
+                        out_ch,
+                        note,
+                        led,
+                    } => {
+                        if quiet_since.elapsed() >= aftershock {
+                            let _ = midi_out.send_note(false, out_ch, note, 0);
+                            if let Some(led) = led {
+                                let _ = try_send_drop(
+                                    &rgb_tx,
+                                    RgbCmd::SetKey(RgbKey {
+                                        device_index: led.dev_idx,
+                                        row: led.row,
+                                        col: led.col,
+                                        rgb: led.base_rgb,
+                                    }),
+                                );
+                            }
+                            vel_state.remove(&key);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let edge = match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(e) => e,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(_) => break,
         };
 
         let (device_id, hid, analog, kind, ts) = match edge {
-            KeyEdge::Start {
-                device_id,
-                hid,
-                analog,
-                ts,
-            } => (device_id, hid, analog, "start", ts),
             KeyEdge::Down {
                 device_id,
                 hid,
@@ -846,14 +871,7 @@ fn main() -> Result<()> {
             } => (device_id, hid, analog, "up", ts),
         };
 
-        // Maintain speed-velocity start timestamp table.
         let key_id = (device_id, hid.clone());
-        if kind == "start" {
-            vel_start_ts.insert(key_id, ts);
-            continue;
-        } else if kind == "up" {
-            vel_start_ts.remove(&key_id);
-        }
 
         let Some(bcfg) = board_by_device.get(&device_id) else {
             continue;
@@ -1050,36 +1068,20 @@ fn main() -> Result<()> {
                 let shifted = (base_ch as i16) + (octave_shift as i16) + hold;
                 let out_ch: u8 = shifted.clamp(0, 15) as u8;
                 let note = cell.key;
+
                 let press_threshold =
                     f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
-                let vel_dbg = analog_to_u7(analog).max(1);
 
+                // Maintain per-key velocity state.
                 if kind == "down" {
-                    // Speed-based velocity.
-                    let dt_ms = vel_start_ts
-                        .get(&(device_id, hid.clone()))
-                        .map(|t0| ts.saturating_duration_since(*t0).as_secs_f32() * 1000.0);
-                    let vel = velocity_profiles[velocity_profile_idx].compute(
-                        analog,
-                        press_threshold,
-                        dt_ms,
-                        cfg.velocity_dt_min_ms,
-                        cfg.velocity_dt_max_ms,
+                    let already_playing = matches!(
+                        vel_state.get(&key_id),
+                        Some(VelState::Playing { .. }) | Some(VelState::Aftershock { .. })
                     );
-                    if log_midi {
-                        let lay = &cfg.layouts[layout_index];
-                        let pitch =
-                            (out_ch as i32) * lay.edo_divisions + (note as i32) + lay.pitch_offset;
-                        let freq = edo_freq_hz(lay.edo_divisions, pitch);
-                        println!(
-                            "NOTE_ON  dev={} wtn_board={} hid={:?} -> ch={} note={} vel={} pitch={} freq_hz={:.4}",
-                            device_id, wtn_board, hid, out_ch, note, vel, pitch, freq
-                        );
-                    }
-                    midi_out.send_note(true, out_ch, note, vel)?;
-                    if rgb_enabled {
+
+                    let led = if rgb_enabled {
                         let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
-                        try_send_drop(
+                        let _ = try_send_drop(
                             &rgb_tx,
                             RgbCmd::SetKey(RgbKey {
                                 device_index: dev_idx,
@@ -1088,51 +1090,123 @@ fn main() -> Result<()> {
                                 rgb: highlight_rgb,
                             }),
                         );
-                    }
-                    if log_led {
-                        let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
-                        eprintln!(
-                            "led dev_idx={} hid={:?} lr={} lc={} (midi r={} c={} idx={})",
-                            dev_idx, hid, loc.led_row, loc.led_col, loc.midi_row, loc.midi_col, idx
-                        );
+                        Some(LedState {
+                            dev_idx,
+                            row: loc.led_row,
+                            col: loc.led_col,
+                            base_rgb: cell.col_rgb,
+                        })
+                    } else {
+                        None
+                    };
+
+                    vel_state.insert(
+                        key_id,
+                        VelState::Tracking {
+                            started: ts,
+                            peak: analog,
+                            out_ch,
+                            note,
+                            already_playing,
+                            led,
+                        },
+                    );
+                } else if kind == "update" {
+                    if let Some(st) = vel_state.get_mut(&key_id) {
+                        match st {
+                            VelState::Tracking { peak, .. } => {
+                                if analog > *peak {
+                                    *peak = analog;
+                                }
+                            }
+                            VelState::Playing { out_ch, note, .. } => {
+                                if !no_aftertouch {
+                                    if let Some(p) = aftertouch_profiles[aftertouch_profile_idx]
+                                        .compute(analog, press_threshold)
+                                    {
+                                        let _ = midi_out.send_polytouch(*out_ch, *note, p);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 } else if kind == "up" {
-                    if log_midi {
-                        let lay = &cfg.layouts[layout_index];
-                        let pitch =
-                            (out_ch as i32) * lay.edo_divisions + (note as i32) + lay.pitch_offset;
-                        let freq = edo_freq_hz(lay.edo_divisions, pitch);
-                        println!(
-                            "NOTE_OFF dev={} wtn_board={} hid={:?} -> ch={} note={} vel={} pitch={} freq_hz={:.4}",
-                            device_id, wtn_board, hid, out_ch, note, vel_dbg, pitch, freq
-                        );
-                    }
-                    midi_out.send_note(false, out_ch, note, 0)?;
-                    if rgb_enabled {
-                        let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
-                        try_send_drop(
-                            &rgb_tx,
-                            RgbCmd::SetKey(RgbKey {
-                                device_index: dev_idx,
-                                row: loc.led_row,
-                                col: loc.led_col,
-                                rgb: cell.col_rgb,
-                            }),
-                        );
-                    }
-                    if log_led {
-                        let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
-                        eprintln!(
-                            "led dev_idx={} hid={:?} lr={} lc={} (midi r={} c={} idx={})",
-                            dev_idx, hid, loc.led_row, loc.led_col, loc.midi_row, loc.midi_col, idx
-                        );
-                    }
-                } else if kind == "update" {
-                    if !no_aftertouch {
-                        if let Some(p) = aftertouch_profiles[aftertouch_profile_idx]
-                            .compute(analog, press_threshold)
-                        {
-                            let _ = midi_out.send_polytouch(out_ch, note, p);
+                    match vel_state.remove(&key_id) {
+                        Some(VelState::Tracking {
+                            out_ch,
+                            note,
+                            already_playing,
+                            led,
+                            ..
+                        }) => {
+                            if already_playing {
+                                vel_state.insert(
+                                    key_id,
+                                    VelState::Aftershock {
+                                        quiet_since: ts,
+                                        out_ch,
+                                        note,
+                                        led,
+                                    },
+                                );
+                            } else {
+                                // Released before NoteOn; restore LED immediately.
+                                if let Some(led) = led {
+                                    let _ = try_send_drop(
+                                        &rgb_tx,
+                                        RgbCmd::SetKey(RgbKey {
+                                            device_index: led.dev_idx,
+                                            row: led.row,
+                                            col: led.col,
+                                            rgb: led.base_rgb,
+                                        }),
+                                    );
+                                }
+                            }
+                        }
+                        Some(VelState::Playing { out_ch, note, led }) => {
+                            vel_state.insert(
+                                key_id,
+                                VelState::Aftershock {
+                                    quiet_since: ts,
+                                    out_ch,
+                                    note,
+                                    led,
+                                },
+                            );
+                        }
+                        Some(VelState::Aftershock {
+                            quiet_since,
+                            out_ch,
+                            note,
+                            led,
+                        }) => {
+                            // Already in aftershock; keep earliest quiet time.
+                            vel_state.insert(
+                                key_id,
+                                VelState::Aftershock {
+                                    quiet_since,
+                                    out_ch,
+                                    note,
+                                    led,
+                                },
+                            );
+                        }
+                        None => {
+                            // Not tracked.
+                            if rgb_enabled {
+                                let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+                                let _ = try_send_drop(
+                                    &rgb_tx,
+                                    RgbCmd::SetKey(RgbKey {
+                                        device_index: dev_idx,
+                                        row: loc.led_row,
+                                        col: loc.led_col,
+                                        rgb: cell.col_rgb,
+                                    }),
+                                );
+                            }
                         }
                     }
                 }
