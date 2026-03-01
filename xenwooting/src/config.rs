@@ -117,7 +117,9 @@ fn default_refresh_hz() -> f32 {
 }
 
 fn default_press_threshold() -> f32 {
-    0.10
+    // Note-on point. Keep this reasonably deep so speed-based velocity has
+    // enough travel/time to differentiate soft vs hard presses.
+    0.45
 }
 
 fn default_press_threshold_step() -> f32 {
@@ -125,15 +127,15 @@ fn default_press_threshold_step() -> f32 {
 }
 
 fn default_velocity_start_threshold() -> f32 {
-    0.03
+    0.01
 }
 
 fn default_velocity_dt_min_ms() -> f32 {
-    12.0
+    8.0
 }
 
 fn default_velocity_dt_max_ms() -> f32 {
-    140.0
+    240.0
 }
 
 fn default_aftertouch_delta() -> f32 {
