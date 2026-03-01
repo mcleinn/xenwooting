@@ -8,7 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use wooting_analog_wrapper as sdk;
 use wooting_analog_wrapper::{FromPrimitive, HIDCodes, KeycodeType};
 
@@ -50,23 +52,150 @@ fn analog_to_u7(v: f32) -> u8 {
     x.round().clamp(0.0, 127.0) as u8
 }
 
+fn analog_to_u7_curved(v: f32, gamma: f32) -> u8 {
+    let g = gamma.max(0.01);
+    let x = v.clamp(0.0, 1.0).powf(g) * 127.0;
+    x.round().clamp(0.0, 127.0) as u8
+}
+
 #[derive(Debug, Clone)]
 enum KeyEdge {
+    Start {
+        device_id: u64,
+        hid: HIDCodes,
+        analog: f32,
+        ts: Instant,
+    },
     Down {
         device_id: u64,
         hid: HIDCodes,
         analog: f32,
+        ts: Instant,
     },
     Update {
         device_id: u64,
         hid: HIDCodes,
         analog: f32,
+        ts: Instant,
     },
     Up {
         device_id: u64,
         hid: HIDCodes,
         analog: f32,
+        ts: Instant,
     },
+}
+
+#[derive(Debug, Clone)]
+enum VelocityProfile {
+    // Position-based velocity (fallback)
+    ScaledPosition { gamma: f32 },
+    // Speed-based velocity
+    SpeedLinear,
+    SpeedGamma { gamma: f32 },
+    SpeedLog { k: f32 },
+    SpeedInvLog { k: f32 },
+}
+
+impl VelocityProfile {
+    fn name(&self) -> String {
+        match self {
+            VelocityProfile::ScaledPosition { gamma } => format!("scaled-pos gamma={}", gamma),
+            VelocityProfile::SpeedLinear => "speed linear".to_string(),
+            VelocityProfile::SpeedGamma { gamma } => format!("speed gamma={}", gamma),
+            VelocityProfile::SpeedLog { k } => format!("speed log k={}", k),
+            VelocityProfile::SpeedInvLog { k } => format!("speed invlog k={}", k),
+        }
+    }
+
+    fn compute(
+        &self,
+        analog: f32,
+        press_threshold: f32,
+        dt_ms: Option<f32>,
+        dt_min_ms: f32,
+        dt_max_ms: f32,
+    ) -> u8 {
+        match self {
+            VelocityProfile::ScaledPosition { gamma } => {
+                // Scale velocity relative to the actuation point.
+                let t = press_threshold.clamp(0.0, 0.99);
+                let x = ((analog - t) / (1.0 - t)).clamp(0.0, 1.0);
+                analog_to_u7_curved(x, *gamma).max(1)
+            }
+            _ => {
+                // Speed-based.
+                let Some(dt_ms) = dt_ms else {
+                    return 1;
+                };
+                let lo = dt_min_ms.max(1.0);
+                let hi = dt_max_ms.max(lo + 1.0);
+                let t = ((dt_ms - lo) / (hi - lo)).clamp(0.0, 1.0);
+                let mut n = 1.0 - t; // fast press -> 1, slow -> 0
+
+                match self {
+                    VelocityProfile::SpeedLinear => {}
+                    VelocityProfile::SpeedGamma { gamma } => {
+                        n = n.powf(gamma.max(0.01));
+                    }
+                    VelocityProfile::SpeedLog { k } => {
+                        let kk = k.max(0.01);
+                        n = (1.0 + kk * n).ln() / (1.0 + kk).ln();
+                    }
+                    VelocityProfile::SpeedInvLog { k } => {
+                        let kk = k.max(0.01);
+                        // compress near 0, expand near 1
+                        let x = 1.0 - n;
+                        n = 1.0 - (1.0 + kk * x).ln() / (1.0 + kk).ln();
+                    }
+                    VelocityProfile::ScaledPosition { .. } => {}
+                }
+
+                analog_to_u7(n).max(1)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AftertouchProfile {
+    Off,
+    RawLinear,
+    RawGamma { gamma: f32 },
+    AbovePressThresholdLinear,
+    AbovePressThresholdGamma { gamma: f32 },
+}
+
+impl AftertouchProfile {
+    fn name(&self) -> String {
+        match self {
+            AftertouchProfile::Off => "off".to_string(),
+            AftertouchProfile::RawLinear => "raw linear".to_string(),
+            AftertouchProfile::RawGamma { gamma } => format!("raw gamma={}", gamma),
+            AftertouchProfile::AbovePressThresholdLinear => "above-threshold linear".to_string(),
+            AftertouchProfile::AbovePressThresholdGamma { gamma } => {
+                format!("above-threshold gamma={}", gamma)
+            }
+        }
+    }
+
+    fn compute(&self, analog: f32, press_threshold: f32) -> Option<u8> {
+        match self {
+            AftertouchProfile::Off => None,
+            AftertouchProfile::RawLinear => Some(analog_to_u7(analog)),
+            AftertouchProfile::RawGamma { gamma } => Some(analog_to_u7_curved(analog, *gamma)),
+            AftertouchProfile::AbovePressThresholdLinear => {
+                let t = press_threshold.clamp(0.0, 0.99);
+                let x = ((analog - t) / (1.0 - t)).clamp(0.0, 1.0);
+                Some(analog_to_u7(x))
+            }
+            AftertouchProfile::AbovePressThresholdGamma { gamma } => {
+                let t = press_threshold.clamp(0.0, 0.99);
+                let x = ((analog - t) / (1.0 - t)).clamp(0.0, 1.0);
+                Some(analog_to_u7_curved(x, *gamma))
+            }
+        }
+    }
 }
 
 struct AlsaMidiOut {
@@ -173,7 +302,12 @@ fn write_default_config(path: &Path) -> Result<()> {
     let mut cfg = Config {
         midi_out_name: "XenWooting".to_string(),
         refresh_hz: 250.0,
-        press_threshold: 0.5,
+        press_threshold: 0.10,
+        press_threshold_step: 0.01,
+        velocity_start_threshold: 0.03,
+        velocity_dt_min_ms: 12.0,
+        velocity_dt_max_ms: 140.0,
+        aftertouch_delta: 0.01,
         boards: vec![
             xenwooting::config::BoardConfig {
                 device_id: None,
@@ -413,7 +547,27 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut octave_shift: i8 = 0; // shifts MIDI channel index
+    let mut octave_shift: i8 = 0; // persistent shifts MIDI channel index
+    let mut octave_hold: bool = false; // momentary +1 channel (Space)
+
+    let velocity_profiles: Vec<VelocityProfile> = vec![
+        VelocityProfile::SpeedLinear,
+        VelocityProfile::SpeedGamma { gamma: 0.6 },
+        VelocityProfile::SpeedLog { k: 12.0 },
+        VelocityProfile::SpeedInvLog { k: 12.0 },
+        VelocityProfile::ScaledPosition { gamma: 1.0 },
+        VelocityProfile::ScaledPosition { gamma: 1.7 },
+    ];
+    let mut velocity_profile_idx: usize = 0;
+
+    let aftertouch_profiles: Vec<AftertouchProfile> = vec![
+        AftertouchProfile::RawLinear,
+        AftertouchProfile::RawGamma { gamma: 1.3 },
+        AftertouchProfile::AbovePressThresholdLinear,
+        AftertouchProfile::AbovePressThresholdGamma { gamma: 1.3 },
+        AftertouchProfile::Off,
+    ];
+    let mut aftertouch_profile_idx: usize = 0;
 
     // Global run-flag is controlled by signal handler.
     RUNNING.store(true, Ordering::SeqCst);
@@ -431,13 +585,20 @@ fn main() -> Result<()> {
     if log_poll {
         eprintln!("poll_ids={:?}", poll_ids);
     }
-    let threshold = cfg.press_threshold;
+    let press_threshold_bits = Arc::new(std::sync::atomic::AtomicU32::new(
+        cfg.press_threshold.to_bits(),
+    ));
+    let velocity_start_threshold = cfg.velocity_start_threshold.clamp(0.0, 0.99);
+    let update_delta = cfg.aftertouch_delta.clamp(0.001, 0.2);
     let verbose = dump_hid || log_edges || log_midi || log_poll;
+    let press_threshold_bits_poll = Arc::clone(&press_threshold_bits);
     std::thread::spawn(move || {
         let mut down_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
+        let mut started_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut last_analog_by_device: HashMap<u64, HashMap<HIDCodes, f32>> = HashMap::new();
         for id in &poll_ids {
             down_by_device.insert(*id, HashSet::new());
+            started_by_device.insert(*id, HashSet::new());
             last_analog_by_device.insert(*id, HashMap::new());
         }
         let mut last_report = std::time::Instant::now() - Duration::from_secs(999);
@@ -480,6 +641,7 @@ fn main() -> Result<()> {
                 }
 
                 let down = down_by_device.get_mut(device_id).unwrap();
+                let started = started_by_device.get_mut(device_id).unwrap();
                 let last_analog = last_analog_by_device.get_mut(device_id).unwrap();
                 for (code_u16, analog) in data.iter() {
                     if *code_u16 > 255 {
@@ -488,7 +650,29 @@ fn main() -> Result<()> {
                     let Some(hid) = HIDCodes::from_u8(*code_u16 as u8) else {
                         continue;
                     };
-                    let is_down_now = *analog > threshold;
+                    let press_threshold = f32::from_bits(
+                        press_threshold_bits_poll.load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                    .clamp(0.0, 0.99);
+
+                    let is_started_now = *analog > velocity_start_threshold;
+                    let was_started = started.contains(&hid);
+                    if is_started_now && !was_started {
+                        started.insert(hid.clone());
+                        let _ = tx.send(KeyEdge::Start {
+                            device_id: *device_id,
+                            hid: hid.clone(),
+                            analog: *analog,
+                            ts: Instant::now(),
+                        });
+                    } else if !is_started_now && was_started {
+                        // Only clear if the key is not currently down.
+                        if !down.contains(&hid) {
+                            started.remove(&hid);
+                        }
+                    }
+
+                    let is_down_now = *analog > press_threshold;
                     let was_down = down.contains(&hid);
                     if is_down_now && !was_down {
                         down.insert(hid.clone());
@@ -504,6 +688,7 @@ fn main() -> Result<()> {
                                 device_id: *device_id,
                                 hid,
                                 analog: *analog,
+                                ts: Instant::now(),
                             })
                             .is_err()
                         {
@@ -513,6 +698,7 @@ fn main() -> Result<()> {
                     } else if !is_down_now && was_down {
                         down.remove(&hid);
                         last_analog.remove(&hid);
+                        started.remove(&hid);
                         if verbose {
                             eprintln!(
                                 "send UP   device_id={} hid={:?} analog={:.3}",
@@ -524,6 +710,7 @@ fn main() -> Result<()> {
                                 device_id: *device_id,
                                 hid,
                                 analog: *analog,
+                                ts: Instant::now(),
                             })
                             .is_err()
                         {
@@ -532,12 +719,13 @@ fn main() -> Result<()> {
                         }
                     } else if is_down_now && was_down {
                         let prev = last_analog.get(&hid).copied().unwrap_or(0.0);
-                        if (*analog - prev).abs() >= 0.02 {
+                        if (*analog - prev).abs() >= update_delta {
                             last_analog.insert(hid.clone(), *analog);
                             let _ = tx.send(KeyEdge::Update {
                                 device_id: *device_id,
                                 hid,
                                 analog: *analog,
+                                ts: Instant::now(),
                             });
                         }
                     }
@@ -621,6 +809,9 @@ fn main() -> Result<()> {
         eprintln!("ready: waiting for key edges");
     }
 
+    // Speed-based velocity start times (per device + HID).
+    let mut vel_start_ts: HashMap<(u64, HIDCodes), Instant> = HashMap::new();
+
     while RUNNING.load(Ordering::SeqCst) {
         let edge = match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(e) => e,
@@ -628,23 +819,41 @@ fn main() -> Result<()> {
             Err(_) => break,
         };
 
-        let (device_id, hid, analog, kind) = match edge {
+        let (device_id, hid, analog, kind, ts) = match edge {
+            KeyEdge::Start {
+                device_id,
+                hid,
+                analog,
+                ts,
+            } => (device_id, hid, analog, "start", ts),
             KeyEdge::Down {
                 device_id,
                 hid,
                 analog,
-            } => (device_id, hid, analog, "down"),
+                ts,
+            } => (device_id, hid, analog, "down", ts),
             KeyEdge::Update {
                 device_id,
                 hid,
                 analog,
-            } => (device_id, hid, analog, "update"),
+                ts,
+            } => (device_id, hid, analog, "update", ts),
             KeyEdge::Up {
                 device_id,
                 hid,
                 analog,
-            } => (device_id, hid, analog, "up"),
+                ts,
+            } => (device_id, hid, analog, "up", ts),
         };
+
+        // Maintain speed-velocity start timestamp table.
+        let key_id = (device_id, hid.clone());
+        if kind == "start" {
+            vel_start_ts.insert(key_id, ts);
+            continue;
+        } else if kind == "up" {
+            vel_start_ts.remove(&key_id);
+        }
 
         let Some(bcfg) = board_by_device.get(&device_id) else {
             continue;
@@ -653,6 +862,56 @@ fn main() -> Result<()> {
         let rotation = bcfg.rotation_deg;
 
         let is_control_bar = control_bar_cols_by_hid.contains_key(&hid);
+
+        // Runtime press threshold can be adjusted with control-bar keys.
+        // These keys never generate notes.
+        if kind == "down" {
+            match hid {
+                HIDCodes::LeftCtrl => {
+                    let mut t = f32::from_bits(press_threshold_bits.load(Ordering::Relaxed));
+                    t = (t - cfg.press_threshold_step).clamp(0.02, 0.98);
+                    press_threshold_bits.store(t.to_bits(), Ordering::Relaxed);
+                    info!("press_threshold now {:.3}", t);
+                    continue;
+                }
+                HIDCodes::RightCtrl => {
+                    let mut t = f32::from_bits(press_threshold_bits.load(Ordering::Relaxed));
+                    t = (t + cfg.press_threshold_step).clamp(0.02, 0.98);
+                    press_threshold_bits.store(t.to_bits(), Ordering::Relaxed);
+                    info!("press_threshold now {:.3}", t);
+                    continue;
+                }
+                HIDCodes::LeftAlt => {
+                    velocity_profile_idx = (velocity_profile_idx + 1) % velocity_profiles.len();
+                    info!(
+                        "velocity_profile now {}",
+                        velocity_profiles[velocity_profile_idx].name()
+                    );
+                    continue;
+                }
+                HIDCodes::RightAlt => {
+                    aftertouch_profile_idx =
+                        (aftertouch_profile_idx + 1) % aftertouch_profiles.len();
+                    info!(
+                        "aftertouch_profile now {}",
+                        aftertouch_profiles[aftertouch_profile_idx].name()
+                    );
+                    continue;
+                }
+                HIDCodes::Space => {
+                    octave_hold = true;
+                    info!("octave_hold on");
+                    continue;
+                }
+                _ => {}
+            }
+        } else if kind == "up" {
+            if let HIDCodes::Space = hid {
+                octave_hold = false;
+                info!("octave_hold off");
+                continue;
+            }
+        }
 
         // Compute debug LED coordinates (either from control bar mapping or hid_map).
         let dev_idx_dbg = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
@@ -787,12 +1046,26 @@ fn main() -> Result<()> {
             let idx = (loc.midi_row as usize) * 14 + (loc.midi_col as usize);
             if let Some(cell) = wtn.cell(wtn_board, idx) {
                 let base_ch = cell.chan_1based.saturating_sub(1);
-                let shifted = (base_ch as i16) + (octave_shift as i16);
+                let hold = if octave_hold { 1i16 } else { 0i16 };
+                let shifted = (base_ch as i16) + (octave_shift as i16) + hold;
                 let out_ch: u8 = shifted.clamp(0, 15) as u8;
                 let note = cell.key;
-                let vel = analog_to_u7(analog).max(1);
+                let press_threshold =
+                    f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
+                let vel_dbg = analog_to_u7(analog).max(1);
 
                 if kind == "down" {
+                    // Speed-based velocity.
+                    let dt_ms = vel_start_ts
+                        .get(&(device_id, hid.clone()))
+                        .map(|t0| ts.saturating_duration_since(*t0).as_secs_f32() * 1000.0);
+                    let vel = velocity_profiles[velocity_profile_idx].compute(
+                        analog,
+                        press_threshold,
+                        dt_ms,
+                        cfg.velocity_dt_min_ms,
+                        cfg.velocity_dt_max_ms,
+                    );
                     if log_midi {
                         let lay = &cfg.layouts[layout_index];
                         let pitch =
@@ -831,7 +1104,7 @@ fn main() -> Result<()> {
                         let freq = edo_freq_hz(lay.edo_divisions, pitch);
                         println!(
                             "NOTE_OFF dev={} wtn_board={} hid={:?} -> ch={} note={} vel={} pitch={} freq_hz={:.4}",
-                            device_id, wtn_board, hid, out_ch, note, vel, pitch, freq
+                            device_id, wtn_board, hid, out_ch, note, vel_dbg, pitch, freq
                         );
                     }
                     midi_out.send_note(false, out_ch, note, 0)?;
@@ -856,7 +1129,11 @@ fn main() -> Result<()> {
                     }
                 } else if kind == "update" {
                     if !no_aftertouch {
-                        let _ = midi_out.send_polytouch(out_ch, note, vel);
+                        if let Some(p) = aftertouch_profiles[aftertouch_profile_idx]
+                            .compute(analog, press_threshold)
+                        {
+                            let _ = midi_out.send_polytouch(out_ch, note, p);
+                        }
                     }
                 }
             } else if log_midi {
