@@ -15,16 +15,17 @@ pub struct Config {
     #[serde(default = "default_press_threshold_step")]
     pub press_threshold_step: f32,
 
-    /// Analog threshold used to start measuring key press speed for velocity.
-    #[serde(default = "default_velocity_start_threshold")]
-    pub velocity_start_threshold: f32,
+    /// Time window to track the press peak (ms) before firing NoteOn.
+    #[serde(default = "default_velocity_peak_track_ms")]
+    pub velocity_peak_track_ms: u32,
 
-    /// Speed-based velocity mapping lower/upper bounds.
-    /// Faster than dt_min_ms maps to velocity near 127; slower than dt_max_ms maps near 1.
-    #[serde(default = "default_velocity_dt_min_ms")]
-    pub velocity_dt_min_ms: f32,
-    #[serde(default = "default_velocity_dt_max_ms")]
-    pub velocity_dt_max_ms: f32,
+    /// Quiet time (ms) below threshold before firing NoteOff.
+    #[serde(default = "default_aftershock_ms")]
+    pub aftershock_ms: u32,
+
+    /// Peak normalization reference (0..1). Used as "max swing" when mapping peak to velocity.
+    #[serde(default = "default_velocity_max_swing")]
+    pub velocity_max_swing: f32,
 
     /// Minimum analog delta (0..1) needed to emit an Update edge.
     /// This affects aftertouch smoothness and MIDI bandwidth.
@@ -117,25 +118,24 @@ fn default_refresh_hz() -> f32 {
 }
 
 fn default_press_threshold() -> f32 {
-    // Note-on point. Keep this reasonably deep so speed-based velocity has
-    // enough travel/time to differentiate soft vs hard presses.
-    0.45
+    // Note-on threshold (0..1). Kept low because velocity uses a peak tracker.
+    0.10
 }
 
 fn default_press_threshold_step() -> f32 {
     0.01
 }
 
-fn default_velocity_start_threshold() -> f32 {
-    0.01
+fn default_velocity_peak_track_ms() -> u32 {
+    12
 }
 
-fn default_velocity_dt_min_ms() -> f32 {
-    8.0
+fn default_aftershock_ms() -> u32 {
+    35
 }
 
-fn default_velocity_dt_max_ms() -> f32 {
-    240.0
+fn default_velocity_max_swing() -> f32 {
+    1.0
 }
 
 fn default_aftertouch_delta() -> f32 {
