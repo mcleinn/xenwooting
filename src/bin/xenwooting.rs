@@ -123,13 +123,15 @@ enum VelState {
         out_ch: u8,
         note: u8,
         playing: bool,
+        last_val: u8,
         led: Option<LedState>,
     },
     Aftershock {
-        quiet_since: Instant,
+        quiet_since: Option<Instant>,
         out_ch: u8,
         note: u8,
         playing: bool,
+        last_val: u8,
         led: Option<LedState>,
     },
 }
@@ -177,7 +179,7 @@ impl AlsaMidiOut {
             channel: ch,
             note,
             velocity: vel,
-            off_velocity: 0,
+            off_velocity: if on { 0 } else { vel },
             duration: 0,
         };
         let mut e = Event::new(
@@ -765,6 +767,7 @@ fn main() -> Result<()> {
                         out_ch,
                         note,
                         playing,
+                        last_val: _,
                         led,
                     } => {
                         if started.elapsed() >= peak_track {
@@ -782,10 +785,11 @@ fn main() -> Result<()> {
                                 vel_state.insert(
                                     key,
                                     VelState::Aftershock {
-                                        quiet_since: Instant::now(),
+                                        quiet_since: None,
                                         out_ch,
                                         note,
                                         playing: true,
+                                        last_val: vel,
                                         led,
                                     },
                                 );
@@ -798,10 +802,11 @@ fn main() -> Result<()> {
                                 vel_state.insert(
                                     key,
                                     VelState::Aftershock {
-                                        quiet_since: Instant::now(),
+                                        quiet_since: None,
                                         out_ch,
                                         note,
                                         playing,
+                                        last_val: vel,
                                         led,
                                     },
                                 );
@@ -813,11 +818,18 @@ fn main() -> Result<()> {
                         out_ch,
                         note,
                         playing,
+                        last_val,
                         led,
                     } => {
-                        if quiet_since.elapsed() >= aftershock {
+                        let Some(qs) = quiet_since else {
+                            continue;
+                        };
+                        if qs.elapsed() >= aftershock {
                             if playing {
-                                let _ = midi_out.send_note(false, out_ch, note, 0);
+                                // Use the last computed peak-mapped value as release velocity.
+                                // This is simple, works well with Pianoteq, and mirrors the
+                                // Teensy behavior where aftertouch uses the same mapped value.
+                                let _ = midi_out.send_note(false, out_ch, note, last_val);
                             }
                             if let Some(led) = led {
                                 let _ = try_send_drop(
@@ -1066,11 +1078,15 @@ fn main() -> Result<()> {
 
                 // Maintain per-key velocity state.
                 if kind == "down" {
-                    let already_playing = matches!(
-                        vel_state.get(&key_id),
-                        Some(VelState::Tracking { playing: true, .. })
-                            | Some(VelState::Aftershock { playing: true, .. })
-                    );
+                    let (already_playing, prev_last_val) = match vel_state.get(&key_id) {
+                        Some(VelState::Tracking {
+                            playing, last_val, ..
+                        }) => (*playing, *last_val),
+                        Some(VelState::Aftershock {
+                            playing, last_val, ..
+                        }) => (*playing, *last_val),
+                        None => (false, 0),
+                    };
 
                     let led = if rgb_enabled {
                         let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
@@ -1101,6 +1117,7 @@ fn main() -> Result<()> {
                             out_ch,
                             note,
                             playing: already_playing,
+                            last_val: prev_last_val,
                             led,
                         },
                     );
@@ -1116,6 +1133,7 @@ fn main() -> Result<()> {
                                 out_ch,
                                 note,
                                 playing,
+                                last_val,
                                 led,
                                 ..
                             } => {
@@ -1124,6 +1142,7 @@ fn main() -> Result<()> {
                                     let already_playing = *playing;
                                     let out_ch = *out_ch;
                                     let note = *note;
+                                    let last_val = *last_val;
                                     let led = led.clone();
                                     *st = VelState::Tracking {
                                         started: ts,
@@ -1131,6 +1150,7 @@ fn main() -> Result<()> {
                                         out_ch,
                                         note,
                                         playing: already_playing,
+                                        last_val,
                                         led,
                                     };
                                 }
@@ -1143,6 +1163,7 @@ fn main() -> Result<()> {
                             out_ch,
                             note,
                             playing,
+                            last_val,
                             led,
                             ..
                         }) => {
@@ -1150,10 +1171,11 @@ fn main() -> Result<()> {
                                 vel_state.insert(
                                     key_id,
                                     VelState::Aftershock {
-                                        quiet_since: ts,
+                                        quiet_since: Some(ts),
                                         out_ch,
                                         note,
                                         playing,
+                                        last_val,
                                         led,
                                     },
                                 );
@@ -1177,6 +1199,7 @@ fn main() -> Result<()> {
                             out_ch,
                             note,
                             playing,
+                            last_val,
                             led,
                         }) => {
                             // Already in aftershock; keep earliest quiet time.
@@ -1187,6 +1210,7 @@ fn main() -> Result<()> {
                                     out_ch,
                                     note,
                                     playing,
+                                    last_val,
                                     led,
                                 },
                             );
