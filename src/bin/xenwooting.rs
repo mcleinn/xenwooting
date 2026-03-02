@@ -1195,18 +1195,18 @@ fn main() -> Result<()> {
                             }
                         }
                         Some(VelState::Aftershock {
-                            quiet_since,
+                            quiet_since: _,
                             out_ch,
                             note,
                             playing,
                             last_val,
                             led,
                         }) => {
-                            // Already in aftershock; keep earliest quiet time.
+                            // Release: start (or restart) the aftershock timer.
                             vel_state.insert(
                                 key_id,
                                 VelState::Aftershock {
-                                    quiet_since,
+                                    quiet_since: Some(ts),
                                     out_ch,
                                     note,
                                     playing,
