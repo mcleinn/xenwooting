@@ -47,16 +47,7 @@ fn install_signal_handlers() {
 
 const C0_HZ: f64 = 16.351_597_831_287_414; // A4=440 reference, C0
 
-fn analog_to_u7(v: f32) -> u8 {
-    let x = v.clamp(0.0, 1.0) * 127.0;
-    x.round().clamp(0.0, 127.0) as u8
-}
-
-fn analog_to_u7_curved(v: f32, gamma: f32) -> u8 {
-    let g = gamma.max(0.01);
-    let x = v.clamp(0.0, 1.0).powf(g) * 127.0;
-    x.round().clamp(0.0, 127.0) as u8
-}
+// (analog_to_u7 helpers removed; aftertouch is peak-mapped like the Teensy firmware)
 
 #[derive(Debug, Clone)]
 enum KeyEdge {
@@ -131,62 +122,34 @@ enum VelState {
         peak: f32,
         out_ch: u8,
         note: u8,
-        already_playing: bool,
-        led: Option<LedState>,
-    },
-    Playing {
-        out_ch: u8,
-        note: u8,
+        playing: bool,
         led: Option<LedState>,
     },
     Aftershock {
         quiet_since: Instant,
         out_ch: u8,
         note: u8,
+        playing: bool,
         led: Option<LedState>,
     },
 }
 
 #[derive(Debug, Clone)]
-enum AftertouchProfile {
+enum AftertouchMode {
+    PeakMapped,
     Off,
-    RawLinear,
-    RawGamma { gamma: f32 },
-    AbovePressThresholdLinear,
-    AbovePressThresholdGamma { gamma: f32 },
 }
 
-impl AftertouchProfile {
-    fn name(&self) -> String {
+impl AftertouchMode {
+    fn name(&self) -> &'static str {
         match self {
-            AftertouchProfile::Off => "off".to_string(),
-            AftertouchProfile::RawLinear => "raw linear".to_string(),
-            AftertouchProfile::RawGamma { gamma } => format!("raw gamma={}", gamma),
-            AftertouchProfile::AbovePressThresholdLinear => "above-threshold linear".to_string(),
-            AftertouchProfile::AbovePressThresholdGamma { gamma } => {
-                format!("above-threshold gamma={}", gamma)
-            }
-        }
-    }
-
-    fn compute(&self, analog: f32, press_threshold: f32) -> Option<u8> {
-        match self {
-            AftertouchProfile::Off => None,
-            AftertouchProfile::RawLinear => Some(analog_to_u7(analog)),
-            AftertouchProfile::RawGamma { gamma } => Some(analog_to_u7_curved(analog, *gamma)),
-            AftertouchProfile::AbovePressThresholdLinear => {
-                let t = press_threshold.clamp(0.0, 0.99);
-                let x = ((analog - t) / (1.0 - t)).clamp(0.0, 1.0);
-                Some(analog_to_u7(x))
-            }
-            AftertouchProfile::AbovePressThresholdGamma { gamma } => {
-                let t = press_threshold.clamp(0.0, 0.99);
-                let x = ((analog - t) / (1.0 - t)).clamp(0.0, 1.0);
-                Some(analog_to_u7_curved(x, *gamma))
-            }
+            AftertouchMode::PeakMapped => "peak-mapped",
+            AftertouchMode::Off => "off",
         }
     }
 }
+
+// (AftertouchProfile removed; aftertouch is peak-mapped like the Teensy firmware)
 
 struct AlsaMidiOut {
     seq: Seq,
@@ -549,14 +512,11 @@ fn main() -> Result<()> {
     ];
     let mut velocity_profile_idx: usize = 0;
 
-    let aftertouch_profiles: Vec<AftertouchProfile> = vec![
-        AftertouchProfile::RawLinear,
-        AftertouchProfile::RawGamma { gamma: 1.3 },
-        AftertouchProfile::AbovePressThresholdLinear,
-        AftertouchProfile::AbovePressThresholdGamma { gamma: 1.3 },
-        AftertouchProfile::Off,
-    ];
-    let mut aftertouch_profile_idx: usize = 0;
+    let mut aftertouch_mode = if no_aftertouch {
+        AftertouchMode::Off
+    } else {
+        AftertouchMode::PeakMapped
+    };
 
     // Global run-flag is controlled by signal handler.
     RUNNING.store(true, Ordering::SeqCst);
@@ -686,15 +646,20 @@ fn main() -> Result<()> {
                         }
                     } else if is_down_now && was_down {
                         let prev = last_analog.get(&hid).copied().unwrap_or(0.0);
+                        // Send updates while a key is held so peak tracking and aftertouch
+                        // keep working even when the analog value doesn't change much.
+                        //
+                        // To keep bandwidth reasonable, only update the stored prev value
+                        // when a meaningful analog delta occurred.
                         if (*analog - prev).abs() >= update_delta {
                             last_analog.insert(hid.clone(), *analog);
-                            let _ = tx.send(KeyEdge::Update {
-                                device_id: *device_id,
-                                hid,
-                                analog: *analog,
-                                ts: Instant::now(),
-                            });
                         }
+                        let _ = tx.send(KeyEdge::Update {
+                            device_id: *device_id,
+                            hid,
+                            analog: *analog,
+                            ts: Instant::now(),
+                        });
                     }
                 }
             }
@@ -799,7 +764,7 @@ fn main() -> Result<()> {
                         peak,
                         out_ch,
                         note,
-                        already_playing,
+                        playing,
                         led,
                     } => {
                         if started.elapsed() >= peak_track {
@@ -808,12 +773,38 @@ fn main() -> Result<()> {
                             let n2 = velocity_profiles[velocity_profile_idx].apply(n);
                             let vel = (n2 * 126.0).round().clamp(0.0, 126.0) as u8 + 1;
 
-                            if !already_playing {
+                            if !playing {
                                 let _ = midi_out.send_note(true, out_ch, note, vel);
-                                vel_state.insert(key, VelState::Playing { out_ch, note, led });
+                                // After firing, go to Aftershock state (like the Teensy state
+                                // machine). While the key is still held, the next Update will
+                                // return it to Tracking again, and repeated windows will emit
+                                // aftertouch values.
+                                vel_state.insert(
+                                    key,
+                                    VelState::Aftershock {
+                                        quiet_since: Instant::now(),
+                                        out_ch,
+                                        note,
+                                        playing: true,
+                                        led,
+                                    },
+                                );
                             } else {
-                                let _ = midi_out.send_polytouch(out_ch, note, vel);
-                                vel_state.insert(key, VelState::Playing { out_ch, note, led });
+                                if matches!(aftertouch_mode, AftertouchMode::PeakMapped)
+                                    && !no_aftertouch
+                                {
+                                    let _ = midi_out.send_polytouch(out_ch, note, vel);
+                                }
+                                vel_state.insert(
+                                    key,
+                                    VelState::Aftershock {
+                                        quiet_since: Instant::now(),
+                                        out_ch,
+                                        note,
+                                        playing,
+                                        led,
+                                    },
+                                );
                             }
                         }
                     }
@@ -821,10 +812,13 @@ fn main() -> Result<()> {
                         quiet_since,
                         out_ch,
                         note,
+                        playing,
                         led,
                     } => {
                         if quiet_since.elapsed() >= aftershock {
-                            let _ = midi_out.send_note(false, out_ch, note, 0);
+                            if playing {
+                                let _ = midi_out.send_note(false, out_ch, note, 0);
+                            }
                             if let Some(led) = led {
                                 let _ = try_send_drop(
                                     &rgb_tx,
@@ -839,7 +833,6 @@ fn main() -> Result<()> {
                             vel_state.remove(&key);
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -908,12 +901,11 @@ fn main() -> Result<()> {
                     continue;
                 }
                 HIDCodes::RightAlt => {
-                    aftertouch_profile_idx =
-                        (aftertouch_profile_idx + 1) % aftertouch_profiles.len();
-                    info!(
-                        "aftertouch_profile now {}",
-                        aftertouch_profiles[aftertouch_profile_idx].name()
-                    );
+                    aftertouch_mode = match aftertouch_mode {
+                        AftertouchMode::PeakMapped => AftertouchMode::Off,
+                        AftertouchMode::Off => AftertouchMode::PeakMapped,
+                    };
+                    info!("aftertouch_mode now {}", aftertouch_mode.name());
                     continue;
                 }
                 HIDCodes::Space => {
@@ -1076,7 +1068,8 @@ fn main() -> Result<()> {
                 if kind == "down" {
                     let already_playing = matches!(
                         vel_state.get(&key_id),
-                        Some(VelState::Playing { .. }) | Some(VelState::Aftershock { .. })
+                        Some(VelState::Tracking { playing: true, .. })
+                            | Some(VelState::Aftershock { playing: true, .. })
                     );
 
                     let led = if rgb_enabled {
@@ -1107,7 +1100,7 @@ fn main() -> Result<()> {
                             peak: analog,
                             out_ch,
                             note,
-                            already_playing,
+                            playing: already_playing,
                             led,
                         },
                     );
@@ -1119,16 +1112,29 @@ fn main() -> Result<()> {
                                     *peak = analog;
                                 }
                             }
-                            VelState::Playing { out_ch, note, .. } => {
-                                if !no_aftertouch {
-                                    if let Some(p) = aftertouch_profiles[aftertouch_profile_idx]
-                                        .compute(analog, press_threshold)
-                                    {
-                                        let _ = midi_out.send_polytouch(*out_ch, *note, p);
-                                    }
+                            VelState::Aftershock {
+                                out_ch,
+                                note,
+                                playing,
+                                led,
+                                ..
+                            } => {
+                                // If still held, transition back to Tracking (Teensy state 2 -> 1).
+                                if analog > press_threshold {
+                                    let already_playing = *playing;
+                                    let out_ch = *out_ch;
+                                    let note = *note;
+                                    let led = led.clone();
+                                    *st = VelState::Tracking {
+                                        started: ts,
+                                        peak: analog,
+                                        out_ch,
+                                        note,
+                                        playing: already_playing,
+                                        led,
+                                    };
                                 }
                             }
-                            _ => {}
                         }
                     }
                 } else if kind == "up" {
@@ -1136,17 +1142,18 @@ fn main() -> Result<()> {
                         Some(VelState::Tracking {
                             out_ch,
                             note,
-                            already_playing,
+                            playing,
                             led,
                             ..
                         }) => {
-                            if already_playing {
+                            if playing {
                                 vel_state.insert(
                                     key_id,
                                     VelState::Aftershock {
                                         quiet_since: ts,
                                         out_ch,
                                         note,
+                                        playing,
                                         led,
                                     },
                                 );
@@ -1165,21 +1172,11 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
-                        Some(VelState::Playing { out_ch, note, led }) => {
-                            vel_state.insert(
-                                key_id,
-                                VelState::Aftershock {
-                                    quiet_since: ts,
-                                    out_ch,
-                                    note,
-                                    led,
-                                },
-                            );
-                        }
                         Some(VelState::Aftershock {
                             quiet_since,
                             out_ch,
                             note,
+                            playing,
                             led,
                         }) => {
                             // Already in aftershock; keep earliest quiet time.
@@ -1189,6 +1186,7 @@ fn main() -> Result<()> {
                                     quiet_since,
                                     out_ch,
                                     note,
+                                    playing,
                                     led,
                                 },
                             );
