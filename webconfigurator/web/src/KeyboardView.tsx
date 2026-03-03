@@ -14,6 +14,7 @@ type KeyboardViewProps = {
   setSelectedOrder: (next: string[]) => void
   lastSelected: string | null
   setLastSelected: (id: string | null) => void
+  onKeyHighlight?: (board: 'Board0' | 'Board1', idx: number, down: boolean) => void
 }
 
 export function KeyboardView({
@@ -29,6 +30,7 @@ export function KeyboardView({
   setSelectedOrder,
   lastSelected,
   setLastSelected,
+  onKeyHighlight,
 }: KeyboardViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(1)
@@ -194,6 +196,18 @@ export function KeyboardView({
                   height,
                   backgroundColor: rgb,
                 }}
+                onPointerDown={(e) => {
+                  try {
+                    // Keep getting pointer events even if pointer leaves the key.
+                    ;(e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId)
+                  } catch {
+                    // ignore
+                  }
+                  onKeyHighlight?.(boardId, wtnIdx, true)
+                }}
+                onPointerUp={() => onKeyHighlight?.(boardId, wtnIdx, false)}
+                onPointerCancel={() => onKeyHighlight?.(boardId, wtnIdx, false)}
+                onPointerLeave={() => onKeyHighlight?.(boardId, wtnIdx, false)}
                 onClick={() => toggle(wtnIdx)}
                 title={`${boardId} idx ${wtnIdx}`}
               >

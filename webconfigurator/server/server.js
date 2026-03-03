@@ -3,7 +3,7 @@ import path from 'node:path'
 import fs from 'node:fs/promises'
 import TOML from '@iarna/toml'
 
-import { readWtnFile, writeWtnFile } from './wtn.js'
+import { formatWtn, readWtnFile, writeWtnFile } from './wtn.js'
 import { loadPlayableGeometry } from './geometry.js'
 
 const APP_BASE = '/wtn'
@@ -22,6 +22,29 @@ app.use(express.json({ limit: '2mb' }))
 async function reloadXenwooting() {
   // xenwooting watches the .wtn file and reloads on change.
   return { ok: true }
+}
+
+const PREVIEW_ENABLED_PATH = process.env.XENWOOTING_PREVIEW_ENABLED_PATH || '/tmp/xenwooting-preview.enabled'
+const PREVIEW_WTN_PATH = process.env.XENWOOTING_PREVIEW_WTN_PATH || '/tmp/xenwooting-preview.wtn'
+const HIGHLIGHT_PATH = process.env.XENWOOTING_HIGHLIGHT_PATH || '/tmp/xenwooting-highlight.txt'
+
+async function writeFileAtomic(filePath, text) {
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`
+  await fs.writeFile(tmp, text, 'utf8')
+  await fs.rename(tmp, filePath)
+}
+
+async function safeUnlink(filePath) {
+  try {
+    await fs.unlink(filePath)
+  } catch (e) {
+    if (e && typeof e === 'object' && 'code' in e && e.code === 'ENOENT') return
+    throw e
+  }
+}
+
+function boardNameToIndex(name) {
+  return name === 'Board0' ? 0 : name === 'Board1' ? 1 : null
 }
 
 app.get(`${API_BASE}/layouts`, async (_req, res) => {
@@ -97,6 +120,72 @@ app.post(`${API_BASE}/layout/:id`, async (req, res) => {
 
     const reload = await reloadXenwooting()
     res.json({ ok: true, xenwootingReloaded: reload.ok, xenwootingReloadError: reload.error || null })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+// Preview mode: write temporary .wtn without touching the on-disk layout.
+app.post(`${API_BASE}/preview/enable`, async (req, res) => {
+  try {
+    const layoutId = String(req.body?.layoutId || '')
+    const boards = req.body?.boards
+    if (!layoutId || !boards || !boards.Board0 || !boards.Board1) {
+      res.status(400).json({ error: 'Expected body: { layoutId, boards }' })
+      return
+    }
+
+    await writeFileAtomic(PREVIEW_WTN_PATH, formatWtn(boards))
+    await writeFileAtomic(PREVIEW_ENABLED_PATH, `${layoutId}\n`)
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+app.post(`${API_BASE}/preview/update`, async (req, res) => {
+  try {
+    const layoutId = String(req.body?.layoutId || '')
+    const boards = req.body?.boards
+    if (!layoutId || !boards || !boards.Board0 || !boards.Board1) {
+      res.status(400).json({ error: 'Expected body: { layoutId, boards }' })
+      return
+    }
+    await writeFileAtomic(PREVIEW_WTN_PATH, formatWtn(boards))
+    // keep enabled file updated too
+    await writeFileAtomic(PREVIEW_ENABLED_PATH, `${layoutId}\n`)
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+app.post(`${API_BASE}/preview/disable`, async (_req, res) => {
+  try {
+    await safeUnlink(PREVIEW_ENABLED_PATH)
+    await safeUnlink(PREVIEW_WTN_PATH)
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+// Manual highlight while pointer is held in the web UI.
+app.post(`${API_BASE}/highlight`, async (req, res) => {
+  try {
+    const layoutId = String(req.body?.layoutId || '')
+    const board = String(req.body?.board || '')
+    const idx = Number.parseInt(String(req.body?.idx ?? ''), 10)
+    const down = Boolean(req.body?.down)
+    const b = boardNameToIndex(board)
+    if (!layoutId || b === null || !Number.isFinite(idx) || idx < 0 || idx >= 56) {
+      res.status(400).json({ error: 'Expected body: { layoutId, board: Board0|Board1, idx: 0..55, down: bool }' })
+      return
+    }
+
+    const text = `layoutId=${layoutId}\nboard=${b}\nidx=${idx}\ndown=${down ? 1 : 0}\nts=${Date.now()}\n`
+    await writeFileAtomic(HIGHLIGHT_PATH, text)
+    res.json({ ok: true })
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })
   }

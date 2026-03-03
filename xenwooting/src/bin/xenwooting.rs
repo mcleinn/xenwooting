@@ -602,7 +602,21 @@ fn main() -> Result<()> {
     let mut wtn =
         Wtn::load(&wtn_path).with_context(|| format!("Load wtn {}", wtn_path.display()))?;
     let mut wtn_mtime: Option<SystemTime> = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+    let mut base_wtn = wtn.clone();
+    let mut base_wtn_mtime = wtn_mtime;
     let mut last_wtn_check = Instant::now();
+
+    // Webconfigurator preview mode (temporary mapping without saving).
+    let preview_enabled_path = PathBuf::from("/tmp/xenwooting-preview.enabled");
+    let preview_wtn_path = PathBuf::from("/tmp/xenwooting-preview.wtn");
+    let highlight_path = PathBuf::from("/tmp/xenwooting-highlight.txt");
+    let mut preview_enabled = false;
+    let mut preview_layout_id: Option<String> = None;
+    let mut preview_wtn_mtime: Option<SystemTime> = None;
+
+    // Manual highlight state (from the web UI).
+    let mut manual_highlight: Option<(u8, u8, u8, (u8, u8, u8))> = None;
+    let mut highlight_mtime: Option<SystemTime> = None;
 
     // MIDI out
     let mut midi_out = AlsaMidiOut::new(&cfg.midi_out_name)?;
@@ -1038,26 +1052,209 @@ fn main() -> Result<()> {
                 }
             }
         }
-        // Detect .wtn changes on disk and reload without restarting the service.
-        // This lets the configurator update XenWooting immediately after Save.
+        // Preview mode and .wtn reloading.
+        //
+        // - Base (on-disk) wtn is always reloaded into `base_wtn`.
+        // - If preview is enabled, `wtn` is loaded from /tmp/xenwooting-preview.wtn.
+        // - Leaving preview restores `wtn = base_wtn`.
         if last_wtn_check.elapsed() >= Duration::from_millis(200) {
             last_wtn_check = Instant::now();
+
+            // Refresh base wtn if the on-disk file changed.
             if let Ok(modified) = fs::metadata(&wtn_path).and_then(|m| m.modified()) {
-                let changed = match wtn_mtime {
+                let changed = match base_wtn_mtime {
                     Some(prev) => modified != prev,
                     None => true,
                 };
                 if changed {
                     match Wtn::load(&wtn_path) {
                         Ok(new_wtn) => {
-                            wtn = new_wtn;
-                            wtn_mtime = Some(modified);
-                            refresh_vel_led_bases(&wtn, &mut vel_state);
-                            paint_base(&wtn, false, &rgb_index_by_device_id);
-                            info!("Reloaded wtn from disk: {}", wtn_path.display());
+                            base_wtn = new_wtn;
+                            base_wtn_mtime = Some(modified);
+                            if !preview_enabled {
+                                wtn = base_wtn.clone();
+                                wtn_mtime = base_wtn_mtime;
+                                refresh_vel_led_bases(&wtn, &mut vel_state);
+                                paint_base(&wtn, false, &rgb_index_by_device_id);
+                                info!("Reloaded wtn from disk: {}", wtn_path.display());
+                            } else {
+                                info!("Reloaded base wtn (preview active): {}", wtn_path.display());
+                            }
                         }
                         Err(e) => {
                             eprintln!("wtn reload failed ({}): {e}", wtn_path.display());
+                        }
+                    }
+                }
+            }
+
+            // Preview enable/disable + (optional) layout switching.
+            let enabled_now = preview_enabled_path.exists();
+            let layout_now: Option<String> = if enabled_now {
+                fs::read_to_string(&preview_enabled_path)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+
+            if enabled_now != preview_enabled || layout_now != preview_layout_id {
+                preview_enabled = enabled_now;
+                preview_layout_id = layout_now.clone();
+
+                if preview_enabled {
+                    if let Some(id) = layout_now {
+                        if let Some(i) = cfg.layouts.iter().position(|l| l.id == id) {
+                            if i != layout_index {
+                                layout_index = i;
+                                eprintln!(
+                                    "preview: switching layout -> {}",
+                                    cfg.layouts[layout_index].id
+                                );
+                                set_mts_table(&master, &cfg.layouts[layout_index])?;
+                                wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
+                                base_wtn = Wtn::load(&wtn_path)
+                                    .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
+                                base_wtn_mtime =
+                                    fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                                wtn_mtime = base_wtn_mtime;
+                            }
+                        }
+                    }
+                    // Force a reload of preview file.
+                    preview_wtn_mtime = None;
+                    info!("preview: enabled");
+                } else {
+                    // Restore base config.
+                    wtn = base_wtn.clone();
+                    wtn_mtime = base_wtn_mtime;
+                    preview_wtn_mtime = None;
+                    refresh_vel_led_bases(&wtn, &mut vel_state);
+                    paint_base(&wtn, true, &rgb_index_by_device_id);
+                    info!("preview: disabled");
+                }
+            }
+
+            // If preview enabled, reload preview wtn on change.
+            if preview_enabled {
+                if let Ok(modified) = fs::metadata(&preview_wtn_path).and_then(|m| m.modified()) {
+                    let changed = match preview_wtn_mtime {
+                        Some(prev) => modified != prev,
+                        None => true,
+                    };
+                    if changed {
+                        match Wtn::load(&preview_wtn_path) {
+                            Ok(new_wtn) => {
+                                wtn = new_wtn;
+                                preview_wtn_mtime = Some(modified);
+                                refresh_vel_led_bases(&wtn, &mut vel_state);
+                                paint_base(&wtn, false, &rgb_index_by_device_id);
+                                info!("preview: reloaded wtn {}", preview_wtn_path.display());
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "preview wtn reload failed ({}): {e}",
+                                    preview_wtn_path.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Manual highlight via web UI.
+            if let Ok(modified) = fs::metadata(&highlight_path).and_then(|m| m.modified()) {
+                let changed = match highlight_mtime {
+                    Some(prev) => modified != prev,
+                    None => true,
+                };
+                if changed {
+                    highlight_mtime = Some(modified);
+                    if let Ok(text) = fs::read_to_string(&highlight_path) {
+                        let mut board: Option<u8> = None;
+                        let mut idx: Option<usize> = None;
+                        let mut down: Option<bool> = None;
+                        for line in text.lines() {
+                            if let Some(v) = line.strip_prefix("board=") {
+                                board = v.trim().parse::<u8>().ok();
+                            } else if let Some(v) = line.strip_prefix("idx=") {
+                                idx = v.trim().parse::<usize>().ok();
+                            } else if let Some(v) = line.strip_prefix("down=") {
+                                down =
+                                    Some(v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"));
+                            }
+                        }
+
+                        // Restore previous highlight if needed.
+                        if let Some((dev_idx, row, col, base_rgb)) = manual_highlight.take() {
+                            let _ = try_send_drop(
+                                &rgb_tx,
+                                RgbCmd::SetKey(RgbKey {
+                                    device_index: dev_idx,
+                                    row,
+                                    col,
+                                    rgb: base_rgb,
+                                }),
+                            );
+                        }
+
+                        if down.unwrap_or(false) {
+                            if let (Some(b), Some(i)) = (board, idx) {
+                                // Find device_id for this wtn_board.
+                                let mut target_dev: Option<u64> = None;
+                                for (dev_id, bcfg) in board_by_device.iter() {
+                                    if bcfg.wtn_board == b {
+                                        target_dev = Some(*dev_id);
+                                        break;
+                                    }
+                                }
+                                if let Some(device_id) = target_dev {
+                                    let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id)
+                                    else {
+                                        continue;
+                                    };
+                                    let bcfg = board_by_device.get(&device_id).unwrap();
+                                    let compact_min_col = compact_min_col_by_device
+                                        .get(&device_id)
+                                        .unwrap_or(&[0u8, 0u8, 0u8, 0u8]);
+
+                                    // Invert mapping: find the physical LED location whose wtn index matches.
+                                    let mut led_rc: Option<(u8, u8)> = None;
+                                    for (_hid, loc0) in hid_map.all_locs().into_iter() {
+                                        let loc = match rotate_4x14(loc0, bcfg.rotation_deg)
+                                            .and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
+                                        {
+                                            Ok(v) => v,
+                                            Err(_) => continue,
+                                        };
+                                        let Some(widx) = wtn_index_for_loc(loc, compact_min_col)
+                                        else {
+                                            continue;
+                                        };
+                                        if widx == i {
+                                            led_rc = Some((loc.led_row, loc.led_col));
+                                            break;
+                                        }
+                                    }
+
+                                    if let Some((row, col)) = led_rc {
+                                        // Compute base color from current active mapping.
+                                        let base_rgb =
+                                            wtn.cell(b, i).map(|c| c.col_rgb).unwrap_or((0, 0, 0));
+                                        let _ = try_send_drop(
+                                            &rgb_tx,
+                                            RgbCmd::SetKey(RgbKey {
+                                                device_index: dev_idx,
+                                                row,
+                                                col,
+                                                rgb: highlight_rgb,
+                                            }),
+                                        );
+                                        manual_highlight = Some((dev_idx, row, col, base_rgb));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1348,11 +1545,15 @@ fn main() -> Result<()> {
                         set_mts_table(&master, &cfg.layouts[layout_index])?;
                         wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
                         eprintln!("loading wtn: {}", wtn_path.display());
-                        wtn = Wtn::load(&wtn_path)
+                        base_wtn = Wtn::load(&wtn_path)
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
-                        wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
-                        refresh_vel_led_bases(&wtn, &mut vel_state);
-                        paint_base(&wtn, false, &rgb_index_by_device_id);
+                        base_wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                        wtn_mtime = base_wtn_mtime;
+                        if !preview_enabled {
+                            wtn = base_wtn.clone();
+                            refresh_vel_led_bases(&wtn, &mut vel_state);
+                            paint_base(&wtn, false, &rgb_index_by_device_id);
+                        }
                     }
                     "layout_prev" => {
                         if layout_index == 0 {
@@ -1364,11 +1565,15 @@ fn main() -> Result<()> {
                         set_mts_table(&master, &cfg.layouts[layout_index])?;
                         wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
                         eprintln!("loading wtn: {}", wtn_path.display());
-                        wtn = Wtn::load(&wtn_path)
+                        base_wtn = Wtn::load(&wtn_path)
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
-                        wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
-                        refresh_vel_led_bases(&wtn, &mut vel_state);
-                        paint_base(&wtn, false, &rgb_index_by_device_id);
+                        base_wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                        wtn_mtime = base_wtn_mtime;
+                        if !preview_enabled {
+                            wtn = base_wtn.clone();
+                            refresh_vel_led_bases(&wtn, &mut vel_state);
+                            paint_base(&wtn, false, &rgb_index_by_device_id);
+                        }
                     }
                     "octave_up" => {
                         octave_shift = (octave_shift + 1).min(15);

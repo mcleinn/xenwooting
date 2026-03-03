@@ -1,6 +1,15 @@
 import './App.css'
-import { useEffect, useMemo, useState } from 'react'
-import { fetchGeometry, fetchLayout, fetchLayouts, saveLayout } from './api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  fetchGeometry,
+  fetchLayout,
+  fetchLayouts,
+  highlightKey,
+  previewDisable,
+  previewEnable,
+  previewUpdate,
+  saveLayout,
+} from './api'
 import { KeyboardView } from './KeyboardView'
 import type { Boards, Geometry, LayoutInfo } from './types'
 
@@ -27,6 +36,9 @@ function App() {
   const [colMixed, setColMixed] = useState(false)
   const [status, setStatus] = useState<string>('')
 
+  const [previewMode, setPreviewMode] = useState(false)
+  const previewPushTimer = useRef<number | null>(null)
+
   useEffect(() => {
     let cancelled = false
     Promise.all([fetchLayouts(), fetchGeometry()])
@@ -51,6 +63,13 @@ function App() {
     if (!layoutId) return
     let cancelled = false
     setStatus('Loading .wtn...')
+
+    // Changing layout exits preview mode.
+    if (previewMode) {
+      setPreviewMode(false)
+      previewDisable().catch(() => {})
+    }
+
     fetchLayout(layoutId)
       .then((l) => {
         if (cancelled) return
@@ -175,6 +194,7 @@ function App() {
     }
 
     setBoards(next)
+    pushPreview(next)
   }
 
   function applyOctave() {
@@ -200,6 +220,69 @@ function App() {
     }
 
     setBoards(next)
+    pushPreview(next)
+  }
+
+  function pushPreview(nextBoards: Boards) {
+    if (!previewMode) return
+    if (!layoutId) return
+
+    if (previewPushTimer.current !== null) {
+      window.clearTimeout(previewPushTimer.current)
+      previewPushTimer.current = null
+    }
+    previewPushTimer.current = window.setTimeout(() => {
+      previewUpdate(layoutId, nextBoards).catch((e) => {
+        setStatus(`Preview sync failed: ${errMsg(e)}`)
+      })
+    }, 60)
+  }
+
+  async function exitPreviewMode() {
+    setPreviewMode(false)
+    try {
+      await previewDisable()
+    } catch (e) {
+      setStatus(`Preview disable failed: ${errMsg(e)}`)
+    }
+  }
+
+  async function onTogglePreview(next: boolean) {
+    if (!layoutId || !boards) return
+    if (!next) {
+      await exitPreviewMode()
+      return
+    }
+    setStatus('Preview enabling...')
+    try {
+      await previewEnable(layoutId, boards)
+      setPreviewMode(true)
+      setStatus('Preview enabled.')
+      setTimeout(() => setStatus(''), 800)
+    } catch (e) {
+      setPreviewMode(false)
+      setStatus(`Preview enable failed: ${errMsg(e)}`)
+    }
+  }
+
+  async function onRevert() {
+    await exitPreviewMode()
+    if (!layoutId) return
+    setStatus('Reverting...')
+    try {
+      const l = await fetchLayout(layoutId)
+      setLayoutName(l.name)
+      setBoards(l.boards)
+      setEdoDivisions(Number.isFinite(l.edoDivisions) ? l.edoDivisions : 12)
+      setPitchOffset(Number.isFinite(l.pitchOffset) ? l.pitchOffset : 0)
+      setSelected(new Set())
+      setSelectedOrder([])
+      setLastSelected(null)
+      setStatus('Reverted.')
+      setTimeout(() => setStatus(''), 800)
+    } catch (e) {
+      setStatus(`Revert failed: ${errMsg(e)}`)
+    }
   }
 
   async function onSave() {
@@ -207,6 +290,7 @@ function App() {
     setStatus('Saving...')
     try {
       const r = await saveLayout(layoutId, boards)
+      await exitPreviewMode()
       setStatus(r.xenwootingReloaded ? 'Saved + reloaded XenWooting.' : 'Saved (reload failed).')
       // Refresh from disk so UI matches canonical .wtn.
       const l = await fetchLayout(layoutId)
@@ -225,6 +309,11 @@ function App() {
     }
   }
 
+  function onKeyHighlight(board: 'Board0' | 'Board1', idx: number, down: boolean) {
+    if (!layoutId) return
+    highlightKey(layoutId, board, idx, down).catch(() => {})
+  }
+
   return (
     <div className="app">
       <header className="topbar">
@@ -233,6 +322,16 @@ function App() {
         </div>
 
         <div className="controls">
+          <label className="previewToggle">
+            <input
+              type="checkbox"
+              checked={previewMode}
+              onChange={(e) => void onTogglePreview(e.target.checked)}
+              disabled={!boards || !layoutId}
+            />
+            <span>Preview mode</span>
+          </label>
+
           <label className="field">
             <span className="fieldLabel">Layout</span>
             <select
@@ -248,6 +347,15 @@ function App() {
               ))}
             </select>
           </label>
+
+          <button
+            className="btnSecondary"
+            type="button"
+            onClick={() => void onRevert()}
+            disabled={!layoutId}
+          >
+            Revert
+          </button>
 
           <button className="btn" type="button" onClick={onSave} disabled={!boards || !layoutId}>
             Save
@@ -401,6 +509,7 @@ function App() {
                 setSelectedOrder={setSelectedOrder}
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
+                onKeyHighlight={onKeyHighlight}
               />
               <KeyboardView
                 title="Board1"
@@ -413,6 +522,7 @@ function App() {
                 setSelectedOrder={setSelectedOrder}
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
+                onKeyHighlight={onKeyHighlight}
               />
             </>
           )}

@@ -40,3 +40,37 @@ export async function fetchGeometry(): Promise<Geometry> {
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
+
+export async function previewEnable(layoutId: string, boards: Boards): Promise<void> {
+  const res = await fetch(apiUrl('api/preview/enable'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ layoutId, boards }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+}
+
+export async function previewUpdate(layoutId: string, boards: Boards): Promise<void> {
+  const res = await fetch(apiUrl('api/preview/update'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ layoutId, boards }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+}
+
+export async function previewDisable(): Promise<void> {
+  const res = await fetch(apiUrl('api/preview/disable'), {
+    method: 'POST',
+  })
+  if (!res.ok) throw new Error(await res.text())
+}
+
+export async function highlightKey(layoutId: string, board: 'Board0' | 'Board1', idx: number, down: boolean): Promise<void> {
+  const res = await fetch(apiUrl('api/highlight'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ layoutId, board, idx, down }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+}
