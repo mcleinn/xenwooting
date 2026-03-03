@@ -5,6 +5,7 @@ use log::info;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -344,6 +345,109 @@ fn set_mts_table(master: &MtsMaster, layout: &xenwooting::config::LayoutConfig) 
     Ok(())
 }
 
+fn compute_rgb_index_by_device_id(
+    configured_device_ids: &HashSet<u64>,
+    rgb_count: u8,
+) -> HashMap<u64, u8> {
+    if rgb_count == 0 {
+        return HashMap::new();
+    }
+
+    // Enumerate Wooting HID devices via sysfs.
+    // We rely on HID_UNIQ as the serial string.
+    let mut best_by_serial: HashMap<String, (u16, u16, String)> = HashMap::new();
+    // serial -> (vid, pid, sort_key)
+
+    let dir = std::path::Path::new("/sys/bus/hid/devices");
+    let entries = match std::fs::read_dir(dir) {
+        Ok(v) => v,
+        Err(_) => return HashMap::new(),
+    };
+
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.contains(":31E3:") {
+            continue;
+        }
+        let uevent_path = e.path().join("uevent");
+        let uevent = match std::fs::read_to_string(&uevent_path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let mut serial: Option<String> = None;
+        let mut vid: Option<u16> = None;
+        let mut pid: Option<u16> = None;
+        let mut phys: Option<String> = None;
+        for line in uevent.lines() {
+            if let Some(v) = line.strip_prefix("HID_UNIQ=") {
+                let s = v.trim();
+                if !s.is_empty() {
+                    serial = Some(s.to_string());
+                }
+            } else if let Some(v) = line.strip_prefix("HID_ID=") {
+                // Example: 0003:000031E3:00001342
+                let parts: Vec<&str> = v.trim().split(':').collect();
+                if parts.len() == 3 {
+                    // Parse last 4 hex digits (VID/PID are 16-bit).
+                    if parts[1].len() >= 4 {
+                        vid = u16::from_str_radix(&parts[1][parts[1].len() - 4..], 16).ok();
+                    }
+                    if parts[2].len() >= 4 {
+                        pid = u16::from_str_radix(&parts[2][parts[2].len() - 4..], 16).ok();
+                    }
+                }
+            } else if let Some(v) = line.strip_prefix("HID_PHYS=") {
+                let s = v.trim();
+                if !s.is_empty() {
+                    phys = Some(s.to_string());
+                }
+            }
+        }
+
+        let (Some(serial), Some(vid), Some(pid), Some(phys)) = (serial, vid, pid, phys) else {
+            continue;
+        };
+
+        // Prefer the smallest phys string for stable ordering.
+        match best_by_serial.get(&serial) {
+            Some((_v, _p, best_phys)) if best_phys <= &phys => {}
+            _ => {
+                best_by_serial.insert(serial, (vid, pid, phys));
+            }
+        }
+    }
+
+    // Convert serials into Analog device_ids.
+    let mut devices: Vec<(String, u64)> = Vec::new();
+    for (serial, (vid, pid, sort_key)) in best_by_serial.iter() {
+        let id = analog_device_id_from_serial(serial, *vid, *pid);
+        if configured_device_ids.contains(&id) {
+            devices.push((sort_key.clone(), id));
+        }
+    }
+
+    devices.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out: HashMap<u64, u8> = HashMap::new();
+    for (idx, (_key, dev_id)) in devices.into_iter().enumerate() {
+        if idx >= rgb_count as usize {
+            break;
+        }
+        out.insert(dev_id, idx as u8);
+    }
+    out
+}
+
+fn analog_device_id_from_serial(serial: &str, vendor_id: u16, product_id: u16) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut s = DefaultHasher::new();
+    s.write_u16(vendor_id);
+    s.write_u16(product_id);
+    s.write(serial.as_bytes());
+    s.finish()
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -508,6 +612,16 @@ fn main() -> Result<()> {
         }
     }
 
+    // IDs we are willing to poll / paint for.
+    let configured_device_ids: HashSet<u64> = board_by_device.keys().copied().collect();
+
+    // Robust mapping from Analog device_id -> RGB SDK device_index.
+    //
+    // The Analog SDK's DeviceID is derived from (vid, pid, serial). We can recover that same ID
+    // from Linux sysfs (HID_UNIQ) and then map to the RGB SDK's current device indices. This keeps
+    // LED routing stable across unplug/replug and independent of discovery order.
+    let mut rgb_index_by_device_id: HashMap<u64, u8> = HashMap::new();
+
     let mut octave_shift: i8 = 0; // persistent shifts MIDI channel index
     let mut octave_hold: bool = false; // momentary +1 channel (Space)
 
@@ -534,32 +648,61 @@ fn main() -> Result<()> {
     // Poll the SDK from a single thread.
     // In practice this is more reliable than polling the SDK concurrently.
     let (tx, rx) = mpsc::channel::<KeyEdge>();
-    let poll_ids: Vec<u64> = devices
-        .iter()
-        .filter(|d| board_by_device.contains_key(&d.device_id))
-        .map(|d| d.device_id)
-        .collect();
-    if log_poll {
-        eprintln!("poll_ids={:?}", poll_ids);
-    }
+    // We'll refresh connected device IDs dynamically to support hotplug.
     let press_threshold_bits = Arc::new(std::sync::atomic::AtomicU32::new(
         cfg.press_threshold.to_bits(),
     ));
     let update_delta = cfg.aftertouch_delta.clamp(0.001, 0.2);
     let verbose = dump_hid || log_edges || log_midi || log_poll;
     let press_threshold_bits_poll = Arc::clone(&press_threshold_bits);
+    let configured_device_ids_poll = configured_device_ids.clone();
     std::thread::spawn(move || {
         let mut down_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut last_analog_by_device: HashMap<u64, HashMap<HIDCodes, f32>> = HashMap::new();
-        for id in &poll_ids {
-            down_by_device.insert(*id, HashSet::new());
-            last_analog_by_device.insert(*id, HashMap::new());
-        }
+        let mut poll_ids: Vec<u64> = Vec::new();
+        let mut last_dev_refresh = std::time::Instant::now() - Duration::from_secs(999);
         let mut last_report = std::time::Instant::now() - Duration::from_secs(999);
         let mut err_count: u64 = 0;
 
         while RUNNING.load(Ordering::SeqCst) {
             let _ = sdk::set_keycode_mode(KeycodeType::HID);
+
+            // Refresh connected devices at a slower cadence than the poll loop.
+            if last_dev_refresh.elapsed() >= Duration::from_millis(500) {
+                last_dev_refresh = std::time::Instant::now();
+                match sdk::get_connected_devices_info(32).0 {
+                    Ok(devs) => {
+                        let mut new_ids: Vec<u64> = devs
+                            .iter()
+                            .filter(|d| configured_device_ids_poll.contains(&d.device_id))
+                            .map(|d| d.device_id)
+                            .collect();
+                        new_ids.sort_unstable();
+                        if new_ids != poll_ids {
+                            if verbose {
+                                eprintln!("poll_ids updated: {:?}", new_ids);
+                            }
+                            // Add new device maps.
+                            for id in &new_ids {
+                                down_by_device.entry(*id).or_insert_with(HashSet::new);
+                                last_analog_by_device
+                                    .entry(*id)
+                                    .or_insert_with(HashMap::new);
+                            }
+                            // Drop removed device maps.
+                            down_by_device.retain(|id, _| new_ids.contains(id));
+                            last_analog_by_device.retain(|id, _| new_ids.contains(id));
+                            poll_ids = new_ids;
+                        }
+                    }
+                    Err(e) => {
+                        if verbose {
+                            eprintln!("get_connected_devices_info error={:?}", e);
+                        }
+                    }
+                }
+            }
+
             for device_id in &poll_ids {
                 let data = match sdk::read_full_buffer_device(256, *device_id).0 {
                     Ok(v) => v,
@@ -675,16 +818,46 @@ fn main() -> Result<()> {
         }
     });
 
-    let paint_base = |wtn: &Wtn, paint_control_bar: bool| {
+    // Track hotplug of RGB devices; repaint base when device count changes.
+    let mut last_rgb_count: u8 = if rgb_enabled { Rgb::device_count() } else { 0 };
+    let mut last_rgb_check = Instant::now();
+
+    // Track hotplug of analog devices; repaint base when configured boards appear/disappear.
+    let mut last_connected_cfg_ids: HashSet<u64> = HashSet::new();
+    let mut last_cfg_dev_check = Instant::now();
+
+    let rebuild_rgb_index_map = |rgb_count: u8| -> HashMap<u64, u8> {
+        if !rgb_enabled {
+            return HashMap::new();
+        }
+        let mut m = compute_rgb_index_by_device_id(&configured_device_ids, rgb_count);
+        if m.is_empty() {
+            // Fallback to config mapping (legacy).
+            for (dev_id, bcfg) in board_by_device.iter() {
+                m.insert(
+                    *dev_id,
+                    cfg.rgb.rgb_device_index_for_wtn_board(bcfg.wtn_board),
+                );
+            }
+        }
+        m
+    };
+
+    rgb_index_by_device_id = rebuild_rgb_index_map(last_rgb_count);
+    info!("RGB device_id->rgb_index map: {:?}", rgb_index_by_device_id);
+
+    let paint_base = |wtn: &Wtn, paint_control_bar: bool, rgb_map: &HashMap<u64, u8>| {
         if !rgb_enabled {
             return;
         }
         if log_edges || log_poll || log_midi {
             eprintln!("paint_base: start");
         }
-        for (_dev_id, bcfg) in board_by_device.iter() {
+        for (dev_id, bcfg) in board_by_device.iter() {
             let wtn_board = bcfg.wtn_board;
-            let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+            let Some(&dev_idx) = rgb_map.get(dev_id) else {
+                continue;
+            };
 
             // Paint base LEDs using the HID->KeyLoc map.
             //
@@ -738,11 +911,7 @@ fn main() -> Result<()> {
         }
     };
 
-    paint_base(&wtn, true);
-
-    // Track hotplug of RGB devices; repaint base when device count changes.
-    let mut last_rgb_count: u8 = if rgb_enabled { Rgb::device_count() } else { 0 };
-    let mut last_rgb_check = Instant::now();
+    paint_base(&wtn, true, &rgb_index_by_device_id);
 
     if log_edges || log_poll || log_midi {
         eprintln!("ready: waiting for key edges");
@@ -788,8 +957,28 @@ fn main() -> Result<()> {
             let now = Rgb::device_count();
             if now != last_rgb_count {
                 last_rgb_count = now;
-                paint_base(&wtn, true);
+                rgb_index_by_device_id = rebuild_rgb_index_map(last_rgb_count);
+                info!("RGB device_id->rgb_index map: {:?}", rgb_index_by_device_id);
+                paint_base(&wtn, true, &rgb_index_by_device_id);
                 info!("RGB device count changed; repainted base ({})", now);
+            }
+        }
+
+        if last_cfg_dev_check.elapsed() >= Duration::from_millis(500) {
+            last_cfg_dev_check = Instant::now();
+            if let Ok(devs) = sdk::get_connected_devices_info(32).0 {
+                let now: HashSet<u64> = devs
+                    .iter()
+                    .map(|d| d.device_id)
+                    .filter(|id| configured_device_ids.contains(id))
+                    .collect();
+                if now != last_connected_cfg_ids {
+                    last_connected_cfg_ids = now;
+                    rgb_index_by_device_id = rebuild_rgb_index_map(last_rgb_count);
+                    info!("RGB device_id->rgb_index map: {:?}", rgb_index_by_device_id);
+                    paint_base(&wtn, true, &rgb_index_by_device_id);
+                    info!("Configured device set changed; repainted base");
+                }
             }
         }
         // Detect .wtn changes on disk and reload without restarting the service.
@@ -807,7 +996,7 @@ fn main() -> Result<()> {
                             wtn = new_wtn;
                             wtn_mtime = Some(modified);
                             refresh_vel_led_bases(&wtn, &mut vel_state);
-                            paint_base(&wtn, false);
+                            paint_base(&wtn, false, &rgb_index_by_device_id);
                             info!("Reloaded wtn from disk: {}", wtn_path.display());
                         }
                         Err(e) => {
@@ -1007,7 +1196,10 @@ fn main() -> Result<()> {
         }
 
         // Compute debug LED coordinates (either from control bar mapping or hid_map).
-        let dev_idx_dbg = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+        let dev_idx_dbg = rgb_index_by_device_id
+            .get(&device_id)
+            .copied()
+            .unwrap_or(255);
         let mut lrow_dbg: Option<u8> = None;
         let mut lcol_dbg: Option<String> = None;
         if is_control_bar {
@@ -1058,7 +1250,9 @@ fn main() -> Result<()> {
 
         // Control bar LED feedback (independent of whether a key is bound to an action).
         if rgb_enabled && is_control_bar {
-            let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
+            let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) else {
+                continue;
+            };
             if let Some(cols) = control_bar_cols_by_hid.get(&hid) {
                 if kind == "down" {
                     for &lc in cols {
@@ -1101,7 +1295,7 @@ fn main() -> Result<()> {
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
                         wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
                         refresh_vel_led_bases(&wtn, &mut vel_state);
-                        paint_base(&wtn, false);
+                        paint_base(&wtn, false, &rgb_index_by_device_id);
                     }
                     "layout_prev" => {
                         if layout_index == 0 {
@@ -1117,7 +1311,7 @@ fn main() -> Result<()> {
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
                         wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
                         refresh_vel_led_bases(&wtn, &mut vel_state);
-                        paint_base(&wtn, false);
+                        paint_base(&wtn, false, &rgb_index_by_device_id);
                     }
                     "octave_up" => {
                         octave_shift = (octave_shift + 1).min(15);
@@ -1164,22 +1358,25 @@ fn main() -> Result<()> {
                     };
 
                     let led = if rgb_enabled {
-                        let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
-                        let _ = try_send_drop(
-                            &rgb_tx,
-                            RgbCmd::SetKey(RgbKey {
-                                device_index: dev_idx,
+                        if let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) {
+                            let _ = try_send_drop(
+                                &rgb_tx,
+                                RgbCmd::SetKey(RgbKey {
+                                    device_index: dev_idx,
+                                    row: loc.led_row,
+                                    col: loc.led_col,
+                                    rgb: highlight_rgb,
+                                }),
+                            );
+                            Some(LedState {
+                                dev_idx,
                                 row: loc.led_row,
                                 col: loc.led_col,
-                                rgb: highlight_rgb,
-                            }),
-                        );
-                        Some(LedState {
-                            dev_idx,
-                            row: loc.led_row,
-                            col: loc.led_col,
-                            base_rgb: cell.col_rgb,
-                        })
+                                base_rgb: cell.col_rgb,
+                            })
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
@@ -1293,16 +1490,17 @@ fn main() -> Result<()> {
                         None => {
                             // Not tracked.
                             if rgb_enabled {
-                                let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
-                                let _ = try_send_drop(
-                                    &rgb_tx,
-                                    RgbCmd::SetKey(RgbKey {
-                                        device_index: dev_idx,
-                                        row: loc.led_row,
-                                        col: loc.led_col,
-                                        rgb: cell.col_rgb,
-                                    }),
-                                );
+                                if let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) {
+                                    let _ = try_send_drop(
+                                        &rgb_tx,
+                                        RgbCmd::SetKey(RgbKey {
+                                            device_index: dev_idx,
+                                            row: loc.led_row,
+                                            col: loc.led_col,
+                                            rgb: cell.col_rgb,
+                                        }),
+                                    );
+                                }
                             }
                         }
                     }
