@@ -16,7 +16,7 @@ use wooting_analog_wrapper as sdk;
 use wooting_analog_wrapper::{FromPrimitive, HIDCodes, KeycodeType};
 
 use xenwooting::config::{ActionBindings, Config};
-use xenwooting::hidmap::{mirror_cols_4x14, parse_hid_name, rotate_4x14, HidMap};
+use xenwooting::hidmap::{mirror_cols_4x14, parse_hid_name, rotate_4x14, HidMap, KeyLoc};
 use xenwooting::mts::MtsMaster;
 use xenwooting::rgb::{parse_hex_rgb, Rgb};
 use xenwooting::rgb_worker::{spawn_rgb_worker, try_send_drop, RgbCmd, RgbKey};
@@ -448,6 +448,41 @@ fn analog_device_id_from_serial(serial: &str, vendor_id: u16, product_id: u16) -
     s.finish()
 }
 
+fn compute_compact_col_offsets(hid_map: &HidMap, rotation_deg: u16, mirror_cols: bool) -> [u8; 4] {
+    let mut min_col: [u8; 4] = [255, 255, 255, 255];
+    for (_hid, loc0) in hid_map.all_locs() {
+        let loc =
+            match rotate_4x14(loc0, rotation_deg).and_then(|l| mirror_cols_4x14(l, mirror_cols)) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+        if loc.midi_row < 4 {
+            min_col[loc.midi_row as usize] = min_col[loc.midi_row as usize].min(loc.midi_col);
+        }
+    }
+    for r in 0..4 {
+        if min_col[r] == 255 {
+            min_col[r] = 0;
+        }
+    }
+    min_col
+}
+
+fn wtn_index_for_loc(loc: KeyLoc, compact_min_col: &[u8; 4]) -> Option<usize> {
+    if loc.midi_row >= 4 || loc.midi_col >= 14 {
+        return None;
+    }
+    let off = compact_min_col[loc.midi_row as usize];
+    if loc.midi_col < off {
+        return None;
+    }
+    let col = loc.midi_col - off;
+    if col >= 14 {
+        return None;
+    }
+    Some((loc.midi_row as usize) * 14 + (col as usize))
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
@@ -614,6 +649,17 @@ fn main() -> Result<()> {
 
     // IDs we are willing to poll / paint for.
     let configured_device_ids: HashSet<u64> = board_by_device.keys().copied().collect();
+
+    // Per-device compaction offsets (per midi_row) so .wtn indices are "left-justified"
+    // after applying rotation/mirroring. This makes Key_0 mean "first key of the first row"
+    // from the user's perspective even on rotated boards.
+    let mut compact_min_col_by_device: HashMap<u64, [u8; 4]> = HashMap::new();
+    for (dev_id, bcfg) in board_by_device.iter() {
+        compact_min_col_by_device.insert(
+            *dev_id,
+            compute_compact_col_offsets(&hid_map, bcfg.rotation_deg, bcfg.mirror_cols),
+        );
+    }
 
     // Robust mapping from Analog device_id -> RGB SDK device_index.
     //
@@ -864,6 +910,10 @@ fn main() -> Result<()> {
             // This is critical because ANSI wide keys create holes in the LED column grid.
             // Highlighting uses KeyLoc.led_row/led_col; base paint must use the same mapping
             // or rows will appear shifted.
+            let compact_min_col = compact_min_col_by_device
+                .get(dev_id)
+                .unwrap_or(&[0u8, 0u8, 0u8, 0u8]);
+
             for (_hid, loc0) in hid_map.all_locs().into_iter() {
                 // Important: `wtn` is in *logical* orientation. If the board is rotated/mirrored,
                 // map physical KeyLoc (midi_row/midi_col) to its logical lookup index.
@@ -873,7 +923,9 @@ fn main() -> Result<()> {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                let idx = (loc.midi_row as usize) * 14 + (loc.midi_col as usize);
+                let Some(idx) = wtn_index_for_loc(loc, compact_min_col) else {
+                    continue;
+                };
                 if let Some(cell) = wtn.cell(wtn_board, idx) {
                     try_send_drop(
                         &rgb_tx,
@@ -926,6 +978,9 @@ fn main() -> Result<()> {
                 continue;
             };
             let rotation = bcfg.rotation_deg;
+            let compact_min_col = compact_min_col_by_device
+                .get(device_id)
+                .unwrap_or(&[0u8, 0u8, 0u8, 0u8]);
 
             let Some(loc0) = hid_map.loc_for(hid.clone()) else {
                 continue;
@@ -936,7 +991,9 @@ fn main() -> Result<()> {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let idx = (loc.midi_row as usize) * 14 + (loc.midi_col as usize);
+            let Some(idx) = wtn_index_for_loc(loc, compact_min_col) else {
+                continue;
+            };
             let Some(cell) = wtn.cell(bcfg.wtn_board, idx) else {
                 continue;
             };
@@ -1334,7 +1391,12 @@ fn main() -> Result<()> {
 
         if let Some(loc) = hid_map.loc_for(hid.clone()) {
             let loc = mirror_cols_4x14(rotate_4x14(loc, rotation)?, bcfg.mirror_cols)?;
-            let idx = (loc.midi_row as usize) * 14 + (loc.midi_col as usize);
+            let compact_min_col = compact_min_col_by_device
+                .get(&device_id)
+                .unwrap_or(&[0u8, 0u8, 0u8, 0u8]);
+            let Some(idx) = wtn_index_for_loc(loc, compact_min_col) else {
+                continue;
+            };
             if let Some(cell) = wtn.cell(wtn_board, idx) {
                 let base_ch = cell.chan_1based.saturating_sub(1);
                 let hold = if octave_hold { 1i16 } else { 0i16 };

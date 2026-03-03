@@ -39,6 +39,30 @@ export function KeyboardView({
   const gapPx = 2
   const xOff = xOffsetU || 0
 
+  const minColByRow = useMemo(() => {
+    if (!rotate180) return [0, 0, 0, 0]
+    const min = [255, 255, 255, 255]
+    for (const k of keys) {
+      const rr = 3 - k.row
+      const cc = 13 - k.col
+      min[rr] = Math.min(min[rr], cc)
+    }
+    for (let i = 0; i < 4; i++) {
+      if (min[i] === 255) min[i] = 0
+    }
+    return min
+  }, [keys, rotate180])
+
+  const keysWithIdx = useMemo(() => {
+    return keys.map((k) => {
+      const rr = rotate180 ? 3 - k.row : k.row
+      const cc0 = rotate180 ? 13 - k.col : k.col
+      const cc = cc0 - (minColByRow[rr] || 0)
+      const wtnIdx = rr * 14 + cc
+      return { k, wtnIdx }
+    })
+  }, [keys, rotate180, minColByRow])
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Shift') setIsRange(true)
@@ -77,9 +101,9 @@ export function KeyboardView({
 
   const keysByIdx = useMemo(() => {
     const m = new Map<number, (typeof keys)[number]>()
-    for (const k of keys) m.set(k.idx, k)
+    for (const { k, wtnIdx } of keysWithIdx) m.set(wtnIdx, k)
     return m
-  }, [keys])
+  }, [keysWithIdx])
 
   function toggle(idx: number) {
     const id = `${boardId}:${idx}`
@@ -144,9 +168,9 @@ export function KeyboardView({
           className="kbdCanvas"
           style={{ width: (geometry.width + xOff) * scale, height: geometry.height * scale }}
         >
-          {keys.map((k) => {
-            const cell = byIdx.get(k.idx)
-            const id = `${boardId}:${k.idx}`
+          {keysWithIdx.map(({ k, wtnIdx }) => {
+            const cell = byIdx.get(wtnIdx)
+            const id = `${boardId}:${wtnIdx}`
             const isSel = selected.has(id)
             const rgb = cell ? `#${cell.col}` : '#444444'
 
@@ -170,8 +194,8 @@ export function KeyboardView({
                   height,
                   backgroundColor: rgb,
                 }}
-                onClick={() => toggle(k.idx)}
-                title={`${boardId} idx ${k.idx}`}
+                onClick={() => toggle(wtnIdx)}
+                title={`${boardId} idx ${wtnIdx}`}
               >
                 <div className="keyTop">
                   {cell && <span className="keyChan">[{cell.chan}]</span>}
