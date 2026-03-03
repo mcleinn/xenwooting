@@ -2,6 +2,138 @@
 
 This file documents a few non-obvious implementation choices in this repo.
 
+## Layout Logic (Grids and Mappings)
+
+This project has to reconcile multiple coordinate systems:
+
+- a logical per-board musical grid (what the user edits in `.wtn`)
+- physical keys reported by the Analog SDK (HID codes)
+- the RGB LED matrix addressed by the RGB SDK (row/col with holes)
+
+When you change anything related to keyboard layout (rotation, ISO vs ANSI, split-backspace,
+etc.) you must know which layer you are changing.
+
+### 1) `.wtn` logical grid (musical)
+
+Files: `~/.config/xenwooting/wtn/*.wtn`
+
+Each `[BoardN]` section stores 56 cells as `Key_0..Key_55`, `Chan_0..Chan_55`, `Col_0..Col_55`.
+
+Important semantics:
+
+- The 56 indices represent a *4-row musical grid*.
+- Index `i` maps to a logical `(row, col)` as:
+
+  - `row = i / 14` (0..3)
+  - `col = i % 14` (0..13)
+
+- **Holes are not part of `.wtn` semantics.**
+  Wide keys create holes in the physical LED column grid; `.wtn` indices are treated as
+  "first key, second key, ..." within each row from the user's perspective.
+  (Implementation: we compact/left-justify rows after applying rotation/mirror.
+  See "WTN Compaction" below.)
+
+Cell meanings:
+
+- `Key_i` is the MIDI note number (0..127) used by xenwooting for the pressed key.
+- `Chan_i` is the MIDI channel (1..16) (stored 1-based in the file).
+- `Col_i` is the base LED color (RRGGBB) used for the idle layout and the base color to
+  restore after highlight.
+
+### 2) Physical key identity (Analog SDK)
+
+xenwooting reads per-key analog values from Wooting's Analog SDK.
+
+- Each physical keyboard is identified by an **Analog `device_id`** (`u64`).
+- Each key on that keyboard is identified by a **HID usage code** (Wooting uses HID keycodes).
+
+We map:
+
+`(device_id, HID) -> KeyLoc { midi_row, midi_col, led_row, led_col }`
+
+The mapping table lives in `xenwooting/src/hidmap.rs`:
+
+- `HidMap::default_60he_ansi_guess()` provides a best-effort mapping for a 60% ANSI layout.
+- `hid_overrides` in config can override any key to a custom `(midi_row, midi_col, led_row, led_col)`.
+
+### 3) MIDI grid (per board)
+
+`KeyLoc.midi_row/midi_col` is the *musical grid coordinate* for a physical key, before
+per-board transforms.
+
+This grid is **always 4x14** (rows 0..3, cols 0..13).
+
+Note: for certain physical layouts (ANSI wide keys), not every (row,col) exists as a
+physical key. Those missing positions are the "holes".
+
+### 4) RGB LED grid (physical)
+
+The RGB SDK addresses keys via a matrix:
+
+- `led_row` is the physical RGB row (0..5)
+- `led_col` is the physical RGB column (0..13 on 60HE)
+
+Wide keys create holes here. Example from `xenwooting/src/hidmap.rs`:
+
+- RightShift is a wide key; it uses `midi_col=11` but `led_col=13`.
+- Enter is forced to `led_col=13`.
+
+Highlighting must use the LED grid (physical), not the MIDI grid.
+
+### 5) Per-board logical transforms (rotation/mirror)
+
+Each configured keyboard (`[[boards]]`) can apply transforms for `.wtn` lookup:
+
+- `rotation_deg`: supported values: `0` or `180`
+- `mirror_cols`: left/right mirror
+
+These transforms affect only the `.wtn` *lookup* (musical space), not the physical LED
+coordinates. In code, the transform helpers operate on `KeyLoc` by changing
+`midi_row/midi_col` and leaving `led_row/led_col` unchanged:
+
+- `rotate_4x14()` in `xenwooting/src/hidmap.rs`
+- `mirror_cols_4x14()` in `xenwooting/src/hidmap.rs`
+
+This is how we can mount the North keyboard rotated 180 degrees while keeping LED addressing
+correct.
+
+### 6) WTN compaction ("ignore holes")
+
+Problem:
+
+- Some physical rows have fewer than 14 keys.
+- On unrotated ANSI layouts, missing positions tend to be at the end, so `.wtn` indices
+  feel left-justified.
+- After rotation, those holes move to the start of the row, which would make `.wtn` index
+  0 correspond to a hole.
+
+Desired behavior:
+
+- `.wtn` indices always mean "first key, second key, ..." in that row from the user's
+  perspective.
+- Holes must never consume `.wtn` indices.
+
+Solution:
+
+- After applying rotation/mirror, compute per-row `min midi_col` among the actually present
+  keys.
+- Subtract that offset before indexing `.wtn`.
+
+Implementation:
+
+- `compute_compact_col_offsets()` (per board/device)
+- `wtn_index_for_loc()`
+
+These are used everywhere we look up `.wtn`:
+
+- MIDI note/channel lookup
+- base LED paint lookup
+- base color restore after highlight
+
+### 7) Dual keyboard identity and LED routing (robust device_id -> RGB index)
+
+See the next section.
+
 ## Dual Keyboard Mapping (Analog device_id -> WTN board -> RGB device index)
 
 Goal:
@@ -85,3 +217,50 @@ Code references:
 
 - `xenwooting/src/hidmap.rs`: `HidMap::all_locs()`
 - `xenwooting/src/bin/xenwooting.rs`: `paint_base` uses `hid_map.all_locs()`
+
+## How To Change Layouts (New Keyboard / ISO / Different Key Geometry)
+
+There are three common types of changes:
+
+### A) Change musical mapping (what note/channel/color each key means)
+
+- Edit the `.wtn` file (via webconfigurator or by hand).
+- `.wtn` is the authoritative "musical" mapping.
+
+Notes:
+
+- For rotated boards, remember that xenwooting applies rotation/mirror and then compacts rows
+  (holes ignored). The configurator mirrors this.
+
+### B) Change board orientation (North vs South physical mounting)
+
+- Update `[[boards]]` entries in `~/.config/xenwooting/config.toml`:
+  - North board: `rotation_deg = 180`
+  - South board: `rotation_deg = 0`
+- Ensure North is assigned to `wtn_board = 0` and South to `wtn_board = 1` (project convention).
+
+This affects `.wtn` lookup only.
+
+### C) Change physical key/LED mapping (ISO layout, split keys, different Wooting model)
+
+This is the part that changes *coordinates*, not notes.
+
+1) Determine how HID codes map to your physical key positions.
+
+2) Update `hid_overrides` in `~/.config/xenwooting/config.toml` to adjust the mapping.
+   Each override is:
+
+   - HID name
+   - `midi_row`, `midi_col` (musical grid position)
+   - `led_row`, `led_col` (physical LED address)
+
+3) If many keys differ from the built-in guess, consider updating
+   `HidMap::default_60he_ansi_guess()` in `xenwooting/src/hidmap.rs` or adding a new
+   preset map for your model.
+
+Important:
+
+- Holes: if the physical LED grid has holes, set `led_col` appropriately (like RightShift,
+  Enter in the ANSI guess). Do not encode holes into `.wtn`.
+- Rotation/mirror: do NOT change `led_row/led_col` when applying rotation/mirror; only
+  `midi_row/midi_col` changes.
