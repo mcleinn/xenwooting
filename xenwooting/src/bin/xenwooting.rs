@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 use wooting_analog_wrapper as sdk;
 use wooting_analog_wrapper::{FromPrimitive, HIDCodes, KeycodeType};
 
 use xenwooting::config::{ActionBindings, Config};
 use xenwooting::hidmap::{mirror_cols_4x14, parse_hid_name, rotate_4x14, HidMap, KeyLoc};
 use xenwooting::mts::MtsMaster;
-use xenwooting::rgb::parse_hex_rgb;
+use xenwooting::rgb::{parse_hex_rgb, Rgb};
 use xenwooting::rgb_worker::{spawn_rgb_worker, try_send_drop, RgbCmd, RgbKey};
 use xenwooting::wtn::Wtn;
 
@@ -459,9 +459,11 @@ fn main() -> Result<()> {
     set_mts_table(&master, &cfg.layouts[layout_index])?;
 
     // Load wtn
-    let wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
+    let mut wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
     let mut wtn =
         Wtn::load(&wtn_path).with_context(|| format!("Load wtn {}", wtn_path.display()))?;
+    let mut wtn_mtime: Option<SystemTime> = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+    let mut last_wtn_check = Instant::now();
 
     // MIDI out
     let mut midi_out = AlsaMidiOut::new(&cfg.midi_out_name)?;
@@ -474,10 +476,14 @@ fn main() -> Result<()> {
     }
 
     // Device -> board config selection
-    let devices = sdk::get_connected_devices_info(32).0?;
-    if devices.is_empty() {
-        anyhow::bail!("No Wooting Analog devices detected");
-    }
+    let devices = loop {
+        let devs = sdk::get_connected_devices_info(32).0?;
+        if !devs.is_empty() {
+            break devs;
+        }
+        eprintln!("No Wooting Analog devices detected; waiting...");
+        thread::sleep(Duration::from_millis(1000));
+    };
 
     // Map device_id -> BoardConfig
     let mut board_by_device: HashMap<u64, xenwooting::config::BoardConfig> = HashMap::new();
@@ -739,6 +745,10 @@ fn main() -> Result<()> {
 
     paint_base(&wtn, true);
 
+    // Track hotplug of RGB devices; repaint base when device count changes.
+    let mut last_rgb_count: u8 = if rgb_enabled { Rgb::device_count() } else { 0 };
+    let mut last_rgb_check = Instant::now();
+
     if log_edges || log_poll || log_midi {
         eprintln!("ready: waiting for key edges");
     }
@@ -746,7 +756,73 @@ fn main() -> Result<()> {
     // Peak-tracked velocity state per key (device_id + HID).
     let mut vel_state: HashMap<(u64, HIDCodes), VelState> = HashMap::new();
 
+    let refresh_vel_led_bases = |wtn: &Wtn, vel_state: &mut HashMap<(u64, HIDCodes), VelState>| {
+        for ((device_id, hid), st) in vel_state.iter_mut() {
+            let Some(bcfg) = board_by_device.get(device_id) else {
+                continue;
+            };
+            let rotation = bcfg.rotation_deg;
+
+            let Some(loc0) = hid_map.loc_for(hid.clone()) else {
+                continue;
+            };
+            let loc = match rotate_4x14(loc0, rotation)
+                .and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
+            {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let idx = (loc.midi_row as usize) * 14 + (loc.midi_col as usize);
+            let Some(cell) = wtn.cell(bcfg.wtn_board, idx) else {
+                continue;
+            };
+
+            match st {
+                VelState::Tracking { led: Some(led), .. } => led.base_rgb = cell.col_rgb,
+                VelState::Aftershock { led: Some(led), .. } => led.base_rgb = cell.col_rgb,
+                _ => {}
+            }
+        }
+    };
+
     while RUNNING.load(Ordering::SeqCst) {
+        // If a keyboard is plugged/unplugged, RGB device indices become available/change.
+        // Repaint the base LEDs so newly connected boards immediately show the current layout.
+        if rgb_enabled && last_rgb_check.elapsed() >= Duration::from_millis(250) {
+            last_rgb_check = Instant::now();
+            let now = Rgb::device_count();
+            if now != last_rgb_count {
+                last_rgb_count = now;
+                paint_base(&wtn, true);
+                info!("RGB device count changed; repainted base ({})", now);
+            }
+        }
+        // Detect .wtn changes on disk and reload without restarting the service.
+        // This lets the configurator update XenWooting immediately after Save.
+        if last_wtn_check.elapsed() >= Duration::from_millis(200) {
+            last_wtn_check = Instant::now();
+            if let Ok(modified) = fs::metadata(&wtn_path).and_then(|m| m.modified()) {
+                let changed = match wtn_mtime {
+                    Some(prev) => modified != prev,
+                    None => true,
+                };
+                if changed {
+                    match Wtn::load(&wtn_path) {
+                        Ok(new_wtn) => {
+                            wtn = new_wtn;
+                            wtn_mtime = Some(modified);
+                            refresh_vel_led_bases(&wtn, &mut vel_state);
+                            paint_base(&wtn, false);
+                            info!("Reloaded wtn from disk: {}", wtn_path.display());
+                        }
+                        Err(e) => {
+                            eprintln!("wtn reload failed ({}): {e}", wtn_path.display());
+                        }
+                    }
+                }
+            }
+        }
+
         // Timer tick: fire delayed NoteOn / NoteOff.
         {
             let peak_track = Duration::from_millis(cfg.velocity_peak_track_ms.max(1) as u64);
@@ -1024,10 +1100,12 @@ fn main() -> Result<()> {
                         layout_index = (layout_index + 1) % cfg.layouts.len();
                         eprintln!("layout_next -> {}", cfg.layouts[layout_index].id);
                         set_mts_table(&master, &cfg.layouts[layout_index])?;
-                        let wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
+                        wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
                         eprintln!("loading wtn: {}", wtn_path.display());
                         wtn = Wtn::load(&wtn_path)
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
+                        wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                        refresh_vel_led_bases(&wtn, &mut vel_state);
                         paint_base(&wtn, false);
                     }
                     "layout_prev" => {
@@ -1038,10 +1116,12 @@ fn main() -> Result<()> {
                         }
                         eprintln!("layout_prev -> {}", cfg.layouts[layout_index].id);
                         set_mts_table(&master, &cfg.layouts[layout_index])?;
-                        let wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
+                        wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
                         eprintln!("loading wtn: {}", wtn_path.display());
                         wtn = Wtn::load(&wtn_path)
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
+                        wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                        refresh_vel_led_bases(&wtn, &mut vel_state);
                         paint_base(&wtn, false);
                     }
                     "octave_up" => {
