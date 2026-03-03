@@ -15,6 +15,7 @@ type KeyboardViewProps = {
   lastSelected: string | null
   setLastSelected: (id: string | null) => void
   onKeyHighlight?: (board: 'Board0' | 'Board1', idx: number, down: boolean) => void
+  overlayColorByIdx?: Map<number, string>
 }
 
 export function KeyboardView({
@@ -31,6 +32,7 @@ export function KeyboardView({
   lastSelected,
   setLastSelected,
   onKeyHighlight,
+  overlayColorByIdx,
 }: KeyboardViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(1)
@@ -174,7 +176,8 @@ export function KeyboardView({
             const cell = byIdx.get(wtnIdx)
             const id = `${boardId}:${wtnIdx}`
             const isSel = selected.has(id)
-            const rgb = cell ? `#${cell.col}` : '#444444'
+            const overlay = overlayColorByIdx?.get(wtnIdx)
+            const rgb = overlay ? `#${overlay}` : cell ? `#${cell.col}` : '#444444'
 
             const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
             const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
