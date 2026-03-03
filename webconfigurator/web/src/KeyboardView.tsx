@@ -8,7 +8,6 @@ type KeyboardViewProps = {
   cells: Cell[]
   rotate180?: boolean
   xOffsetU?: number
-  onImport?: (board: 'Board0' | 'Board1') => void
   selected: Set<string>
   selectedOrder: string[]
   setSelected: (next: Set<string>) => void
@@ -16,7 +15,6 @@ type KeyboardViewProps = {
   lastSelected: string | null
   setLastSelected: (id: string | null) => void
   onKeyHighlight?: (board: 'Board0' | 'Board1', idx: number, down: boolean) => void
-  overlayByIdx?: Map<number, { note: number; chan: number; col: string }>
 }
 
 export function KeyboardView({
@@ -26,7 +24,6 @@ export function KeyboardView({
   cells,
   rotate180,
   xOffsetU,
-  onImport,
   selected,
   selectedOrder,
   setSelected,
@@ -34,7 +31,6 @@ export function KeyboardView({
   lastSelected,
   setLastSelected,
   onKeyHighlight,
-  overlayByIdx,
 }: KeyboardViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(1)
@@ -168,11 +164,6 @@ export function KeyboardView({
       <header className="kbdHeader">
         <div className="kbdTitle">{title}</div>
         <div className="kbdHeaderRight">
-          {onImport && (
-            <button className="kbdBtn" type="button" onClick={() => onImport(boardId)}>
-              Import
-            </button>
-          )}
           <div className="kbdMeta">{keys.length} keys</div>
         </div>
       </header>
@@ -185,9 +176,7 @@ export function KeyboardView({
             const cell = byIdx.get(wtnIdx)
             const id = `${boardId}:${wtnIdx}`
             const isSel = selected.has(id)
-            const overlay = overlayByIdx?.get(wtnIdx)
-            const rgb = overlay ? `#${overlay.col}` : cell ? `#${cell.col}` : '#444444'
-            const isOverlay = Boolean(overlay)
+            const rgb = cell ? `#${cell.col}` : '#444444'
 
             const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
             const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
@@ -201,7 +190,7 @@ export function KeyboardView({
               <button
                 key={id}
                 type="button"
-                className={`key ${isSel ? 'keySelected' : ''} ${isOverlay ? 'keyOverlay' : ''}`}
+                className={`key ${isSel ? 'keySelected' : ''}`}
                 style={{
                   left,
                   top,
@@ -225,11 +214,9 @@ export function KeyboardView({
                 title={`${boardId} idx ${wtnIdx}`}
               >
                 <div className="keyTop">
-                  {(overlay || cell) && (
-                    <span className="keyChan">[{overlay ? overlay.chan : cell!.chan}]</span>
-                  )}
+                  {cell && <span className="keyChan">[{cell.chan}]</span>}
                 </div>
-                {(overlay || cell) && <div className="keyNote">{overlay ? overlay.note : cell!.note}</div>}
+                {cell && <div className="keyNote">{cell.note}</div>}
               </button>
             )
           })}

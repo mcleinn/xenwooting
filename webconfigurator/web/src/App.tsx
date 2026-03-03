@@ -1,5 +1,6 @@
 import './App.css'
 import { useEffect, useMemo, useRef, useState } from 'react'
+/* eslint-disable react-hooks/set-state-in-effect */
 import {
   fetchGeometry,
   fetchLayout,
@@ -12,7 +13,6 @@ import {
 } from './api'
 import { KeyboardView } from './KeyboardView'
 import type { Boards, Geometry, LayoutInfo } from './types'
-import { parseLtnText, placeLtnKeys, type LtnPlacedKey } from './ltn'
 
 const C0_HZ = 16.351_597_831_287_414
 
@@ -40,13 +40,6 @@ function App() {
   const [previewMode, setPreviewMode] = useState(false)
   const previewPushTimer = useRef<number | null>(null)
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null)
-  const [importActive, setImportActive] = useState(false)
-  const [importBoard, setImportBoard] = useState<'Board0' | 'Board1' | null>(null)
-  const [importKeys, setImportKeys] = useState<LtnPlacedKey[] | null>(null)
-  const [importDx2, setImportDx2] = useState(0)
-  const [importDy, setImportDy] = useState(0)
-
   useEffect(() => {
     let cancelled = false
     Promise.all([fetchLayouts(), fetchGeometry()])
@@ -73,10 +66,8 @@ function App() {
     setStatus('Loading .wtn...')
 
     // Changing layout exits preview mode.
-    if (previewMode) {
-      setPreviewMode(false)
-      previewDisable().catch(() => {})
-    }
+    setPreviewMode(false)
+    previewDisable().catch(() => {})
 
     fetchLayout(layoutId)
       .then((l) => {
@@ -98,48 +89,6 @@ function App() {
       cancelled = true
     }
   }, [layoutId])
-
-  // Import placement keyboard controls.
-  useEffect(() => {
-    if (!importActive) return
-    const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase()
-      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
-
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        exitImportMode()
-        return
-      }
-      if (e.key === 'Enter') {
-        e.preventDefault()
-        onImportApply()
-        return
-      }
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault()
-        setImportDx2((v) => v - 2)
-        return
-      }
-      if (e.key === 'ArrowRight') {
-        e.preventDefault()
-        setImportDx2((v) => v + 2)
-        return
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault()
-        setImportDy((v) => v - 1)
-        return
-      }
-      if (e.key === 'ArrowDown') {
-        e.preventDefault()
-        setImportDy((v) => v + 1)
-        return
-      }
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [importActive, importDx2, importDy])
 
   const selectionCount = selected.size
   const selectedCells = useMemo(() => {
@@ -288,14 +237,6 @@ function App() {
     }, 60)
   }
 
-  function exitImportMode() {
-    setImportActive(false)
-    setImportBoard(null)
-    setImportKeys(null)
-    setImportDx2(0)
-    setImportDy(0)
-  }
-
   async function exitPreviewMode() {
     setPreviewMode(false)
     try {
@@ -324,7 +265,6 @@ function App() {
   }
 
   async function onRevert() {
-    exitImportMode()
     await exitPreviewMode()
     if (!layoutId) return
     setStatus('Reverting...')
@@ -349,7 +289,6 @@ function App() {
     setStatus('Saving...')
     try {
       const r = await saveLayout(layoutId, boards)
-      exitImportMode()
       await exitPreviewMode()
       setStatus(r.xenwootingReloaded ? 'Saved + reloaded XenWooting.' : 'Saved (reload failed).')
       // Refresh from disk so UI matches canonical .wtn.
@@ -374,79 +313,6 @@ function App() {
     highlightKey(layoutId, board, idx, down).catch(() => {})
   }
 
-  function onImportClick(board: 'Board0' | 'Board1') {
-    if (!fileInputRef.current) return
-    setImportBoard(board)
-    fileInputRef.current.value = ''
-    fileInputRef.current.click()
-  }
-
-  async function onImportFileSelected(file: File | null) {
-    if (!file || !boards) return
-    if (!importBoard) {
-      setStatus('Import failed: no target board selected')
-      return
-    }
-    exitImportMode()
-    setStatus('Importing .ltn...')
-    try {
-      const text = await file.text()
-      const ltn = parseLtnText(text)
-      const placed = placeLtnKeys(ltn)
-      setImportKeys(placed)
-      setImportActive(true)
-      setImportBoard(importBoard)
-      setImportDx2(0)
-      setImportDy(0)
-      setStatus('')
-    } catch (e) {
-      setStatus(`Import failed: ${errMsg(e)}`)
-    }
-  }
-
-  const importOverlay = useMemo(() => {
-    if (!importActive || !importKeys || !geometry || !boards || !importBoard) return null
-    const keyRects = buildWootingKeyRectsForBoard(geometry, importBoard)
-    const byIdx = new Map<number, { note: number; chan: number; col: string }>()
-
-    for (const k of importKeys) {
-      const px2 = k.x2 + importDx2
-      const py = k.y + importDy
-      const hit = hitTestKey(px2, py, keyRects)
-      if (!hit) continue
-      byIdx.set(hit.idx, { note: k.cell.note, chan: k.cell.chan, col: k.cell.col })
-    }
-
-    return { board: importBoard, byIdx }
-  }, [importActive, importKeys, importDx2, importDy, geometry, boards, importBoard])
-
-  function onImportApply() {
-    if (!boards || !importKeys || !geometry || !importBoard) return
-    const keyRects = buildWootingKeyRectsForBoard(geometry, importBoard)
-    const next: Boards = {
-      Board0: boards.Board0.map((c) => ({ ...c })),
-      Board1: boards.Board1.map((c) => ({ ...c })),
-    }
-
-    for (const k of importKeys) {
-      const px2 = k.x2 + importDx2
-      const py = k.y + importDy
-      const hit = hitTestKey(px2, py, keyRects)
-      if (!hit) continue
-      const cell = next[importBoard][hit.idx]
-      if (!cell) continue
-      cell.note = k.cell.note
-      cell.chan = k.cell.chan
-      cell.col = k.cell.col
-    }
-
-    setBoards(next)
-    pushPreview(next)
-    exitImportMode()
-    setStatus('Import applied (not saved).')
-    setTimeout(() => setStatus(''), 1000)
-  }
-
   return (
     <div className="app">
       <header className="topbar">
@@ -455,14 +321,6 @@ function App() {
         </div>
 
         <div className="controls">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".ltn"
-            style={{ display: 'none' }}
-            onChange={(e) => void onImportFileSelected(e.target.files?.[0] || null)}
-          />
-
           <label className="previewToggle">
             <input
               type="checkbox"
@@ -606,11 +464,6 @@ function App() {
             </div>
 
             {status && <div className="status">{status}</div>}
-            {importActive && (
-              <div className="status">
-                Use arrow keys to place, ESC to abort placement. RETURN to apply placement.
-              </div>
-            )}
             <div className="hint">
               Click to select. Ctrl/Meta to multi-select. Shift to add range. Blank fields keep values.
             </div>
@@ -642,12 +495,6 @@ function App() {
             <div className="loading">Loading…</div>
           ) : (
             <>
-              {importActive && (
-                <div
-                  className="importOverlay"
-                  onPointerDown={(e) => e.preventDefault()}
-                />
-              )}
               <KeyboardView
                 title="Board0"
                 boardId="Board0"
@@ -655,30 +502,26 @@ function App() {
                 cells={boards.Board0}
                 rotate180
                 xOffsetU={3}
-                onImport={() => onImportClick('Board0')}
                 selected={selected}
                 selectedOrder={selectedOrder}
                 setSelected={setSelected}
                 setSelectedOrder={setSelectedOrder}
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
-                onKeyHighlight={importActive ? undefined : onKeyHighlight}
-                overlayByIdx={importOverlay?.board === 'Board0' ? importOverlay.byIdx : undefined}
+                onKeyHighlight={onKeyHighlight}
               />
               <KeyboardView
                 title="Board1"
                 boardId="Board1"
                 geometry={geometry}
                 cells={boards.Board1}
-                onImport={() => onImportClick('Board1')}
                 selected={selected}
                 selectedOrder={selectedOrder}
                 setSelected={setSelected}
                 setSelectedOrder={setSelectedOrder}
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
-                onKeyHighlight={importActive ? undefined : onKeyHighlight}
-                overlayByIdx={importOverlay?.board === 'Board1' ? importOverlay.byIdx : undefined}
+                onKeyHighlight={onKeyHighlight}
               />
             </>
           )}
@@ -686,88 +529,6 @@ function App() {
       </main>
     </div>
   )
-}
-
-type KeyRect = {
-  board: 'Board0' | 'Board1'
-  idx: number
-  x2: number
-  y: number
-  w2: number
-  h: number
-  cx2: number
-  cy: number
-}
-
-function buildWootingKeyRectsForBoard(geometry: Geometry, board: 'Board0' | 'Board1'): KeyRect[] {
-  // Import mapping is per-board and uses board-local coordinates.
-  // The visual shift between boards (Board0 xOffsetU, Board1 y stacking) is not part of placement.
-  const out: KeyRect[] = []
-
-  const rotate180 = board === 'Board0'
-
-  // Compute row compaction for Board0 like KeyboardView does.
-  const minColByRow = [0, 0, 0, 0]
-  if (rotate180) {
-    const min = [255, 255, 255, 255]
-    for (const k of geometry.keys) {
-      const rr = 3 - k.row
-      const cc = 13 - k.col
-      min[rr] = Math.min(min[rr], cc)
-    }
-    for (let i = 0; i < 4; i++) minColByRow[i] = min[i] === 255 ? 0 : min[i]
-  }
-
-  for (const k of geometry.keys) {
-    const rr = rotate180 ? 3 - k.row : k.row
-    const cc0 = rotate180 ? 13 - k.col : k.col
-    const cc = cc0 - (minColByRow[rr] || 0)
-    const wtnIdx = rr * 14 + cc
-    if (wtnIdx < 0 || wtnIdx >= 56) continue
-
-    const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
-    const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
-
-    const x2 = Math.round(x0 * 2)
-    const y = y0
-    const w2 = Math.round(k.w * 2)
-    const h = k.h
-
-    out.push({
-      board,
-      idx: wtnIdx,
-      x2,
-      y,
-      w2,
-      h,
-      cx2: x2 + w2 / 2,
-      cy: y + h / 2,
-    })
-  }
-
-  return out
-}
-
-function hitTestKey(x2: number, y: number, rects: KeyRect[]) {
-  // direct hit
-  for (const r of rects) {
-    if (x2 >= r.x2 && x2 < r.x2 + r.w2 && y >= r.y && y < r.y + r.h) return r
-  }
-
-  // snap to nearest center if close
-  let best: KeyRect | null = null
-  let bestD2 = Infinity
-  const snapR2 = (2.0 * 2.0) // within 1U
-  for (const r of rects) {
-    const dx = (x2 - r.cx2) / 2
-    const dy = y - r.cy
-    const d2 = dx * dx + dy * dy
-    if (d2 < bestD2) {
-      bestD2 = d2
-      best = r
-    }
-  }
-  return best && bestD2 <= snapR2 ? best : null
 }
 
 export default App
