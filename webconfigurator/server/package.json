@@ -1,0 +1,14 @@
+{
+  "name": "wtn-editor-server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@iarna/toml": "^3.0.0",
+    "express": "^4.21.2"
+  }
+}
