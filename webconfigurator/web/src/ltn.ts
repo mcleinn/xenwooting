@@ -111,7 +111,13 @@ export function placeLtnKeys(ltn: LtnFile): LtnPlacedKey[] {
       const c = rc.c
 
       // Base pattern coordinates in half-U.
-      const baseX2 = 2 * c + (r % 2 === 0 ? 1 : 0)
+      //
+      // Empirical alignment for our Wooting import grid:
+      // - shift all rows left by 1U
+      // - additionally, starting from the 3rd Lumatone row (1-based), shift left by another 1U
+      //
+      // This matches how Lumatone rows visually sit relative to the Wooting key grid.
+      const baseX2 = 2 * c + (r % 2 === 0 ? 1 : 0) - 2 - (r >= 2 ? 2 : 0)
       const baseY = r
 
       // Repeat placement like xenAssist:

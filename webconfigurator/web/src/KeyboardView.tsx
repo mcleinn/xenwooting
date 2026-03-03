@@ -8,6 +8,7 @@ type KeyboardViewProps = {
   cells: Cell[]
   rotate180?: boolean
   xOffsetU?: number
+  onImport?: (board: 'Board0' | 'Board1') => void
   selected: Set<string>
   selectedOrder: string[]
   setSelected: (next: Set<string>) => void
@@ -25,6 +26,7 @@ export function KeyboardView({
   cells,
   rotate180,
   xOffsetU,
+  onImport,
   selected,
   selectedOrder,
   setSelected,
@@ -165,7 +167,14 @@ export function KeyboardView({
     <section className="kbd">
       <header className="kbdHeader">
         <div className="kbdTitle">{title}</div>
-        <div className="kbdMeta">{keys.length} keys</div>
+        <div className="kbdHeaderRight">
+          {onImport && (
+            <button className="kbdBtn" type="button" onClick={() => onImport(boardId)}>
+              Import
+            </button>
+          )}
+          <div className="kbdMeta">{keys.length} keys</div>
+        </div>
       </header>
       <div className="kbdWrap" ref={containerRef}>
         <div

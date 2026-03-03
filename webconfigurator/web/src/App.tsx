@@ -42,6 +42,7 @@ function App() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [importActive, setImportActive] = useState(false)
+  const [importBoard, setImportBoard] = useState<'Board0' | 'Board1' | null>(null)
   const [importKeys, setImportKeys] = useState<LtnPlacedKey[] | null>(null)
   const [importDx2, setImportDx2] = useState(0)
   const [importDy, setImportDy] = useState(0)
@@ -289,6 +290,7 @@ function App() {
 
   function exitImportMode() {
     setImportActive(false)
+    setImportBoard(null)
     setImportKeys(null)
     setImportDx2(0)
     setImportDy(0)
@@ -372,14 +374,19 @@ function App() {
     highlightKey(layoutId, board, idx, down).catch(() => {})
   }
 
-  function onImportClick() {
+  function onImportClick(board: 'Board0' | 'Board1') {
     if (!fileInputRef.current) return
+    setImportBoard(board)
     fileInputRef.current.value = ''
     fileInputRef.current.click()
   }
 
   async function onImportFileSelected(file: File | null) {
     if (!file || !boards) return
+    if (!importBoard) {
+      setStatus('Import failed: no target board selected')
+      return
+    }
     exitImportMode()
     setStatus('Importing .ltn...')
     try {
@@ -388,6 +395,7 @@ function App() {
       const placed = placeLtnKeys(ltn)
       setImportKeys(placed)
       setImportActive(true)
+      setImportBoard(importBoard)
       setImportDx2(0)
       setImportDy(0)
       setStatus('')
@@ -397,31 +405,24 @@ function App() {
   }
 
   const importOverlay = useMemo(() => {
-    if (!importActive || !importKeys || !geometry || !boards) return null
-    const keyRects = buildWootingKeyRects(geometry)
-
-    const byBoard: {
-      Board0: Map<number, { note: number; chan: number; col: string }>
-      Board1: Map<number, { note: number; chan: number; col: string }>
-    } = {
-      Board0: new Map(),
-      Board1: new Map(),
-    }
+    if (!importActive || !importKeys || !geometry || !boards || !importBoard) return null
+    const keyRects = buildWootingKeyRectsForBoard(geometry, importBoard)
+    const byIdx = new Map<number, { note: number; chan: number; col: string }>()
 
     for (const k of importKeys) {
       const px2 = k.x2 + importDx2
       const py = k.y + importDy
       const hit = hitTestKey(px2, py, keyRects)
       if (!hit) continue
-      byBoard[hit.board].set(hit.idx, { note: k.cell.note, chan: k.cell.chan, col: k.cell.col })
+      byIdx.set(hit.idx, { note: k.cell.note, chan: k.cell.chan, col: k.cell.col })
     }
 
-    return { byBoard, keyRects }
-  }, [importActive, importKeys, importDx2, importDy, geometry, boards])
+    return { board: importBoard, byIdx }
+  }, [importActive, importKeys, importDx2, importDy, geometry, boards, importBoard])
 
   function onImportApply() {
-    if (!boards || !importKeys || !geometry) return
-    const keyRects = buildWootingKeyRects(geometry)
+    if (!boards || !importKeys || !geometry || !importBoard) return
+    const keyRects = buildWootingKeyRectsForBoard(geometry, importBoard)
     const next: Boards = {
       Board0: boards.Board0.map((c) => ({ ...c })),
       Board1: boards.Board1.map((c) => ({ ...c })),
@@ -432,7 +433,7 @@ function App() {
       const py = k.y + importDy
       const hit = hitTestKey(px2, py, keyRects)
       if (!hit) continue
-      const cell = next[hit.board][hit.idx]
+      const cell = next[importBoard][hit.idx]
       if (!cell) continue
       cell.note = k.cell.note
       cell.chan = k.cell.chan
@@ -454,10 +455,6 @@ function App() {
         </div>
 
         <div className="controls">
-          <button className="btnSecondary" type="button" onClick={onImportClick} disabled={!boards || !layoutId}>
-            Import
-          </button>
-
           <input
             ref={fileInputRef}
             type="file"
@@ -658,6 +655,7 @@ function App() {
                 cells={boards.Board0}
                 rotate180
                 xOffsetU={3}
+                onImport={() => onImportClick('Board0')}
                 selected={selected}
                 selectedOrder={selectedOrder}
                 setSelected={setSelected}
@@ -665,13 +663,14 @@ function App() {
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
                 onKeyHighlight={importActive ? undefined : onKeyHighlight}
-                overlayByIdx={importOverlay?.byBoard.Board0}
+                overlayByIdx={importOverlay?.board === 'Board0' ? importOverlay.byIdx : undefined}
               />
               <KeyboardView
                 title="Board1"
                 boardId="Board1"
                 geometry={geometry}
                 cells={boards.Board1}
+                onImport={() => onImportClick('Board1')}
                 selected={selected}
                 selectedOrder={selectedOrder}
                 setSelected={setSelected}
@@ -679,7 +678,7 @@ function App() {
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
                 onKeyHighlight={importActive ? undefined : onKeyHighlight}
-                overlayByIdx={importOverlay?.byBoard.Board1}
+                overlayByIdx={importOverlay?.board === 'Board1' ? importOverlay.byIdx : undefined}
               />
             </>
           )}
@@ -700,52 +699,50 @@ type KeyRect = {
   cy: number
 }
 
-function buildWootingKeyRects(geometry: Geometry): KeyRect[] {
+function buildWootingKeyRectsForBoard(geometry: Geometry, board: 'Board0' | 'Board1'): KeyRect[] {
+  // Import mapping is per-board and uses board-local coordinates.
+  // The visual shift between boards (Board0 xOffsetU, Board1 y stacking) is not part of placement.
   const out: KeyRect[] = []
 
-  for (const board of ['Board0', 'Board1'] as const) {
-    const rotate180 = board === 'Board0'
-    const xOffU = board === 'Board0' ? 3 : 0
-    const yOff = board === 'Board1' ? 4 : 0
+  const rotate180 = board === 'Board0'
 
-    // Compute row compaction for Board0 like KeyboardView does.
-    const minColByRow = [0, 0, 0, 0]
-    if (rotate180) {
-      const min = [255, 255, 255, 255]
-      for (const k of geometry.keys) {
-        const rr = 3 - k.row
-        const cc = 13 - k.col
-        min[rr] = Math.min(min[rr], cc)
-      }
-      for (let i = 0; i < 4; i++) minColByRow[i] = min[i] === 255 ? 0 : min[i]
-    }
-
+  // Compute row compaction for Board0 like KeyboardView does.
+  const minColByRow = [0, 0, 0, 0]
+  if (rotate180) {
+    const min = [255, 255, 255, 255]
     for (const k of geometry.keys) {
-      const rr = rotate180 ? 3 - k.row : k.row
-      const cc0 = rotate180 ? 13 - k.col : k.col
-      const cc = cc0 - (minColByRow[rr] || 0)
-      const wtnIdx = rr * 14 + cc
-      if (wtnIdx < 0 || wtnIdx >= 56) continue
-
-      const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
-      const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
-
-      const x2 = Math.round((x0 + xOffU) * 2)
-      const y = y0 + yOff
-      const w2 = Math.round(k.w * 2)
-      const h = k.h
-
-      out.push({
-        board,
-        idx: wtnIdx,
-        x2,
-        y,
-        w2,
-        h,
-        cx2: x2 + w2 / 2,
-        cy: y + h / 2,
-      })
+      const rr = 3 - k.row
+      const cc = 13 - k.col
+      min[rr] = Math.min(min[rr], cc)
     }
+    for (let i = 0; i < 4; i++) minColByRow[i] = min[i] === 255 ? 0 : min[i]
+  }
+
+  for (const k of geometry.keys) {
+    const rr = rotate180 ? 3 - k.row : k.row
+    const cc0 = rotate180 ? 13 - k.col : k.col
+    const cc = cc0 - (minColByRow[rr] || 0)
+    const wtnIdx = rr * 14 + cc
+    if (wtnIdx < 0 || wtnIdx >= 56) continue
+
+    const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
+    const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
+
+    const x2 = Math.round(x0 * 2)
+    const y = y0
+    const w2 = Math.round(k.w * 2)
+    const h = k.h
+
+    out.push({
+      board,
+      idx: wtnIdx,
+      x2,
+      y,
+      w2,
+      h,
+      cx2: x2 + w2 / 2,
+      cy: y + h / 2,
+    })
   }
 
   return out
