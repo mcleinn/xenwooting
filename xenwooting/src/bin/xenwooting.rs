@@ -15,7 +15,7 @@ use wooting_analog_wrapper as sdk;
 use wooting_analog_wrapper::{FromPrimitive, HIDCodes, KeycodeType};
 
 use xenwooting::config::{ActionBindings, Config};
-use xenwooting::hidmap::{mirror_cols_4x14, parse_hid_name, rotate_4x14, HidMap, KeyLoc};
+use xenwooting::hidmap::{mirror_cols_4x14, parse_hid_name, rotate_4x14, HidMap};
 use xenwooting::mts::MtsMaster;
 use xenwooting::rgb::{parse_hex_rgb, Rgb};
 use xenwooting::rgb_worker::{spawn_rgb_worker, try_send_drop, RgbCmd, RgbKey};
@@ -686,36 +686,31 @@ fn main() -> Result<()> {
             let wtn_board = bcfg.wtn_board;
             let dev_idx = cfg.rgb.rgb_device_index_for_wtn_board(wtn_board);
 
-            // Paint 4x14 from .wtn.
+            // Paint base LEDs using the HID->KeyLoc map.
             //
-            // Important: `wtn` is in *logical* orientation. If the board is rotated, we must
-            // map each physical (mr,mc) to its logical lookup index.
-            for mr in 0..4u8 {
-                for mc in 0..14u8 {
-                    let loc = KeyLoc {
-                        midi_row: mr,
-                        midi_col: mc,
-                        led_row: mr + 1,
-                        led_col: mc,
-                    };
-                    let loc = match rotate_4x14(loc, bcfg.rotation_deg)
-                        .and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
-                    {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let idx = (loc.midi_row as usize) * 14 + (loc.midi_col as usize);
-                    if let Some(cell) = wtn.cell(wtn_board, idx) {
-                        try_send_drop(
-                            &rgb_tx,
-                            RgbCmd::SetKey(RgbKey {
-                                device_index: dev_idx,
-                                row: mr + 1,
-                                col: mc,
-                                rgb: cell.col_rgb,
-                            }),
-                        );
-                    }
+            // This is critical because ANSI wide keys create holes in the LED column grid.
+            // Highlighting uses KeyLoc.led_row/led_col; base paint must use the same mapping
+            // or rows will appear shifted.
+            for (_hid, loc0) in hid_map.all_locs().into_iter() {
+                // Important: `wtn` is in *logical* orientation. If the board is rotated/mirrored,
+                // map physical KeyLoc (midi_row/midi_col) to its logical lookup index.
+                let loc = match rotate_4x14(loc0, bcfg.rotation_deg)
+                    .and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
+                {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let idx = (loc.midi_row as usize) * 14 + (loc.midi_col as usize);
+                if let Some(cell) = wtn.cell(wtn_board, idx) {
+                    try_send_drop(
+                        &rgb_tx,
+                        RgbCmd::SetKey(RgbKey {
+                            device_index: dev_idx,
+                            row: loc.led_row,
+                            col: loc.led_col,
+                            rgb: cell.col_rgb,
+                        }),
+                    );
                 }
             }
             info!("Queued base LEDs for wtn_board {}", wtn_board);

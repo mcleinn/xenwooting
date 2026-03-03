@@ -170,6 +170,13 @@ impl HidMap {
     pub fn loc_for(&self, hid: HIDCodes) -> Option<KeyLoc> {
         self.loc_by_hid.get(&hid).copied()
     }
+
+    pub fn all_locs(&self) -> Vec<(HIDCodes, KeyLoc)> {
+        self.loc_by_hid
+            .iter()
+            .map(|(hid, loc)| (hid.clone(), *loc))
+            .collect()
+    }
 }
 
 pub fn parse_hid_name(name: &str) -> Result<HIDCodes> {
