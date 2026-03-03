@@ -45,7 +45,7 @@ function App() {
   const [importKeys, setImportKeys] = useState<LtnPlacedKey[] | null>(null)
   const [importDx2, setImportDx2] = useState(0)
   const [importDy, setImportDy] = useState(0)
-  const [interpMode, setInterpMode] = useState(false)
+  const importAccRef = useRef({ ax: 0, ay: 0, uPx: 28 })
 
   useEffect(() => {
     let cancelled = false
@@ -101,54 +101,15 @@ function App() {
 
   // Escape cancels import placement.
   useEffect(() => {
-    if (!importActive) return
     const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase()
-      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
-
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        exitImportMode()
-        setStatus('')
-        return
-      }
-
-      if (e.key === 'Enter') {
-        e.preventDefault()
-        onImportApply()
-        return
-      }
-
-      if (e.key === 'i' || e.key === 'I') {
-        e.preventDefault()
-        setInterpMode((v) => !v)
-        return
-      }
-
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault()
-        setImportDx2((v) => v - 2)
-        return
-      }
-      if (e.key === 'ArrowRight') {
-        e.preventDefault()
-        setImportDx2((v) => v + 2)
-        return
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault()
-        setImportDy((v) => v - 1)
-        return
-      }
-      if (e.key === 'ArrowDown') {
-        e.preventDefault()
-        setImportDy((v) => v + 1)
-        return
+      if (e.key === 'Escape' && importActive) {
+        setImportActive(false)
+        setImportKeys(null)
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [importActive, boards, geometry, importKeys, importDx2, importDy, previewMode, layoutId])
+  }, [importActive])
 
   const selectionCount = selected.size
   const selectedCells = useMemo(() => {
@@ -302,7 +263,8 @@ function App() {
     setImportKeys(null)
     setImportDx2(0)
     setImportDy(0)
-    setInterpMode(false)
+    importAccRef.current.ax = 0
+    importAccRef.current.ay = 0
   }
 
   async function exitPreviewMode() {
@@ -401,7 +363,7 @@ function App() {
       setImportActive(true)
       setImportDx2(0)
       setImportDy(0)
-      setStatus('')
+      setStatus('Import placement: move mouse in 1U steps, click to apply.')
     } catch (e) {
       setStatus(`Import failed: ${errMsg(e)}`)
     }
@@ -409,39 +371,80 @@ function App() {
 
   const importOverlay = useMemo(() => {
     if (!importActive || !importKeys || !geometry || !boards) return null
+    const keyRects = buildWootingKeyRects(geometry)
 
-    const overlayByBoard = computeOverlayByBoard(importKeys, importDx2, importDy)
-    const suggestedByBoard = interpMode ? computeSuggestedByBoard(overlayByBoard) : null
-    return { overlayByBoard, suggestedByBoard }
-  }, [importActive, importKeys, importDx2, importDy, geometry, boards, interpMode])
+    // Map of target wtnIdx -> overlay color.
+    const byBoard: { Board0: Map<number, string>; Board1: Map<number, string> } = {
+      Board0: new Map(),
+      Board1: new Map(),
+    }
+
+    for (const k of importKeys) {
+      const px2 = k.x2 + importDx2
+      const py = k.y + importDy
+      const hit = hitTestKey(px2, py, keyRects)
+      if (!hit) continue
+      byBoard[hit.board].set(hit.idx, k.cell.col)
+    }
+
+    return { byBoard, keyRects }
+  }, [importActive, importKeys, importDx2, importDy, geometry, boards])
+
+  function onImportPointerMove(e: React.PointerEvent) {
+    if (!importActive) return
+
+    // Calibrate 1U in px using the smallest visible key.
+    const keys = Array.from(document.querySelectorAll<HTMLButtonElement>('button.key'))
+    if (keys.length) {
+      let minW = Infinity
+      let minH = Infinity
+      for (const el of keys) {
+        const r = el.getBoundingClientRect()
+        if (r.width > 0) minW = Math.min(minW, r.width)
+        if (r.height > 0) minH = Math.min(minH, r.height)
+      }
+      if (Number.isFinite(minW) && minW > 5) importAccRef.current.uPx = Math.max(10, minW)
+      // vertical step is row step, approximate by minH
+      if (Number.isFinite(minH) && minH > 5) {
+        // use average of width/height for stability
+        importAccRef.current.uPx = Math.max(10, Math.min(importAccRef.current.uPx, minH))
+      }
+    }
+
+    importAccRef.current.ax += e.movementX
+    importAccRef.current.ay += e.movementY
+    const uPx = importAccRef.current.uPx
+
+    while (Math.abs(importAccRef.current.ax) >= uPx) {
+      const s = importAccRef.current.ax > 0 ? 1 : -1
+      importAccRef.current.ax -= s * uPx
+      setImportDx2((v) => v + s * 2) // 1U step = 2 half-units
+    }
+    while (Math.abs(importAccRef.current.ay) >= uPx) {
+      const s = importAccRef.current.ay > 0 ? 1 : -1
+      importAccRef.current.ay -= s * uPx
+      setImportDy((v) => v + s * 1)
+    }
+  }
 
   function onImportApply() {
     if (!boards || !importKeys || !geometry) return
+    const keyRects = buildWootingKeyRects(geometry)
     const next: Boards = {
       Board0: boards.Board0.map((c) => ({ ...c })),
       Board1: boards.Board1.map((c) => ({ ...c })),
     }
 
-    const overlayByBoard = computeOverlayByBoard(importKeys, importDx2, importDy)
-    const suggestedByBoard = interpMode ? computeSuggestedByBoard(overlayByBoard) : null
-
-    for (const board of ['Board0', 'Board1'] as const) {
-      for (const [idx, v] of overlayByBoard[board].entries()) {
-        const cell = next[board][idx]
-        if (!cell) continue
-        cell.note = v.note
-        cell.chan = v.chan
-        cell.col = v.col
-      }
-      if (suggestedByBoard) {
-        for (const [idx, v] of suggestedByBoard[board].entries()) {
-          const cell = next[board][idx]
-          if (!cell) continue
-          cell.note = v.note
-          cell.chan = v.chan
-          cell.col = v.col
-        }
-      }
+    for (const k of importKeys) {
+      const px2 = k.x2 + importDx2
+      const py = k.y + importDy
+      const hit = hitTestKey(px2, py, keyRects)
+      if (!hit) continue
+      const cell = next[hit.board][hit.idx]
+      if (!cell) continue
+      cell.note = k.cell.note
+      cell.chan = k.cell.chan
+      cell.col = k.cell.col
     }
 
     setBoards(next)
@@ -614,11 +617,6 @@ function App() {
             </div>
 
             {status && <div className="status">{status}</div>}
-            {importActive && (
-              <div className="status">
-                Use arrow keys to place, ESC to abort placement. RETURN to apply placement. I toggles interpolation.
-              </div>
-            )}
             <div className="hint">
               Click to select. Ctrl/Meta to multi-select. Shift to add range. Blank fields keep values.
             </div>
@@ -653,7 +651,11 @@ function App() {
               {importActive && (
                 <div
                   className="importOverlay"
-                  onPointerDown={(e) => e.preventDefault()}
+                  onPointerMove={onImportPointerMove}
+                  onPointerDown={(e) => {
+                    e.preventDefault()
+                    onImportApply()
+                  }}
                 />
               )}
               <KeyboardView
@@ -670,8 +672,7 @@ function App() {
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
                 onKeyHighlight={importActive ? undefined : onKeyHighlight}
-                overlayByIdx={importOverlay?.overlayByBoard.Board0}
-                suggestedByIdx={importOverlay?.suggestedByBoard?.Board0 || undefined}
+                overlayColorByIdx={importOverlay?.byBoard.Board0}
               />
               <KeyboardView
                 title="Board1"
@@ -685,8 +686,7 @@ function App() {
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
                 onKeyHighlight={importActive ? undefined : onKeyHighlight}
-                overlayByIdx={importOverlay?.overlayByBoard.Board1}
-                suggestedByIdx={importOverlay?.suggestedByBoard?.Board1 || undefined}
+                overlayColorByIdx={importOverlay?.byBoard.Board1}
               />
             </>
           )}
@@ -696,187 +696,88 @@ function App() {
   )
 }
 
-// (old nearest-target placement helpers removed; we now do contiguous row placement)
+type KeyRect = {
+  board: 'Board0' | 'Board1'
+  idx: number
+  x2: number
+  y: number
+  w2: number
+  h: number
+  cx2: number
+  cy: number
+}
 
-type CellDef = { note: number; chan: number; col: string }
-type OverlayByBoard = { Board0: Map<number, CellDef>; Board1: Map<number, CellDef> }
+function buildWootingKeyRects(geometry: Geometry): KeyRect[] {
+  const out: KeyRect[] = []
 
-function computeOverlayByBoard(importKeys: LtnPlacedKey[], dx2: number, dy: number): OverlayByBoard {
-  const byBoard: OverlayByBoard = { Board0: new Map(), Board1: new Map() }
+  for (const board of ['Board0', 'Board1'] as const) {
+    const rotate180 = board === 'Board0'
+    const xOffU = board === 'Board0' ? 3 : 0
+    const yOff = board === 'Board1' ? 4 : 0
 
-  // Group by integer lum row (after vertical offset).
-  const rows = new Map<number, LtnPlacedKey[]>()
-  for (const k of importKeys) {
-    const y = k.y + dy
-    const arr = rows.get(y) || []
-    arr.push(k)
-    rows.set(y, arr)
-  }
-
-  const candidates = buildWootingRowCandidates()
-
-  for (const [yRow, keys] of rows.entries()) {
-    const sorted = [...keys].sort((a, b) => (a.x2 + dx2) - (b.x2 + dx2))
-    if (sorted.length === 0) continue
-
-    let best: {
-      score: number
-      cand: (typeof candidates)[number]
-      winStart: number
-      startCol: number
-    } | null = null
-
-    for (const cand of candidates) {
-      const n = sorted.length
-      const len = cand.len
-      const winSize = Math.min(n, len)
-      if (winSize <= 0) continue
-
-      // If overflow: try all windows of length len and pick best.
-      const winCount = n > len ? n - len + 1 : 1
-      for (let w0 = 0; w0 < winCount; w0++) {
-        const win = sorted.slice(w0, w0 + winSize)
-        const lumCy = yRow + 0.5
-        const dyAbs = Math.abs(lumCy - cand.cy)
-
-        const s = bestStartCol(win, dx2, cand.xOffU, len)
-        if (s === null) continue
-
-        let score = 0
-        for (let i = 0; i < win.length; i++) {
-          const px2 = win[i].x2 + dx2
-          const targetCx2 = 2 * (cand.xOffU + (s + i)) + 1
-          const dxU = Math.abs(px2 - targetCx2) / 2
-          score += dyAbs * 6 + dxU
-        }
-
-        if (!best || score < best.score) {
-          best = { score, cand, winStart: w0, startCol: s }
-        }
+    // Compute row compaction for Board0 like KeyboardView does.
+    const minColByRow = [0, 0, 0, 0]
+    if (rotate180) {
+      const min = [255, 255, 255, 255]
+      for (const k of geometry.keys) {
+        const rr = 3 - k.row
+        const cc = 13 - k.col
+        min[rr] = Math.min(min[rr], cc)
       }
+      for (let i = 0; i < 4; i++) minColByRow[i] = min[i] === 255 ? 0 : min[i]
     }
 
-    if (!best) continue
-    const win = sorted.slice(best.winStart, best.winStart + Math.min(sorted.length, best.cand.len))
-    for (let i = 0; i < win.length; i++) {
-      const idx = best.cand.row * 14 + (best.startCol + i)
-      if (idx < 0 || idx >= 56) continue
-      byBoard[best.cand.board].set(idx, {
-        note: win[i].cell.note,
-        chan: win[i].cell.chan,
-        col: win[i].cell.col,
+    for (const k of geometry.keys) {
+      const rr = rotate180 ? 3 - k.row : k.row
+      const cc0 = rotate180 ? 13 - k.col : k.col
+      const cc = cc0 - (minColByRow[rr] || 0)
+      const wtnIdx = rr * 14 + cc
+      if (wtnIdx < 0 || wtnIdx >= 56) continue
+
+      const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
+      const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
+
+      const x2 = Math.round((x0 + xOffU) * 2)
+      const y = y0 + yOff
+      const w2 = Math.round(k.w * 2)
+      const h = k.h
+
+      out.push({
+        board,
+        idx: wtnIdx,
+        x2,
+        y,
+        w2,
+        h,
+        cx2: x2 + w2 / 2,
+        cy: y + h / 2,
       })
     }
   }
 
-  return byBoard
-}
-
-function buildWootingRowCandidates() {
-  const rowLens = [14, 14, 13, 12]
-  const out: Array<{ board: 'Board0' | 'Board1'; row: number; len: number; xOffU: number; cy: number }> = []
-  for (const board of ['Board0', 'Board1'] as const) {
-    const xOffU = board === 'Board0' ? 3 : 0
-    const yOff = board === 'Board1' ? 4 : 0
-    for (let r = 0; r < 4; r++) {
-      out.push({ board, row: r, len: rowLens[r], xOffU, cy: r + yOff + 0.5 })
-    }
-  }
   return out
 }
 
-function bestStartCol(win: LtnPlacedKey[], dx2: number, xOffU: number, len: number) {
-  const m = win.length
-  if (m <= 0) return null
-  const sList: number[] = []
-  for (let i = 0; i < m; i++) {
-    const px2 = win[i].x2 + dx2
-    const cEst = Math.round((px2 - 1) / 2 - xOffU)
-    sList.push(cEst - i)
+function hitTestKey(x2: number, y: number, rects: KeyRect[]) {
+  // direct hit
+  for (const r of rects) {
+    if (x2 >= r.x2 && x2 < r.x2 + r.w2 && y >= r.y && y < r.y + r.h) return r
   }
-  sList.sort((a, b) => a - b)
-  let s = sList[Math.floor(sList.length / 2)]
-  s = Math.min(len - m, Math.max(0, s))
-  return s
-}
 
-function computeSuggestedByBoard(overlayByBoard: OverlayByBoard): OverlayByBoard {
-  const rowLens = [14, 14, 13, 12]
-  const out: OverlayByBoard = { Board0: new Map(), Board1: new Map() }
-
-  for (const board of ['Board0', 'Board1'] as const) {
-    for (let r = 0; r < 4; r++) {
-      const len = rowLens[r]
-      const overlays: Array<{ c: number; v: CellDef }> = []
-      for (let c = 0; c < len; c++) {
-        const idx = r * 14 + c
-        const v = overlayByBoard[board].get(idx)
-        if (v) overlays.push({ c, v })
-      }
-      if (overlays.length === 0) continue
-
-      overlays.sort((a, b) => a.c - b.c)
-
-      for (let c = 0; c < len; c++) {
-        const idx = r * 14 + c
-        if (overlayByBoard[board].has(idx)) continue
-
-        const left = findLeft(overlays, c)
-        const right = findRight(overlays, c)
-        if (!left && !right) continue
-
-        const pickColor = (() => {
-          if (left && right) {
-            return c - left.c <= right.c - c ? left.v.col : right.v.col
-          }
-          return (left || right)!.v.col
-        })()
-
-        const interp = (() => {
-          if (left && right && right.c !== left.c) {
-            const t = (c - left.c) / (right.c - left.c)
-            const note = Math.round(left.v.note * (1 - t) + right.v.note * t)
-            const chan = Math.round(left.v.chan * (1 - t) + right.v.chan * t)
-            return { note, chan }
-          }
-          const v = (left || right)!.v
-          return { note: v.note, chan: v.chan }
-        })()
-
-        out[board].set(idx, {
-          note: modNote(interp.note),
-          chan: modChan(interp.chan),
-          col: pickColor,
-        })
-      }
+  // snap to nearest center if close
+  let best: KeyRect | null = null
+  let bestD2 = Infinity
+  const snapR2 = (2.0 * 2.0) // within 1U
+  for (const r of rects) {
+    const dx = (x2 - r.cx2) / 2
+    const dy = y - r.cy
+    const d2 = dx * dx + dy * dy
+    if (d2 < bestD2) {
+      bestD2 = d2
+      best = r
     }
   }
-
-  return out
-}
-
-function findLeft(arr: Array<{ c: number; v: CellDef }>, c: number) {
-  for (let i = arr.length - 1; i >= 0; i--) {
-    if (arr[i].c < c) return arr[i]
-  }
-  return null
-}
-
-function findRight(arr: Array<{ c: number; v: CellDef }>, c: number) {
-  for (let i = 0; i < arr.length; i++) {
-    if (arr[i].c > c) return arr[i]
-  }
-  return null
-}
-
-function modChan(chan1: number) {
-  const c0 = ((Math.trunc(chan1) - 1) % 16 + 16) % 16
-  return c0 + 1
-}
-
-function modNote(note: number) {
-  const n0 = ((Math.trunc(note) % 128) + 128) % 128
-  return n0
+  return best && bestD2 <= snapR2 ? best : null
 }
 
 export default App

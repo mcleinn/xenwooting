@@ -15,8 +15,7 @@ type KeyboardViewProps = {
   lastSelected: string | null
   setLastSelected: (id: string | null) => void
   onKeyHighlight?: (board: 'Board0' | 'Board1', idx: number, down: boolean) => void
-  overlayByIdx?: Map<number, { note: number; chan: number; col: string }>
-  suggestedByIdx?: Map<number, { note: number; chan: number; col: string }>
+  overlayColorByIdx?: Map<number, string>
 }
 
 export function KeyboardView({
@@ -33,8 +32,7 @@ export function KeyboardView({
   lastSelected,
   setLastSelected,
   onKeyHighlight,
-  overlayByIdx,
-  suggestedByIdx,
+  overlayColorByIdx,
 }: KeyboardViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(1)
@@ -178,16 +176,8 @@ export function KeyboardView({
             const cell = byIdx.get(wtnIdx)
             const id = `${boardId}:${wtnIdx}`
             const isSel = selected.has(id)
-            const overlay = overlayByIdx?.get(wtnIdx)
-            const sug = overlay ? null : suggestedByIdx?.get(wtnIdx)
-            const rgb = overlay
-              ? `#${overlay.col}`
-              : sug
-                ? `#${sug.col}`
-                : cell
-                  ? `#${cell.col}`
-                  : '#444444'
-            const isOverlay = Boolean(overlay)
+            const overlay = overlayColorByIdx?.get(wtnIdx)
+            const rgb = overlay ? `#${overlay}` : cell ? `#${cell.col}` : '#444444'
 
             const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
             const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
@@ -201,7 +191,7 @@ export function KeyboardView({
               <button
                 key={id}
                 type="button"
-                className={`key ${isSel ? 'keySelected' : ''} ${isOverlay ? 'keyOverlay' : ''}`}
+                className={`key ${isSel ? 'keySelected' : ''}`}
                 style={{
                   left,
                   top,
@@ -225,13 +215,9 @@ export function KeyboardView({
                 title={`${boardId} idx ${wtnIdx}`}
               >
                 <div className="keyTop">
-                  {(overlay || sug || cell) && (
-                    <span className="keyChan">[{overlay ? overlay.chan : sug ? sug.chan : cell!.chan}]</span>
-                  )}
+                  {cell && <span className="keyChan">[{cell.chan}]</span>}
                 </div>
-                {(overlay || sug || cell) && (
-                  <div className="keyNote">{overlay ? overlay.note : sug ? sug.note : cell!.note}</div>
-                )}
+                {cell && <div className="keyNote">{cell.note}</div>}
               </button>
             )
           })}

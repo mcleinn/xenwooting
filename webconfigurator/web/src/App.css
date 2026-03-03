@@ -297,15 +297,6 @@
   overflow: hidden;
 }
 
-.keyOverlay {
-  border-color: rgba(255, 60, 60, 0.95);
-}
-
-.keyOverlay .keyChan,
-.keyOverlay .keyNote {
-  color: rgba(255, 70, 70, 0.98);
-}
-
 /* Uniform text outline (not a drop shadow). */
 .keyChan,
 .keyNote {
@@ -334,10 +325,6 @@
 .keySelected {
   border-color: rgba(255, 255, 255, 0.72);
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.22);
-}
-
-.keyOverlay.keySelected {
-  border-color: rgba(255, 60, 60, 0.95);
 }
 
 .keyTop {
