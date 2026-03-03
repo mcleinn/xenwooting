@@ -45,7 +45,6 @@ function App() {
   const [importKeys, setImportKeys] = useState<LtnPlacedKey[] | null>(null)
   const [importDx2, setImportDx2] = useState(0)
   const [importDy, setImportDy] = useState(0)
-  const importAccRef = useRef({ ax: 0, ay: 0, uPx: 28 })
 
   useEffect(() => {
     let cancelled = false
@@ -99,17 +98,47 @@ function App() {
     }
   }, [layoutId])
 
-  // Escape cancels import placement.
+  // Import placement keyboard controls.
   useEffect(() => {
+    if (!importActive) return
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && importActive) {
-        setImportActive(false)
-        setImportKeys(null)
+      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
+
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        exitImportMode()
+        return
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        onImportApply()
+        return
+      }
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault()
+        setImportDx2((v) => v - 2)
+        return
+      }
+      if (e.key === 'ArrowRight') {
+        e.preventDefault()
+        setImportDx2((v) => v + 2)
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setImportDy((v) => v - 1)
+        return
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setImportDy((v) => v + 1)
+        return
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [importActive])
+  }, [importActive, importDx2, importDy])
 
   const selectionCount = selected.size
   const selectedCells = useMemo(() => {
@@ -263,8 +292,6 @@ function App() {
     setImportKeys(null)
     setImportDx2(0)
     setImportDy(0)
-    importAccRef.current.ax = 0
-    importAccRef.current.ay = 0
   }
 
   async function exitPreviewMode() {
@@ -363,7 +390,7 @@ function App() {
       setImportActive(true)
       setImportDx2(0)
       setImportDy(0)
-      setStatus('Import placement: move mouse in 1U steps, click to apply.')
+      setStatus('')
     } catch (e) {
       setStatus(`Import failed: ${errMsg(e)}`)
     }
@@ -373,8 +400,10 @@ function App() {
     if (!importActive || !importKeys || !geometry || !boards) return null
     const keyRects = buildWootingKeyRects(geometry)
 
-    // Map of target wtnIdx -> overlay color.
-    const byBoard: { Board0: Map<number, string>; Board1: Map<number, string> } = {
+    const byBoard: {
+      Board0: Map<number, { note: number; chan: number; col: string }>
+      Board1: Map<number, { note: number; chan: number; col: string }>
+    } = {
       Board0: new Map(),
       Board1: new Map(),
     }
@@ -384,48 +413,11 @@ function App() {
       const py = k.y + importDy
       const hit = hitTestKey(px2, py, keyRects)
       if (!hit) continue
-      byBoard[hit.board].set(hit.idx, k.cell.col)
+      byBoard[hit.board].set(hit.idx, { note: k.cell.note, chan: k.cell.chan, col: k.cell.col })
     }
 
     return { byBoard, keyRects }
   }, [importActive, importKeys, importDx2, importDy, geometry, boards])
-
-  function onImportPointerMove(e: React.PointerEvent) {
-    if (!importActive) return
-
-    // Calibrate 1U in px using the smallest visible key.
-    const keys = Array.from(document.querySelectorAll<HTMLButtonElement>('button.key'))
-    if (keys.length) {
-      let minW = Infinity
-      let minH = Infinity
-      for (const el of keys) {
-        const r = el.getBoundingClientRect()
-        if (r.width > 0) minW = Math.min(minW, r.width)
-        if (r.height > 0) minH = Math.min(minH, r.height)
-      }
-      if (Number.isFinite(minW) && minW > 5) importAccRef.current.uPx = Math.max(10, minW)
-      // vertical step is row step, approximate by minH
-      if (Number.isFinite(minH) && minH > 5) {
-        // use average of width/height for stability
-        importAccRef.current.uPx = Math.max(10, Math.min(importAccRef.current.uPx, minH))
-      }
-    }
-
-    importAccRef.current.ax += e.movementX
-    importAccRef.current.ay += e.movementY
-    const uPx = importAccRef.current.uPx
-
-    while (Math.abs(importAccRef.current.ax) >= uPx) {
-      const s = importAccRef.current.ax > 0 ? 1 : -1
-      importAccRef.current.ax -= s * uPx
-      setImportDx2((v) => v + s * 2) // 1U step = 2 half-units
-    }
-    while (Math.abs(importAccRef.current.ay) >= uPx) {
-      const s = importAccRef.current.ay > 0 ? 1 : -1
-      importAccRef.current.ay -= s * uPx
-      setImportDy((v) => v + s * 1)
-    }
-  }
 
   function onImportApply() {
     if (!boards || !importKeys || !geometry) return
@@ -617,6 +609,11 @@ function App() {
             </div>
 
             {status && <div className="status">{status}</div>}
+            {importActive && (
+              <div className="status">
+                Use arrow keys to place, ESC to abort placement. RETURN to apply placement.
+              </div>
+            )}
             <div className="hint">
               Click to select. Ctrl/Meta to multi-select. Shift to add range. Blank fields keep values.
             </div>
@@ -651,11 +648,7 @@ function App() {
               {importActive && (
                 <div
                   className="importOverlay"
-                  onPointerMove={onImportPointerMove}
-                  onPointerDown={(e) => {
-                    e.preventDefault()
-                    onImportApply()
-                  }}
+                  onPointerDown={(e) => e.preventDefault()}
                 />
               )}
               <KeyboardView
@@ -672,7 +665,7 @@ function App() {
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
                 onKeyHighlight={importActive ? undefined : onKeyHighlight}
-                overlayColorByIdx={importOverlay?.byBoard.Board0}
+                overlayByIdx={importOverlay?.byBoard.Board0}
               />
               <KeyboardView
                 title="Board1"
@@ -686,7 +679,7 @@ function App() {
                 lastSelected={lastSelected}
                 setLastSelected={setLastSelected}
                 onKeyHighlight={importActive ? undefined : onKeyHighlight}
-                overlayColorByIdx={importOverlay?.byBoard.Board1}
+                overlayByIdx={importOverlay?.byBoard.Board1}
               />
             </>
           )}

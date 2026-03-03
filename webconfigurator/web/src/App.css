@@ -239,6 +239,19 @@
   cursor: crosshair;
 }
 
+.keyOverlay {
+  border-color: rgba(255, 60, 60, 0.95);
+}
+
+.keyOverlay .keyChan,
+.keyOverlay .keyNote {
+  color: rgba(255, 70, 70, 0.98);
+}
+
+.keyOverlay.keySelected {
+  border-color: rgba(255, 60, 60, 0.95);
+}
+
 .loading {
   border: 1px solid var(--stroke);
   border-radius: 16px;
