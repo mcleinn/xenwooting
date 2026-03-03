@@ -801,70 +801,88 @@ function bestStartCol(win: LtnPlacedKey[], dx2: number, xOffU: number, len: numb
 }
 
 function computeSuggestedByBoard(overlayByBoard: OverlayByBoard): OverlayByBoard {
+  // Suggest across the combined grid row (Board0 row r shares a "combined row" with Board1 row r-4).
+  // This ensures every non-overlayed key in a row gets a suggestion, even if the overlay data
+  // for that row sits only on the other board.
   const rowLens = [14, 14, 13, 12]
   const out: OverlayByBoard = { Board0: new Map(), Board1: new Map() }
 
+  type KeyPos = { board: 'Board0' | 'Board1'; r: number; c: number; idx: number; gx: number }
+  type Seed = { gx: number; v: CellDef }
+
+  const positionsByCombinedRow = new Map<number, KeyPos[]>()
   for (const board of ['Board0', 'Board1'] as const) {
+    const xOff = board === 'Board0' ? 3 : 0
+    const yOff = board === 'Board1' ? 4 : 0
     for (let r = 0; r < 4; r++) {
       const len = rowLens[r]
-      const overlays: Array<{ c: number; v: CellDef }> = []
+      const crow = r + yOff
+      const arr = positionsByCombinedRow.get(crow) || []
       for (let c = 0; c < len; c++) {
         const idx = r * 14 + c
-        const v = overlayByBoard[board].get(idx)
-        if (v) overlays.push({ c, v })
+        arr.push({ board, r, c, idx, gx: c + xOff })
       }
-      if (overlays.length === 0) continue
+      positionsByCombinedRow.set(crow, arr)
+    }
+  }
 
-      overlays.sort((a, b) => a.c - b.c)
+  for (const positions of positionsByCombinedRow.values()) {
+    const seeds: Seed[] = []
+    for (const p of positions) {
+      const v = overlayByBoard[p.board].get(p.idx)
+      if (v) seeds.push({ gx: p.gx, v })
+    }
+    if (seeds.length === 0) continue
+    seeds.sort((a, b) => a.gx - b.gx)
 
-      for (let c = 0; c < len; c++) {
-        const idx = r * 14 + c
-        if (overlayByBoard[board].has(idx)) continue
+    for (const p of positions) {
+      if (overlayByBoard[p.board].has(p.idx)) continue
 
-        const left = findLeft(overlays, c)
-        const right = findRight(overlays, c)
-        if (!left && !right) continue
+      const left = findLeftSeed(seeds, p.gx)
+      const right = findRightSeed(seeds, p.gx)
+      if (!left && !right) continue
 
-        const pickColor = (() => {
-          if (left && right) {
-            return c - left.c <= right.c - c ? left.v.col : right.v.col
-          }
-          return (left || right)!.v.col
-        })()
+      const pickColor = (() => {
+        if (left && right) {
+          return p.gx - left.gx <= right.gx - p.gx ? left.v.col : right.v.col
+        }
+        return (left || right)!.v.col
+      })()
 
-        const interp = (() => {
-          if (left && right && right.c !== left.c) {
-            const t = (c - left.c) / (right.c - left.c)
-            const note = Math.round(left.v.note * (1 - t) + right.v.note * t)
-            const chan = Math.round(left.v.chan * (1 - t) + right.v.chan * t)
-            return { note, chan }
-          }
-          const v = (left || right)!.v
-          return { note: v.note, chan: v.chan }
-        })()
+      const interp = (() => {
+        if (left && right && right.gx !== left.gx) {
+          const t = (p.gx - left.gx) / (right.gx - left.gx)
+          const note = Math.round(left.v.note * (1 - t) + right.v.note * t)
+          const chan = Math.round(left.v.chan * (1 - t) + right.v.chan * t)
+          return { note, chan }
+        }
+        const v = (left || right)!.v
+        return { note: v.note, chan: v.chan }
+      })()
 
-        out[board].set(idx, {
-          note: modNote(interp.note),
-          chan: modChan(interp.chan),
-          col: pickColor,
-        })
-      }
+      out[p.board].set(p.idx, {
+        note: modNote(interp.note),
+        chan: modChan(interp.chan),
+        col: pickColor,
+      })
     }
   }
 
   return out
 }
 
-function findLeft(arr: Array<{ c: number; v: CellDef }>, c: number) {
+// (old per-row helpers removed; interpolation uses gx-based helpers)
+
+function findLeftSeed(arr: Array<{ gx: number; v: CellDef }>, gx: number) {
   for (let i = arr.length - 1; i >= 0; i--) {
-    if (arr[i].c < c) return arr[i]
+    if (arr[i].gx < gx) return arr[i]
   }
   return null
 }
 
-function findRight(arr: Array<{ c: number; v: CellDef }>, c: number) {
+function findRightSeed(arr: Array<{ gx: number; v: CellDef }>, gx: number) {
   for (let i = 0; i < arr.length; i++) {
-    if (arr[i].c > c) return arr[i]
+    if (arr[i].gx > gx) return arr[i]
   }
   return null
 }
