@@ -1,6 +1,6 @@
 # XenWTN (wooting-xen)
 
-XenWTN turns one or two analog Wooting (gaming) keyboards into a configurable microtonal music controller.
+XenWTN turns multiple Wooting 60HE V2 (analog hall effect keyboards popular with gamers) into a configurable microtonal music controller.
 It lets you edit per-key pitch + color layouts in a web UI, then plays them as multi-channel MIDI and provides an MTS-ESP master for compatible synths.
 
 This repository contains three main components:
