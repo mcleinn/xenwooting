@@ -1,144 +1,141 @@
-# wooting-xen
+# XenWTN (wooting-xen)
 
-Small helper scripts for monitoring MIDI coming from the Wooting headless daemon.
+XenWTN turns one or two analog keyboards into a configurable microtonal controller.
+It lets you edit per-key pitch + color layouts in a web UI, then plays them as multi-channel MIDI and provides an MTS-ESP master for compatible synths.
 
-See `InstallRGB.md` for Raspberry Pi + Wooting RGB SDK notes.
+This repository contains three main components:
 
-## Monitor MIDI
+- `xenwooting/`: Rust daemon that reads analog key events, maps keys to a WTN grid via `.wtn` layout files, outputs MIDI, and optionally drives per-key RGB.
+- `webconfigurator/`: Local web app (Node backend + React frontend) to edit `.wtn` layouts, preview changes, and import `.ltn` layouts.
+- `xenharm_service/`: Localhost-only Python service that wraps `xenharmlib` to generate readable note names (including Unicode glyph variants).
 
-For ALSA *input* ports (e.g. the old `Wooting Analog MIDI` daemon):
+## For Microtonal Musicians
 
-The printed prefix is a 0-based MIDI channel, e.g. `[0]`, `[1]`.
+Features (musician-facing):
 
-Run:
+- Multiple tunings / layouts: store several `.wtn` layouts (e.g. 12-EDO, 19-EDO, 31-EDO, 53-EDO) and switch between them.
+- Two-board support: use one or two keyboards as `Board0` / `Board1` with independent layouts.
+- Microtonal pitch via MIDI channel + note: pitch is encoded as `(channel-1)*edo + note + pitch_offset` (16 channels x 128 notes).
+- MTS-ESP master: the daemon hosts an MTS-ESP shared-memory master so compatible synths can follow your current tuning.
+- Per-key colors: key LEDs show your layout colors; presses can be highlighted.
+- Layout import: import `.ltn` layout files into `.wtn` and place/rotate them on the target key grid.
+- Note labels: optional on-key labels (Unicode note spelling) and tooltips (ASCII spellings).
+- Preview mode: audition edits without permanently saving to disk.
+- Isomorphic layout check: the editor can flag boards that are not isomorphic (grid direction steps are inconsistent).
 
-```bash
-python3 monitor_wooting_midi.py
+## Required Hardware
+
+- An analog keyboard supported by the vendor Analog SDK (commonly used: Wooting 60HE/Two HE class devices).
+- Optional: a second compatible keyboard for `Board1`.
+- Linux machine (tested in headless setups); ALSA MIDI available.
+
+RGB is optional, but requires the vendor RGB SDK. See `InstallRGB.md`.
+
+## Web App Addresses
+
+When the configurator server is running (default):
+
+- Configurator UI: `http://<host>:3174/wtn/`
+- Board geometry/debug page: `http://<host>:3174/wtn/boards`
+- Configurator API base: `http://<host>:3174/wtn/api/`
+
+The note-name service runs locally by default:
+
+- XenHarm health: `http://127.0.0.1:3199/health`
+
+Tip: using a reverse proxy (e.g. Caddy) makes this easier to access from phones/tablets on your LAN.
+
+Example Caddyfile snippet:
+
+```caddyfile
+xenwtn.local {
+  reverse_proxy 127.0.0.1:3174
+}
 ```
 
-For ALSA *output* ports (e.g. `XenWooting`), use `aseqdump` mode:
+Then use: `http://xenwtn.local/wtn/`
+
+## Installation (High Level)
+
+This project is typically installed as three services:
+
+1) Build/install the daemon:
 
 ```bash
-python3 monitor_wooting_midi.py --dump-alsa-out --port XenWooting
+cd xenwooting
+cargo build --release
+sudo install -m 0755 target/release/xenwooting /usr/local/bin/xenwooting
 ```
 
-List ports:
+Systemd service (system service): `xenwooting/contrib/systemd/xenwooting.service`
+
+2) Install the XenHarm note-name service (systemd user service):
 
 ```bash
-python3 monitor_wooting_midi.py --list
+mkdir -p ~/.config/systemd/user
+ln -sf "$PWD/xenharm_service/xenharm.service" ~/.config/systemd/user/xenharm.service
+systemctl --user daemon-reload
+systemctl --user enable --now xenharm.service
 ```
 
-Show raw bytes:
+3) Build and run the configurator:
 
 ```bash
-python3 monitor_wooting_midi.py --raw
+npm -C webconfigurator/server install
+npm -C webconfigurator/web install
+npm -C webconfigurator/web run build
+npm -C webconfigurator/server start
 ```
 
-Select a different port by substring:
+Environment variables for the configurator server:
 
-```bash
-python3 monitor_wooting_midi.py --port "Wooting"
-```
+- `PORT` (default `3174`)
+- `XENWTN_CONFIG_DIR` (default `/home/patch/.config/xenwooting`)
+- `XENWTN_CONFIG_TOML` (default `<config_dir>/config.toml`)
+- `XENWTN_GEOMETRY_JSON` (default `/home/patch/xenWTN.json`)
+- `XENHARM_URL` (default `http://127.0.0.1:3199`)
 
-## Power/USB Watch
+## API Endpoints
 
-Prints `vcgencmd get_throttled` + core voltage/temperature periodically. Useful to catch undervoltage or USB power problems.
+Configurator server (`/wtn/api`):
 
-```bash
-./power_watch.sh
-```
+- `GET /wtn/api/layouts`
+- `POST /wtn/api/layouts/add`
+- `GET /wtn/api/layout/:id`
+- `POST /wtn/api/layout/:id` (save `.wtn` boards)
+- `POST /wtn/api/layout/:id/settings`
+- `DELETE /wtn/api/layout/:id`
+- `POST /wtn/api/preview/enable`
+- `POST /wtn/api/preview/update`
+- `POST /wtn/api/preview/disable`
+- `POST /wtn/api/highlight`
+- `POST /wtn/api/note-names` (proxy to xenharm_service)
+- `GET /wtn/api/geometry`
 
-Change interval:
+XenHarm service (`xenharm_service/server.py`):
 
-```bash
-INTERVAL_SEC=1 ./power_watch.sh
-```
+- `GET /health`
+- `POST /v1/note-names`
+- `POST /v1/scale/rotate`
+- `POST /v1/scale/retune`
 
-## Wooting RGB Control
+## Developer Docs
 
-Uses the Wooting RGB SDK (`libwooting-rgb-sdk.so`) to set LED colors per device.
+- Implementation notes and geometry details: `ImpDetails.md`
 
-List devices:
+## Upstream Projects / Credits
 
-```bash
-python3 wooting_rgb.py --list
-```
+This project depends on and/or is inspired by:
 
-Set all keys on device 0 to red:
+- Wooting Analog SDK and Wooting RGB SDK (Wooting Technologies B.V.)
+- MTS-ESP (ODDSound Ltd.)
+- xenharmlib (Fabian Vallon)
+- `.ltn` layout file format from the Lumatone ecosystem (used for import)
 
-```bash
-python3 wooting_rgb.py --device 0 --all --rgb 255 0 0
-```
+## Utilities
 
-Set all keys on devices 0 and 1:
+This repo also includes helper scripts (useful for headless setups):
 
-```bash
-python3 wooting_rgb.py --devices 0,1 --all --hex 00FF00
-```
-
-Set a single matrix cell (row/col) on device 1:
-
-```bash
-python3 wooting_rgb.py --device 1 --key 0 0 --hex 00FFAA
-```
-
-Set a single key on multiple devices:
-
-```bash
-python3 wooting_rgb.py --devices 0,1 --key 0 0 --hex FF00FF --direct
-```
-
-Reset:
-
-```bash
-python3 wooting_rgb.py --device 0 --reset
-```
-
-By default the script leaves your custom colors active. To restore the original
-profile colors on exit (for effects), pass `--restore`.
-
-Effects (Ctrl-C to stop):
-
-```bash
-python3 wooting_rgb.py --device 0 --effect rainbow --rgb 255 0 0
-python3 wooting_rgb.py --device 0 --effect breathe --hex 00A0FF
-python3 wooting_rgb.py --device 0 --effect scanner --hex FF0000
-```
-
-## Identify Matrix Coordinates
-
-Step through `(row,col)` positions and light one at a time (press Enter to advance). Useful for building a physical key map.
-
-```bash
-./step_coords.py --devices 0,1
-```
-
-If Enter doesn't advance in your terminal, use single-key mode (default) or force a specific key:
-
-```bash
-./step_coords.py --devices 0,1 --advance any
-./step_coords.py --devices 0,1 --advance space
-./step_coords.py --devices 0,1 --advance enter
-```
-
-If you're running through SSH / tmux / redirected stdin, this script reads from `/dev/tty` so keypresses still work.
-
-Use a different highlight color and reset to profile colors on exit:
-
-```bash
-./step_coords.py --devices 0,1 --color FF00FF --reset-on-exit
-```
-
-## RGB Power Test (Best Effort)
-
-Runs a quick test: baseline -> full white -> reset, printing Pi PMIC rail readings and looking for undervoltage/USB errors.
-
-```bash
-./rgb_power_test.sh
-```
-
-Target specific devices / change settle time:
-
-```bash
-DEVICES=0,1 SETTLE_SEC=5 ./rgb_power_test.sh
-```
+- MIDI monitor: `monitor_wooting_midi.py`
+- USB/power watchdog: `power_watch.sh`
+- RGB helpers: `wooting_rgb.py`, `step_coords.py`, `rgb_power_test.sh` (see `InstallRGB.md`)
