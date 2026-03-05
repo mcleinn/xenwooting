@@ -1,6 +1,6 @@
 # XenWTN (wooting-xen)
 
-XenWTN turns multiple *Wooting 60HE V2* (*analog* hall effect keyboards popular with gamers: https://wooting.io/wooting-60he-v2) into a configurable "Lumatone" (https://www.lumatone.io/) style velocity-sensitive microtonal music controller with aftertouch and 4mm key travel.
+XenWTN turns multiple *Wooting 60HE V2* (*analog* hall effect keyboards popular with gamers: https://wooting.io/wooting-60he-v2) into a configurable "Lumatone" (https://www.lumatone.io/) style velocity-sensitive microtonal music controller with aftertouch, 4mm key travel and per-key configurable LED lighting.
 It lets you edit per-key pitch + color layouts in a web UI, then plays them as multi-channel MIDI and provides an MTS-ESP master for compatible synths, such as free Amsynth (multi-channel branch: https://github.com/mcleinn/amsynth_multichannel) or commercial Pianotech synth. 
 The project is intended to be installed on a Raspberry Pi with a PiSound soundcard and a recent Patchbox OS (https://community.blokas.io/t/beta-patchbox-os-bookworm-arm64-2024-04-04/5163), but will likely run on any Linux. 
 
