@@ -45,3 +45,17 @@ input,
 select {
   font: inherit;
 }
+
+@font-face {
+  font-family: 'Bravura';
+  src: url('/wtn/fonts/Bravura.otf') format('opentype');
+  font-weight: normal;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: 'Bravura Text';
+  src: url('/wtn/fonts/BravuraText.otf') format('opentype');
+  font-weight: normal;
+  font-style: normal;
+}

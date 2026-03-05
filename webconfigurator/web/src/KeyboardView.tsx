@@ -8,6 +8,10 @@ type KeyboardViewProps = {
   cells: Cell[]
   rotate180?: boolean
   xOffsetU?: number
+  noteNamesByIdx?: Map<number, string>
+  displayMode: 'label' | 'number' | 'both'
+  onHoverKey?: (board: 'Board0' | 'Board1', idx: number) => void
+  onHoverEnd?: () => void
   selected: Set<string>
   selectedOrder: string[]
   setSelected: (next: Set<string>) => void
@@ -24,6 +28,10 @@ export function KeyboardView({
   cells,
   rotate180,
   xOffsetU,
+  noteNamesByIdx,
+  displayMode,
+  onHoverKey,
+  onHoverEnd,
   selected,
   selectedOrder,
   setSelected,
@@ -177,6 +185,10 @@ export function KeyboardView({
             const id = `${boardId}:${wtnIdx}`
             const isSel = selected.has(id)
             const rgb = cell ? `#${cell.col}` : '#444444'
+            const name = noteNamesByIdx?.get(wtnIdx) || ''
+            const showLabel = displayMode === 'label'
+            const showNumber = displayMode === 'number'
+            const showChan = displayMode === 'number'
 
             const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
             const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
@@ -190,7 +202,7 @@ export function KeyboardView({
               <button
                 key={id}
                 type="button"
-                className={`key ${isSel ? 'keySelected' : ''}`}
+                className={`key ${isSel ? 'keySelected' : ''} ${displayMode !== 'both' ? 'keySoloMode' : ''} ${displayMode === 'both' ? 'keyAllMode' : ''}`}
                 style={{
                   left,
                   top,
@@ -209,14 +221,29 @@ export function KeyboardView({
                 }}
                 onPointerUp={() => onKeyHighlight?.(boardId, wtnIdx, false)}
                 onPointerCancel={() => onKeyHighlight?.(boardId, wtnIdx, false)}
-                onPointerLeave={() => onKeyHighlight?.(boardId, wtnIdx, false)}
+                onPointerEnter={() => onHoverKey?.(boardId, wtnIdx)}
+                onPointerLeave={() => {
+                  onKeyHighlight?.(boardId, wtnIdx, false)
+                  onHoverEnd?.()
+                }}
                 onClick={() => toggle(wtnIdx)}
                 title={`${boardId} idx ${wtnIdx}`}
               >
-                <div className="keyTop">
-                  {cell && <span className="keyChan">[{cell.chan}]</span>}
+                {cell && showChan && (
+                  <div className="keyTop">
+                    <span className="keyChan">[{cell.chan}]</span>
+                  </div>
+                )}
+                <div className="keyInner">
+                  {cell && displayMode === 'both' && (
+                    <>
+                      <div className="keyNote">{cell.chan}-{cell.note}</div>
+                      {name && <div className="keyName">{name}</div>}
+                    </>
+                  )}
+                  {cell && showNumber && <div className="keySolo">{cell.note}</div>}
+                  {cell && showLabel && name && <div className="keySolo keySoloLabel">{name}</div>}
                 </div>
-                {cell && <div className="keyNote">{cell.note}</div>}
               </button>
             )
           })}

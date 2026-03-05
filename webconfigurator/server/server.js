@@ -28,6 +28,12 @@ const PREVIEW_ENABLED_PATH = process.env.XENWOOTING_PREVIEW_ENABLED_PATH || '/tm
 const PREVIEW_WTN_PATH = process.env.XENWOOTING_PREVIEW_WTN_PATH || '/tmp/xenwooting-preview.wtn'
 const HIGHLIGHT_PATH = process.env.XENWOOTING_HIGHLIGHT_PATH || '/tmp/xenwooting-highlight.txt'
 
+const XENHARM_URL = process.env.XENHARM_URL || 'http://127.0.0.1:3199'
+
+// Simple in-memory cache for note names.
+// key: `${edo}:${pitch}` -> { short, unicode } | null
+const NOTE_NAME_CACHE = new Map()
+
 async function writeFileAtomic(filePath, text) {
   const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`
   await fs.writeFile(tmp, text, 'utf8')
@@ -189,6 +195,80 @@ app.post(`${API_BASE}/highlight`, async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })
   }
+})
+
+app.post(`${API_BASE}/note-names`, async (req, res) => {
+  const edo = req.body?.edo
+  const pitches = req.body?.pitches
+  if (!Number.isInteger(edo) || !Array.isArray(pitches)) {
+    res.status(400).json({ error: 'Expected body: { edo: int, pitches: int[] }' })
+    return
+  }
+
+  const uniq = []
+  const seen = new Set()
+  for (const p of pitches) {
+    if (!Number.isInteger(p)) continue
+    const key = `${edo}:${p}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    uniq.push(p)
+  }
+
+  const results = {}
+  const missing = []
+  for (const p of uniq) {
+    const key = `${edo}:${p}`
+    if (NOTE_NAME_CACHE.has(key)) {
+      const v = NOTE_NAME_CACHE.get(key)
+      if (v) results[String(p)] = v
+    } else {
+      missing.push(p)
+    }
+  }
+
+  if (missing.length === 0) {
+    res.json({ edo, results })
+    return
+  }
+
+  // Proxy to python service; on error, return empty additions.
+  try {
+    const ac = new AbortController()
+    const t = setTimeout(() => ac.abort(), 900)
+    const r = await fetch(`${XENHARM_URL}/v1/note-names`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ edo, pitches: missing }),
+      signal: ac.signal,
+    })
+    clearTimeout(t)
+
+    if (r.ok) {
+      const body = await r.json().catch(() => null)
+      const got = body && typeof body === 'object' ? body.results : null
+      if (got && typeof got === 'object') {
+        for (const p of missing) {
+          const k = `${edo}:${p}`
+          const vv = got[String(p)]
+          if (vv && typeof vv === 'object' && typeof vv.unicode === 'string' && typeof vv.short === 'string') {
+            NOTE_NAME_CACHE.set(k, { short: vv.short, unicode: vv.unicode })
+            results[String(p)] = { short: vv.short, unicode: vv.unicode }
+          } else {
+            NOTE_NAME_CACHE.set(k, null)
+          }
+        }
+      } else {
+        for (const p of missing) NOTE_NAME_CACHE.set(`${edo}:${p}`, null)
+      }
+    } else {
+      for (const p of missing) NOTE_NAME_CACHE.set(`${edo}:${p}`, null)
+    }
+  } catch {
+    for (const p of missing) NOTE_NAME_CACHE.set(`${edo}:${p}`, null)
+  }
+
+  res.json({ edo, results })
 })
 
 app.get(`${API_BASE}/geometry`, async (_req, res) => {

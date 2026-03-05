@@ -67,6 +67,37 @@
   padding: 16px;
 }
 
+.modalOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.modal {
+  width: min(460px, 100%);
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(20, 26, 38, 0.98);
+  box-shadow: var(--shadow);
+  padding: 14px;
+}
+
+.modalTitle {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.modalSub {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 @media (max-width: 920px) {
   .main {
     grid-template-columns: 1fr;
@@ -125,6 +156,13 @@
   padding: 10px 10px;
   border-radius: 10px;
   outline: none;
+}
+
+/* Ensure dropdown menu is readable on dark UI. */
+.select option,
+.select optgroup {
+  background: #0b1220;
+  color: rgba(255, 255, 255, 0.92);
 }
 
 .input:focus,
@@ -209,7 +247,7 @@
 
 .cellLine {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr auto auto auto;
   gap: 10px;
   align-items: baseline;
   margin: 6px 0;
@@ -297,7 +335,9 @@
 
 /* Uniform text outline (not a drop shadow). */
 .keyChan,
-.keyNote {
+.keyNote,
+.keyName,
+.keySolo {
   -webkit-text-stroke: 0.35px rgba(0, 0, 0, 0.65);
   text-shadow:
     0.5px 0 0 rgba(0, 0, 0, 0.65),
@@ -308,6 +348,54 @@
     -0.5px 0.5px 0 rgba(0, 0, 0, 0.65),
     0.5px -0.5px 0 rgba(0, 0, 0, 0.65),
     -0.5px -0.5px 0 rgba(0, 0, 0, 0.65);
+}
+
+.keyInner {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+}
+
+.keyName {
+  margin-top: 0;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  font-family: 'Bravura', 'Bravura Text', ui-sans-serif, system-ui, sans-serif;
+  text-align: center;
+  line-height: 1;
+}
+
+.keySolo {
+  margin-top: 0;
+  font-size: 42px;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  text-align: center;
+}
+
+.keySoloLabel {
+  font-family: 'Bravura', 'Bravura Text', ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700;
+  transform: translateY(17px);
+}
+
+.keyAllMode .keyInner {
+  gap: 10px;
+}
+
+.keyAllMode .keyNote {
+  font-size: 24px;
+  line-height: 1.05;
+}
+
+.keyAllMode .keyName {
+  font-size: 22px;
+  line-height: 1.05;
 }
 
 .key:hover {
@@ -330,18 +418,30 @@
   justify-content: center;
   align-items: baseline;
   gap: 8px;
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 6px;
+  pointer-events: none;
 }
 
 .keyChan {
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 750;
   letter-spacing: 0.01em;
   opacity: 0.95;
 }
 
 .keyNote {
-  margin-top: 6px;
-  font-size: 16px;
+  margin-top: 0;
+  font-size: 19px;
   font-weight: 700;
   letter-spacing: 0.01em;
+  text-align: center;
+  line-height: 1;
+}
+
+.cellNoteName {
+  font-family: 'Bravura', 'Bravura Text', ui-sans-serif, system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
 }

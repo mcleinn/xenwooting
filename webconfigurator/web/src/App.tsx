@@ -1,10 +1,10 @@
 import './App.css'
-import { useEffect, useMemo, useRef, useState } from 'react'
-/* eslint-disable react-hooks/set-state-in-effect */
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   fetchGeometry,
   fetchLayout,
   fetchLayouts,
+  fetchNoteNames,
   highlightKey,
   previewDisable,
   previewEnable,
@@ -37,8 +37,39 @@ function App() {
   const [colMixed, setColMixed] = useState(false)
   const [status, setStatus] = useState<string>('')
 
+  const [displayMode, setDisplayMode] = useState<'label' | 'number' | 'both'>('both')
+
+  const [enumOpen, setEnumOpen] = useState(false)
+  const [enumInc, setEnumInc] = useState('1')
+  const enumInputRef = useRef<HTMLInputElement | null>(null)
+
+  const [hoveredKey, setHoveredKey] = useState<{ board: 'Board0' | 'Board1'; idx: number } | null>(null)
+
   const [previewMode, setPreviewMode] = useState(false)
   const previewPushTimer = useRef<number | null>(null)
+
+  const pushPreview = useCallback(
+    (nextBoards: Boards) => {
+      if (!previewMode) return
+      if (!layoutId) return
+
+      if (previewPushTimer.current !== null) {
+        window.clearTimeout(previewPushTimer.current)
+        previewPushTimer.current = null
+      }
+      previewPushTimer.current = window.setTimeout(() => {
+        previewUpdate(layoutId, nextBoards).catch((e) => {
+          setStatus(`Preview sync failed: ${errMsg(e)}`)
+        })
+      }, 60)
+    },
+    [layoutId, previewMode],
+  )
+
+  // Note names (unicode) via xenharm service (proxied by node backend).
+  // key: `${edo}:${pitch}` -> { short, unicode } | null
+  const [noteNameCache, setNoteNameCache] = useState<Map<string, { short: string; unicode: string } | null>>(new Map())
+  const noteNamesFetchTimer = useRef<number | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -63,6 +94,7 @@ function App() {
   useEffect(() => {
     if (!layoutId) return
     let cancelled = false
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setStatus('Loading .wtn...')
 
     // Changing layout exits preview mode.
@@ -90,6 +122,150 @@ function App() {
     }
   }, [layoutId])
 
+  useEffect(() => {
+    if (!enumOpen) return
+    const t = window.setTimeout(() => {
+      enumInputRef.current?.focus()
+      enumInputRef.current?.select()
+    }, 0)
+    return () => window.clearTimeout(t)
+  }, [enumOpen])
+
+  // Hotkey: 'c' cycles color of hovered key only.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
+      if (e.key.toLowerCase() !== 'c') return
+      if (!boards) return
+      if (!hoveredKey) return
+      if (!geometry) return
+
+      // Palette: colors from actually drawn keys only (no holes).
+      const palette: string[] = []
+      const seen = new Set<string>()
+      const vis0 = visibleWtnIdxs(geometry, true)
+      const vis1 = visibleWtnIdxs(geometry, false)
+      for (const [b, idxs] of [
+        ['Board0', vis0],
+        ['Board1', vis1],
+      ] as const) {
+        for (const i of idxs) {
+          const c = boards[b][i]
+          if (!c) continue
+          const col = String(c.col || '').trim().toUpperCase()
+          if (!/^[0-9A-F]{6}$/.test(col)) continue
+          if (seen.has(col)) continue
+          seen.add(col)
+          palette.push(col)
+        }
+      }
+      if (palette.length < 2) return
+
+      const { board, idx } = hoveredKey
+      const cur = boards[board]?.[idx]
+      if (!cur) return
+      const curCol = String(cur.col || '').trim().toUpperCase()
+      const at = palette.indexOf(curCol)
+      const nextCol = palette[(at >= 0 ? at + 1 : 0) % palette.length]
+      if (!nextCol || nextCol === cur.col) return
+
+      const next: Boards = {
+        Board0: boards.Board0.map((c) => ({ ...c })),
+        Board1: boards.Board1.map((c) => ({ ...c })),
+      }
+      const cell = next[board][idx]
+      if (!cell) return
+      cell.col = nextCol
+      setBoards(next)
+      pushPreview(next)
+
+      e.preventDefault()
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [boards, hoveredKey, geometry, pushPreview])
+
+  // Prefetch note names for all keys (both boards) and cache them.
+  useEffect(() => {
+    if (!boards) return
+    const edo = Math.max(1, edoDivisions)
+
+    const missing: number[] = []
+    const seenPitch = new Set<number>()
+    for (const b of ['Board0', 'Board1'] as const) {
+      for (const c of boards[b]) {
+        const pitch = (Math.max(0, Math.min(15, c.chan - 1)) * edo + c.note + pitchOffset) | 0
+        if (seenPitch.has(pitch)) continue
+        seenPitch.add(pitch)
+
+        const k = `${edo}:${pitch}`
+        if (!noteNameCache.has(k)) missing.push(pitch)
+      }
+    }
+
+    if (missing.length === 0) return
+
+    // Debounce so editing doesn't spam the server.
+    if (noteNamesFetchTimer.current !== null) {
+      window.clearTimeout(noteNamesFetchTimer.current)
+      noteNamesFetchTimer.current = null
+    }
+    noteNamesFetchTimer.current = window.setTimeout(() => {
+      fetchNoteNames(edo, missing)
+        .then((r) => {
+          const results = r?.results || {}
+          setNoteNameCache((prev) => {
+            const next = new Map(prev)
+            for (const p of missing) {
+              const v = results[String(p)]
+              const key = `${edo}:${p}`
+              if (v && typeof v.unicode === 'string' && typeof v.short === 'string') {
+                next.set(key, { short: v.short, unicode: v.unicode })
+              } else {
+                next.set(key, null)
+              }
+            }
+            return next
+          })
+        })
+        .catch(() => {
+          setNoteNameCache((prev) => {
+            const next = new Map(prev)
+            for (const p of missing) next.set(`${edo}:${p}`, null)
+            return next
+          })
+        })
+    }, 80)
+
+    return () => {
+      if (noteNamesFetchTimer.current !== null) {
+        window.clearTimeout(noteNamesFetchTimer.current)
+        noteNamesFetchTimer.current = null
+      }
+    }
+  }, [boards, edoDivisions, pitchOffset, noteNameCache])
+
+  const noteNamesByBoard = useMemo(() => {
+    if (!boards) return null
+    const edo = Math.max(1, edoDivisions)
+    const b0 = new Map<number, string>()
+    const b1 = new Map<number, string>()
+    for (const [b, out] of [
+      ['Board0', b0],
+      ['Board1', b1],
+    ] as const) {
+      for (let i = 0; i < boards[b].length; i++) {
+        const c = boards[b][i]
+        const pitch = (Math.max(0, Math.min(15, c.chan - 1)) * edo + c.note + pitchOffset) | 0
+        const v = noteNameCache.get(`${edo}:${pitch}`)
+        if (v && v.unicode) out.set(i, v.unicode)
+      }
+    }
+    return { Board0: b0, Board1: b1 }
+  }, [boards, edoDivisions, pitchOffset, noteNameCache])
+
   const selectionCount = selected.size
   const selectedCells = useMemo(() => {
     if (!boards) return []
@@ -106,7 +282,7 @@ function App() {
 
   const selectedCellsInfo = useMemo(() => {
     if (!boards) return []
-    const out: Array<{ id: string; pitch: number; hz: number }> = []
+    const out: Array<{ id: string; pitch: number; hz: number; unicode: string }> = []
 
     const edo = Math.max(1, edoDivisions)
 
@@ -119,13 +295,16 @@ function App() {
       if (!cell) continue
 
       const ch0 = Math.max(0, Math.min(15, cell.chan - 1))
-      const pitch = ch0 * edo + cell.note + pitchOffset
+      const pitch = (ch0 * edo + cell.note + pitchOffset) | 0
       const hz = Math.round(C0_HZ * Math.pow(2, pitch / edo))
-      out.push({ id, pitch, hz })
+
+      const nn = noteNameCache.get(`${edo}:${pitch}`)
+      const unicode = nn && nn.unicode ? nn.unicode : ''
+      out.push({ id, pitch, hz, unicode })
     }
 
     return out
-  }, [boards, selected, edoDivisions, pitchOffset])
+  }, [boards, selected, edoDivisions, pitchOffset, noteNameCache])
 
   // Keep editor fields in sync with selection.
   // - Single key: show its values.
@@ -135,6 +314,7 @@ function App() {
     if (!boards) return
 
     if (selectedCells.length === 0) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setNoteMixed(false)
       setChanMixed(false)
       setColMixed(false)
@@ -196,45 +376,54 @@ function App() {
     pushPreview(next)
   }
 
-  function applyOctave() {
+  function openEnumerate() {
     if (!boards) return
-    if (selectedOrder.length === 0) return
+    if (selected.size === 0) return
+    setEnumInc('1')
+    setEnumOpen(true)
+  }
+
+  function closeEnumerate() {
+    setEnumOpen(false)
+  }
+
+  function applyEnumerate() {
+    if (!boards) return
+    const inc = clampInt(enumInc, 1, 127)
+
+    const ordered = selectedOrder.filter((id) => selected.has(id)).map(parseCellId).filter(Boolean) as Array<{
+      board: 'Board0' | 'Board1'
+      idx: number
+    }>
+
+    if (ordered.length === 0) {
+      closeEnumerate()
+      return
+    }
+
+    const baseCell = boards[ordered[0].board]?.[ordered[0].idx]
+    if (!baseCell) {
+      closeEnumerate()
+      return
+    }
+    const baseNote = baseCell.note | 0
 
     const next: Boards = {
       Board0: boards.Board0.map((c) => ({ ...c })),
       Board1: boards.Board1.map((c) => ({ ...c })),
     }
 
-    let n = 1
-    for (const id of selectedOrder) {
-      if (!selected.has(id)) continue
-      const [b, i] = id.split(':')
-      if (b !== 'Board0' && b !== 'Board1') continue
-      const idx = Number.parseInt(i || '', 10)
-      if (!Number.isFinite(idx)) continue
-      const cell = next[b][idx]
+    for (let k = 0; k < ordered.length; k++) {
+      const { board, idx } = ordered[k]
+      const cell = next[board][idx]
       if (!cell) continue
-      cell.note = Math.min(127, Math.max(0, n))
-      n += 1
+      const n = clampInt(String(baseNote + k * inc), 0, 127)
+      cell.note = n
     }
 
     setBoards(next)
     pushPreview(next)
-  }
-
-  function pushPreview(nextBoards: Boards) {
-    if (!previewMode) return
-    if (!layoutId) return
-
-    if (previewPushTimer.current !== null) {
-      window.clearTimeout(previewPushTimer.current)
-      previewPushTimer.current = null
-    }
-    previewPushTimer.current = window.setTimeout(() => {
-      previewUpdate(layoutId, nextBoards).catch((e) => {
-        setStatus(`Preview sync failed: ${errMsg(e)}`)
-      })
-    }, 60)
+    closeEnumerate()
   }
 
   async function exitPreviewMode() {
@@ -321,6 +510,19 @@ function App() {
         </div>
 
         <div className="controls">
+          <label className="field">
+            <span className="fieldLabel">Display</span>
+            <select
+              className="select"
+              value={displayMode}
+              onChange={(e) => setDisplayMode(e.target.value as 'label' | 'number' | 'both')}
+            >
+              <option value="label">Label only</option>
+              <option value="number">MIDI only</option>
+              <option value="both">All</option>
+            </select>
+          </label>
+
           <label className="previewToggle">
             <input
               type="checkbox"
@@ -363,6 +565,56 @@ function App() {
       </header>
 
       <main className="main">
+        {enumOpen && (
+          <div
+            className="modalOverlay"
+            onPointerDown={(e) => {
+              if (e.target === e.currentTarget) closeEnumerate()
+            }}
+          >
+            <div
+              className="modal"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Enumerate notes"
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <div className="modalTitle">Enumerate</div>
+              <div className="modalSub">
+                Leave first selected note as-is; assign following notes by increment.
+              </div>
+              <label className="field">
+                <span className="fieldLabel">Increment (min 1)</span>
+                <input
+                  ref={enumInputRef}
+                  className="input"
+                  inputMode="numeric"
+                  value={enumInc}
+                  onChange={(e) => setEnumInc(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      e.preventDefault()
+                      closeEnumerate()
+                    }
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      applyEnumerate()
+                    }
+                  }}
+                />
+              </label>
+              <div className="row">
+                <button className="btnSecondary" type="button" onClick={closeEnumerate}>
+                  Abort
+                </button>
+                <button className="btn" type="button" onClick={applyEnumerate}>
+                  Apply
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         <div className="sidebar">
           <section className="panel">
             <div className="panelTitle">Edit Selection</div>
@@ -444,10 +696,10 @@ function App() {
               <button
                 className="btnSecondary"
                 type="button"
-                onClick={applyOctave}
-                disabled={!boards || selectedOrder.length === 0}
+                onClick={openEnumerate}
+                disabled={!boards || selected.size === 0}
               >
-                Octave
+                Enumerate
               </button>
               <button
                 className="btnSecondary"
@@ -481,6 +733,7 @@ function App() {
                 {selectedCellsInfo.map((x) => (
                   <li key={x.id} className="cellLine">
                     <span className="cellId">{x.id}</span>
+                    <span className="cellVal cellNoteName">{x.unicode}</span>
                     <span className="cellVal">pitch {x.pitch}</span>
                     <span className="cellVal">{x.hz} Hz</span>
                   </li>
@@ -502,6 +755,10 @@ function App() {
                 cells={boards.Board0}
                 rotate180
                 xOffsetU={3}
+                noteNamesByIdx={noteNamesByBoard?.Board0}
+                displayMode={displayMode}
+                onHoverKey={(board, idx) => setHoveredKey({ board, idx })}
+                onHoverEnd={() => setHoveredKey(null)}
                 selected={selected}
                 selectedOrder={selectedOrder}
                 setSelected={setSelected}
@@ -515,6 +772,10 @@ function App() {
                 boardId="Board1"
                 geometry={geometry}
                 cells={boards.Board1}
+                noteNamesByIdx={noteNamesByBoard?.Board1}
+                displayMode={displayMode}
+                onHoverKey={(board, idx) => setHoveredKey({ board, idx })}
+                onHoverEnd={() => setHoveredKey(null)}
                 selected={selected}
                 selectedOrder={selectedOrder}
                 setSelected={setSelected}
@@ -537,6 +798,46 @@ function clampInt(s: string, min: number, max: number) {
   const n = Number.parseInt(s, 10)
   if (!Number.isFinite(n)) return min
   return Math.min(max, Math.max(min, n))
+}
+
+function parseCellId(id: string): { board: 'Board0' | 'Board1'; idx: number } | null {
+  const [b, i] = id.split(':')
+  if (b !== 'Board0' && b !== 'Board1') return null
+  const idx = Number.parseInt(i || '', 10)
+  if (!Number.isFinite(idx) || idx < 0 || idx >= 56) return null
+  return { board: b, idx }
+}
+
+function visibleWtnIdxs(geometry: Geometry, rotate180: boolean): number[] {
+  const keys = geometry.keys
+
+  let minColByRow = [0, 0, 0, 0]
+  if (rotate180) {
+    const min = [255, 255, 255, 255]
+    for (const k of keys) {
+      const rr = 3 - k.row
+      const cc = 13 - k.col
+      min[rr] = Math.min(min[rr], cc)
+    }
+    for (let i = 0; i < 4; i++) {
+      if (min[i] === 255) min[i] = 0
+    }
+    minColByRow = min
+  }
+
+  const out: number[] = []
+  const seen = new Set<number>()
+  for (const k of keys) {
+    const rr = rotate180 ? 3 - k.row : k.row
+    const cc0 = rotate180 ? 13 - k.col : k.col
+    const cc = cc0 - (minColByRow[rr] || 0)
+    const idx = rr * 14 + cc
+    if (idx < 0 || idx >= 56) continue
+    if (seen.has(idx)) continue
+    seen.add(idx)
+    out.push(idx)
+  }
+  return out
 }
 
 function normalizeHex6(s: string) {
