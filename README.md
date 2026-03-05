@@ -8,7 +8,7 @@ This repository contains three main components:
 
 - `xenwooting/`: Rust daemon that reads analog key events, maps keys to a WTN grid via `.wtn` layout files, outputs MIDI, and optionally drives per-key RGB.
 - `webconfigurator/`: Local web app (Node backend + React frontend) to edit `.wtn` layouts, preview changes, and import `.ltn` layouts.
-- `xenharm_service/`: Localhost-only Python service that wraps `xenharmlib` to generate readable note names (including Unicode glyph variants).
+- `xenharm_service/`: Localhost-only Python service that wraps `xenharmlib` (https://github.com/retooth2/xenharmlib) to generate readable note names (including Unicode glyph variants).
 
 ## For Microtonal Musicians
 
