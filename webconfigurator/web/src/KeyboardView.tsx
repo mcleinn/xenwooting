@@ -10,6 +10,8 @@ type KeyboardViewProps = {
   xOffsetU?: number
   noteNamesByIdx?: Map<number, string>
   displayMode: 'label' | 'number' | 'both'
+  overlayByIdx?: Map<number, { note: number; chan: number; col: string }>
+  placementActive?: boolean
   onHoverKey?: (board: 'Board0' | 'Board1', idx: number) => void
   onHoverEnd?: () => void
   selected: Set<string>
@@ -30,6 +32,8 @@ export function KeyboardView({
   xOffsetU,
   noteNamesByIdx,
   displayMode,
+  overlayByIdx,
+  placementActive,
   onHoverKey,
   onHoverEnd,
   selected,
@@ -184,7 +188,8 @@ export function KeyboardView({
             const cell = byIdx.get(wtnIdx)
             const id = `${boardId}:${wtnIdx}`
             const isSel = selected.has(id)
-            const rgb = cell ? `#${cell.col}` : '#444444'
+            const overlay = overlayByIdx?.get(wtnIdx)
+            const rgb = overlay ? `#${overlay.col}` : cell ? `#${cell.col}` : '#444444'
             const name = noteNamesByIdx?.get(wtnIdx) || ''
             const showLabel = displayMode === 'label'
             const showNumber = displayMode === 'number'
@@ -202,7 +207,7 @@ export function KeyboardView({
               <button
                 key={id}
                 type="button"
-                className={`key ${isSel ? 'keySelected' : ''} ${displayMode !== 'both' ? 'keySoloMode' : ''} ${displayMode === 'both' ? 'keyAllMode' : ''}`}
+                className={`key ${isSel ? 'keySelected' : ''} ${displayMode !== 'both' ? 'keySoloMode' : ''} ${displayMode === 'both' ? 'keyAllMode' : ''} ${overlay ? 'keyOverlay' : ''}`}
                 style={{
                   left,
                   top,
@@ -217,13 +222,17 @@ export function KeyboardView({
                   } catch {
                     // ignore
                   }
-                  onKeyHighlight?.(boardId, wtnIdx, true)
+                  if (!placementActive) onKeyHighlight?.(boardId, wtnIdx, true)
                 }}
-                onPointerUp={() => onKeyHighlight?.(boardId, wtnIdx, false)}
-                onPointerCancel={() => onKeyHighlight?.(boardId, wtnIdx, false)}
+                onPointerUp={() => {
+                  if (!placementActive) onKeyHighlight?.(boardId, wtnIdx, false)
+                }}
+                onPointerCancel={() => {
+                  if (!placementActive) onKeyHighlight?.(boardId, wtnIdx, false)
+                }}
                 onPointerEnter={() => onHoverKey?.(boardId, wtnIdx)}
                 onPointerLeave={() => {
-                  onKeyHighlight?.(boardId, wtnIdx, false)
+                  if (!placementActive) onKeyHighlight?.(boardId, wtnIdx, false)
                   onHoverEnd?.()
                 }}
                 onClick={() => toggle(wtnIdx)}
@@ -231,17 +240,17 @@ export function KeyboardView({
               >
                 {cell && showChan && (
                   <div className="keyTop">
-                    <span className="keyChan">[{cell.chan}]</span>
+                    <span className="keyChan">[{overlay ? overlay.chan : cell.chan}]</span>
                   </div>
                 )}
                 <div className="keyInner">
                   {cell && displayMode === 'both' && (
                     <>
-                      <div className="keyNote">{cell.chan}-{cell.note}</div>
+                      <div className="keyNote">{(overlay ? overlay.chan : cell.chan)}-{(overlay ? overlay.note : cell.note)}</div>
                       {name && <div className="keyName">{name}</div>}
                     </>
                   )}
-                  {cell && showNumber && <div className="keySolo">{cell.note}</div>}
+                  {cell && showNumber && <div className="keySolo">{overlay ? overlay.note : cell.note}</div>}
                   {cell && showLabel && name && <div className="keySolo keySoloLabel">{name}</div>}
                 </div>
               </button>

@@ -59,16 +59,97 @@ app.get(`${API_BASE}/layouts`, async (_req, res) => {
     const cfg = TOML.parse(raw)
     const layouts = Array.isArray(cfg.layouts) ? cfg.layouts : []
 
+    const outLayouts = layouts
+      .map((l) => ({
+        id: String(l.id || ''),
+        name: String(l.name || l.id || ''),
+        wtnPath: String(l.wtn_path || ''),
+      }))
+      .filter((l) => l.id && l.wtnPath)
+      .sort((a, b) => naturalCompare(a.name || a.id, b.name || b.id) || naturalCompare(a.id, b.id))
+
     res.json({
       configDir: CONFIG_DIR,
-      layouts: layouts
-        .map((l) => ({
-          id: String(l.id || ''),
-          name: String(l.name || l.id || ''),
-          wtnPath: String(l.wtn_path || ''),
-        }))
-        .filter((l) => l.id && l.wtnPath),
+      layouts: outLayouts,
     })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+function naturalCompare(a, b) {
+  const ax = String(a ?? '')
+  const bx = String(b ?? '')
+  if (ax === bx) return 0
+
+  const as = ax.split(/(\d+)/).filter(Boolean)
+  const bs = bx.split(/(\d+)/).filter(Boolean)
+  const n = Math.max(as.length, bs.length)
+  for (let i = 0; i < n; i++) {
+    const ap = as[i]
+    const bp = bs[i]
+    if (ap === undefined) return -1
+    if (bp === undefined) return 1
+    const an = /^\d+$/.test(ap) ? Number.parseInt(ap, 10) : null
+    const bn = /^\d+$/.test(bp) ? Number.parseInt(bp, 10) : null
+    if (an !== null && bn !== null) {
+      if (an !== bn) return an - bn
+      continue
+    }
+    const c = ap.localeCompare(bp, undefined, { sensitivity: 'base' })
+    if (c !== 0) return c
+  }
+  return ax.localeCompare(bx, undefined, { sensitivity: 'base' })
+}
+
+app.post(`${API_BASE}/layouts/add`, async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim()
+    const edoDivisions = Number.parseInt(String(req.body?.edoDivisions ?? ''), 10)
+    const pitchOffset = Number.parseInt(String(req.body?.pitchOffset ?? 0), 10)
+    if (!name) {
+      res.status(400).json({ error: 'Expected body: { name }' })
+      return
+    }
+    if (!Number.isFinite(edoDivisions) || edoDivisions < 1 || edoDivisions > 999) {
+      res.status(400).json({ error: 'Expected body: { edoDivisions: int >= 1 }' })
+      return
+    }
+    const raw = await fs.readFile(CONFIG_TOML, 'utf8')
+    const cfg = TOML.parse(raw)
+    const layouts = Array.isArray(cfg.layouts) ? cfg.layouts : []
+
+    const baseId = `edo${edoDivisions}`
+    const used = new Set(layouts.map((l) => String(l.id || '')))
+    let id = baseId
+    if (used.has(id)) {
+      let n = 2
+      while (used.has(`${baseId}-${n}`)) n++
+      id = `${baseId}-${n}`
+    }
+
+    const wtnRel = `wtn/${id}.wtn`
+    const wtnAbs = path.join(CONFIG_DIR, wtnRel)
+
+    // Create minimal .wtn file if missing.
+    try {
+      await fs.mkdir(path.dirname(wtnAbs), { recursive: true })
+      await fs.access(wtnAbs)
+    } catch {
+      await writeFileAtomic(wtnAbs, `[Board0]\n\n[Board1]\n\n`)
+    }
+
+    const block =
+      `\n[[layouts]]\n` +
+      `id = ${JSON.stringify(id)}\n` +
+      `name = ${JSON.stringify(name)}\n` +
+      `wtn_path = ${JSON.stringify(wtnRel)}\n` +
+      `edo_divisions = ${edoDivisions}\n` +
+      `pitch_offset = ${Number.isFinite(pitchOffset) ? pitchOffset : 0}\n`
+
+    await writeFileAtomic(CONFIG_TOML, `${raw.trimEnd()}${block}`)
+
+    res.json({ id, name })
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })
   }
@@ -98,6 +179,80 @@ app.get(`${API_BASE}/layout/:id`, async (req, res) => {
       pitchOffset: Number(layout.pitch_offset ?? 0),
       boards,
     })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+app.post(`${API_BASE}/layout/:id/settings`, async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const name = String(req.body?.name || '').trim()
+    const edoDivisions = Number.parseInt(String(req.body?.edoDivisions ?? ''), 10)
+    if (!name) {
+      res.status(400).json({ error: 'Expected body: { name }' })
+      return
+    }
+    if (!Number.isFinite(edoDivisions) || edoDivisions < 1 || edoDivisions > 999) {
+      res.status(400).json({ error: 'Expected body: { edoDivisions: int >= 1 }' })
+      return
+    }
+
+    const raw = await fs.readFile(CONFIG_TOML, 'utf8')
+    const cfg = TOML.parse(raw)
+    const layouts = Array.isArray(cfg.layouts) ? cfg.layouts : []
+    const idx = layouts.findIndex((l) => String(l.id) === id)
+    if (idx < 0) {
+      res.status(404).json({ error: `Unknown layout id: ${id}` })
+      return
+    }
+
+    layouts[idx] = {
+      ...layouts[idx],
+      id,
+      name,
+      edo_divisions: edoDivisions,
+    }
+    cfg.layouts = layouts
+
+    const out = TOML.stringify(cfg)
+    await writeFileAtomic(CONFIG_TOML, out)
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+app.delete(`${API_BASE}/layout/:id`, async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const raw = await fs.readFile(CONFIG_TOML, 'utf8')
+    const cfg = TOML.parse(raw)
+    const layouts = Array.isArray(cfg.layouts) ? cfg.layouts : []
+    if (layouts.length <= 1) {
+      res.status(400).json({ error: 'Cannot delete the last remaining layout' })
+      return
+    }
+    const idx = layouts.findIndex((l) => String(l.id) === id)
+    if (idx < 0) {
+      res.status(404).json({ error: `Unknown layout id: ${id}` })
+      return
+    }
+
+    const wtnPathRel = String(layouts[idx].wtn_path || '')
+    layouts.splice(idx, 1)
+    cfg.layouts = layouts
+
+    const out = TOML.stringify(cfg)
+    await writeFileAtomic(CONFIG_TOML, out)
+
+    if (wtnPathRel) {
+      const wtnAbs = path.join(CONFIG_DIR, wtnPathRel)
+      await safeUnlink(wtnAbs)
+    }
+
+    const nextId = String(layouts[0]?.id || '')
+    res.json({ ok: true, nextId })
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })
   }

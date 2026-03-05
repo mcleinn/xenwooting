@@ -87,3 +87,41 @@ export async function fetchNoteNames(
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
+
+export async function addLayout(body: {
+  name: string
+  edoDivisions: number
+  pitchOffset?: number
+}): Promise<{ id: string; name: string }> {
+  const res = await fetch(apiUrl('api/layouts/add'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function updateLayoutSettings(
+  id: string,
+  body: {
+    name: string
+    edoDivisions: number
+  },
+): Promise<{ ok: true }> {
+  const res = await fetch(apiUrl(`api/layout/${encodeURIComponent(id)}/settings`), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function deleteLayout(id: string): Promise<{ ok: true; nextId: string }> {
+  const res = await fetch(apiUrl(`api/layout/${encodeURIComponent(id)}`), {
+    method: 'DELETE',
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}

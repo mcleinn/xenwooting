@@ -264,3 +264,82 @@ Important:
   Enter in the ANSI guess). Do not encode holes into `.wtn`.
 - Rotation/mirror: do NOT change `led_row/led_col` when applying rotation/mirror; only
   `midi_row/midi_col` changes.
+
+## Hex-Grid Board Geometry + LTN->WTN Mapping (Import / Placement Mode)
+
+The configurator can project Lumatone `.ltn` layouts onto Wooting `.wtn` layouts using explicit
+hex-grid geometry tables (not pixel hit-testing).
+
+### Geometry Tables
+
+Files:
+
+- `webconfigurator/web/src/hexgrid/boardGrids.ts`
+  - `WTN_GRIDS.{Board0,Board1}`: Wooting boards in a hex-grid **visible-key** index space
+    (53 keys per board, indices `0..52`).
+  - `LTN_GRIDS.Board0..Board4`: Lumatone boards (56 keys per board, indices `0..55`).
+
+Each key has an integer coordinate `(x, y)` in a hex lattice where neighbors are:
+
+- `(0, -2)`, `(0, +2)`
+- `(-1, -1)`, `(-1, +1)`, `(+1, -1)`, `(+1, +1)`
+
+This is a "doubled-y" representation: adjacent columns differ by 2 in `y`.
+
+### Combined Coordinate Space
+
+Mapping uses a single combined coordinate space:
+
+1) LTN: `(BoardN, Key_k) -> (x, y)` via `LTN_GRIDS.BoardN.byKey`.
+2) WTN: `(x, y) -> (wtn_board, visible_key_index)` via a combined lookup built from `WTN_GRIDS`.
+
+This step is purely geometric. **Holes/wide-key gaps are not part of the projection**.
+
+### Transform (Translate + 60-degree Rotate)
+
+Placement mode applies an adjustable transform to LTN coordinates before lookup:
+
+```
+world = rotate60(src, rot_steps) + (tx, ty)
+```
+
+- `rot_steps` is in `0..5` (60-degree steps around the hex axes)
+- `(tx, ty)` is a translation in the same `(x, y)` coordinate system
+
+Implementation: `webconfigurator/web/src/hexgrid/project.ts`
+
+Rotation is implemented by converting `(x, y)` to cube coordinates scaled by 2, applying
+`(X, Y, Z) -> (-Z, -X, -Y)` per step, then converting back.
+
+### Rotation Pivot (Hover-rotate)
+
+In placement mode, pressing `r` rotates around:
+
+- the currently hovered target WTN key, or
+- a fixed anchor coordinate if the mouse is not hovering a key.
+
+Translation is adjusted so the overlay rotates "in place" around that world coordinate.
+
+### Visible-key Mapping vs `.wtn` 56-cell Indexing
+
+WTN geometry tables use **visible** key indices (`0..52`). However `.wtn` files and xenwooting
+operate on the 56-cell 4x14 musical grid (`Key_0..Key_55`).
+
+After the geometric hit-test identifies `(wtn_board, visible_key_index)`, the configurator maps
+that visible index onto the current internal 0..55 indexing used by the loaded layout arrays.
+
+This final step is intentionally separate so we can later change `.wtn` handling (e.g. eliminate
+unused indices) without changing the hex-grid projection logic.
+
+### Overlay / Apply Semantics
+
+- Overlay cells in placement mode render with a red border + red text.
+- `Enter` applies the overlay values into the in-memory layout (not saved yet).
+- `Esc` aborts placement without applying.
+- Missing/incomplete `.ltn` entries are ignored.
+
+Relevant code:
+
+- LTN parsing: `webconfigurator/web/src/ltn/parse.ts`
+- Placement + projection + apply: `webconfigurator/web/src/App.tsx`
+- Overlay rendering: `webconfigurator/web/src/KeyboardView.tsx`

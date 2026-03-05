@@ -183,7 +183,7 @@ impl BoardConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayoutConfig {
     pub id: String,
     pub name: String,
@@ -191,6 +191,18 @@ pub struct LayoutConfig {
     pub edo_divisions: i32,
     #[serde(default)]
     pub pitch_offset: i32,
+}
+
+impl LayoutConfig {
+    pub fn sort_key(&self) -> (&str, &str) {
+        // Primary: human name; fallback: id.
+        let primary = if self.name.trim().is_empty() {
+            self.id.as_str()
+        } else {
+            self.name.as_str()
+        };
+        (primary, self.id.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

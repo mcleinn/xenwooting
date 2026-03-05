@@ -22,6 +22,55 @@ use xenwooting::rgb::{parse_hex_rgb, Rgb};
 use xenwooting::rgb_worker::{spawn_rgb_worker, try_send_drop, RgbCmd, RgbKey};
 use xenwooting::wtn::Wtn;
 
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if a == b {
+        return Ordering::Equal;
+    }
+    fn split_parts(s: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        let bytes = s.as_bytes();
+        while i < bytes.len() {
+            let is_digit = bytes[i].is_ascii_digit();
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() == is_digit {
+                j += 1;
+            }
+            out.push(s[i..j].to_string());
+            i = j;
+        }
+        out
+    }
+    let ap = split_parts(a);
+    let bp = split_parts(b);
+    let n = ap.len().max(bp.len());
+    for i in 0..n {
+        let aa = ap.get(i);
+        let bb = bp.get(i);
+        match (aa, bb) {
+            (None, None) => break,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(aa), Some(bb)) => {
+                let an = aa.parse::<u64>();
+                let bn = bb.parse::<u64>();
+                if let (Ok(an), Ok(bn)) = (an, bn) {
+                    if an != bn {
+                        return an.cmp(&bn);
+                    }
+                    continue;
+                }
+                let c = aa.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+        }
+    }
+    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
+}
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 extern "C" fn handle_signal(_sig: libc::c_int) {
@@ -567,6 +616,14 @@ fn main() -> Result<()> {
         anyhow::bail!("No layouts configured. Edit config.toml and add at least one layout.");
     }
 
+    // Layout list is hot-reloaded from config.toml.
+    let mut layouts = cfg.layouts.clone();
+    layouts.sort_by(|a, b| {
+        let (ak, aid) = a.sort_key();
+        let (bk, bid) = b.sort_key();
+        natural_cmp(ak, bk).then_with(|| natural_cmp(aid, bid))
+    });
+
     let mut hid_map = HidMap::default_60he_ansi_guess();
     if !cfg.hid_overrides.is_empty() {
         let overrides: Vec<(String, u8, u8, u8, u8)> = cfg
@@ -595,16 +652,23 @@ fn main() -> Result<()> {
     // MTS master
     let master = MtsMaster::register(false)?;
     let mut layout_index: usize = 0;
-    set_mts_table(&master, &cfg.layouts[layout_index])?;
+    set_mts_table(&master, &layouts[layout_index])?;
 
     // Load wtn
-    let mut wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
+    let mut wtn_path = resolve_path(&layouts[layout_index].wtn_path);
     let mut wtn =
         Wtn::load(&wtn_path).with_context(|| format!("Load wtn {}", wtn_path.display()))?;
     let mut wtn_mtime: Option<SystemTime> = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
     let mut base_wtn = wtn.clone();
     let mut base_wtn_mtime = wtn_mtime;
     let mut last_wtn_check = Instant::now();
+
+    // Config hot-reload (layouts only).
+    let cfg_path = config_path()?;
+    let mut cfg_sig: Option<(SystemTime, u64)> = fs::metadata(&cfg_path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let mut last_cfg_check = Instant::now();
 
     // Webconfigurator preview mode (temporary mapping without saving).
     let preview_enabled_path = PathBuf::from("/tmp/xenwooting-preview.enabled");
@@ -1052,6 +1116,108 @@ fn main() -> Result<()> {
                 }
             }
         }
+
+        // Reload layout list when config.toml changes (no service restart).
+        if last_cfg_check.elapsed() >= Duration::from_millis(500) {
+            last_cfg_check = Instant::now();
+            if let Ok(meta) = fs::metadata(&cfg_path) {
+                let modified = meta.modified().ok();
+                let sig_now = modified.map(|t| (t, meta.len()));
+                let changed = sig_now.is_some() && sig_now != cfg_sig;
+                if changed {
+                    cfg_sig = sig_now;
+                    let cur_id = layouts.get(layout_index).map(|l| l.id.clone());
+                    match load_config() {
+                        Ok(new_cfg) => {
+                            if new_cfg.layouts.is_empty() {
+                                eprintln!(
+                                    "config reload: layouts empty; keeping previous layout list"
+                                );
+                            } else if {
+                                let mut sorted = new_cfg.layouts.clone();
+                                sorted.sort_by(|a, b| {
+                                    let (ak, aid) = a.sort_key();
+                                    let (bk, bid) = b.sort_key();
+                                    natural_cmp(ak, bk).then_with(|| natural_cmp(aid, bid))
+                                });
+                                sorted != layouts
+                            } {
+                                let mut new_layouts = new_cfg.layouts;
+                                new_layouts.sort_by(|a, b| {
+                                    let (ak, aid) = a.sort_key();
+                                    let (bk, bid) = b.sort_key();
+                                    natural_cmp(ak, bk).then_with(|| natural_cmp(aid, bid))
+                                });
+
+                                // Keep current layout id if possible.
+                                let mut new_index: usize = 0;
+                                if let Some(id) = cur_id {
+                                    if let Some(i) = new_layouts.iter().position(|l| l.id == id) {
+                                        new_index = i;
+                                    }
+                                }
+                                if new_index >= new_layouts.len() {
+                                    new_index = 0;
+                                }
+
+                                // If preview is enabled and a layout id is pinned in the preview file,
+                                // force the preview switching logic to re-run with the new layout list.
+                                if preview_enabled {
+                                    layouts = new_layouts;
+                                    layout_index = new_index;
+                                    preview_layout_id = None;
+                                    preview_wtn_mtime = None;
+                                    info!("Reloaded config layouts ({} layouts)", layouts.len());
+                                } else {
+                                    // Apply changes without crashing the daemon.
+                                    let mut ok = true;
+
+                                    if let Err(e) = set_mts_table(&master, &new_layouts[new_index])
+                                    {
+                                        eprintln!("config reload: set_mts_table failed: {e}");
+                                        ok = false;
+                                    }
+
+                                    let new_wtn_path =
+                                        resolve_path(&new_layouts[new_index].wtn_path);
+                                    let new_base = match Wtn::load(&new_wtn_path) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "config reload: load wtn failed ({}): {e}",
+                                                new_wtn_path.display()
+                                            );
+                                            ok = false;
+                                            base_wtn.clone()
+                                        }
+                                    };
+
+                                    if ok {
+                                        layouts = new_layouts;
+                                        layout_index = new_index;
+                                        wtn_path = new_wtn_path;
+                                        base_wtn = new_base;
+                                        base_wtn_mtime =
+                                            fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                                        wtn_mtime = base_wtn_mtime;
+                                        wtn = base_wtn.clone();
+                                        refresh_vel_led_bases(&wtn, &mut vel_state);
+                                        paint_base(&wtn, false, &rgb_index_by_device_id);
+                                        info!(
+                                            "Reloaded config layouts ({} layouts)",
+                                            layouts.len()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("config reload failed ({}): {e}", cfg_path.display());
+                        }
+                    }
+                }
+            }
+        }
         // Preview mode and .wtn reloading.
         //
         // - Base (on-disk) wtn is always reloaded into `base_wtn`.
@@ -1105,15 +1271,15 @@ fn main() -> Result<()> {
 
                 if preview_enabled {
                     if let Some(id) = layout_now {
-                        if let Some(i) = cfg.layouts.iter().position(|l| l.id == id) {
+                        if let Some(i) = layouts.iter().position(|l| l.id == id) {
                             if i != layout_index {
                                 layout_index = i;
                                 eprintln!(
                                     "preview: switching layout -> {}",
-                                    cfg.layouts[layout_index].id
+                                    layouts[layout_index].id
                                 );
-                                set_mts_table(&master, &cfg.layouts[layout_index])?;
-                                wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
+                                set_mts_table(&master, &layouts[layout_index])?;
+                                wtn_path = resolve_path(&layouts[layout_index].wtn_path);
                                 base_wtn = Wtn::load(&wtn_path)
                                     .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
                                 base_wtn_mtime =
@@ -1540,10 +1706,10 @@ fn main() -> Result<()> {
             if let Some(action) = actions_by_hid.get(&hid) {
                 match action.as_str() {
                     "layout_next" => {
-                        layout_index = (layout_index + 1) % cfg.layouts.len();
-                        eprintln!("layout_next -> {}", cfg.layouts[layout_index].id);
-                        set_mts_table(&master, &cfg.layouts[layout_index])?;
-                        wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
+                        layout_index = (layout_index + 1) % layouts.len();
+                        eprintln!("layout_next -> {}", layouts[layout_index].id);
+                        set_mts_table(&master, &layouts[layout_index])?;
+                        wtn_path = resolve_path(&layouts[layout_index].wtn_path);
                         eprintln!("loading wtn: {}", wtn_path.display());
                         base_wtn = Wtn::load(&wtn_path)
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
@@ -1557,13 +1723,13 @@ fn main() -> Result<()> {
                     }
                     "layout_prev" => {
                         if layout_index == 0 {
-                            layout_index = cfg.layouts.len() - 1;
+                            layout_index = layouts.len() - 1;
                         } else {
                             layout_index -= 1;
                         }
-                        eprintln!("layout_prev -> {}", cfg.layouts[layout_index].id);
-                        set_mts_table(&master, &cfg.layouts[layout_index])?;
-                        wtn_path = resolve_path(&cfg.layouts[layout_index].wtn_path);
+                        eprintln!("layout_prev -> {}", layouts[layout_index].id);
+                        set_mts_table(&master, &layouts[layout_index])?;
+                        wtn_path = resolve_path(&layouts[layout_index].wtn_path);
                         eprintln!("loading wtn: {}", wtn_path.display());
                         base_wtn = Wtn::load(&wtn_path)
                             .with_context(|| format!("Load wtn {}", wtn_path.display()))?;

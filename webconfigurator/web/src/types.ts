@@ -8,6 +8,8 @@ export type Cell = {
   note: number
   chan: number
   col: string // RRGGBB (no #)
+  // Optional UI-only flag. If false, treat as "unset" for display/cache.
+  set?: boolean
 }
 
 export type Boards = {
