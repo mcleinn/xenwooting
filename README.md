@@ -18,7 +18,7 @@ Features (musician-facing):
 - Microtonal pitch via MIDI channel + note: pitch is encoded as `(channel-1)*edo + note + pitch_offset` (16 channels x 128 notes).
 - MTS-ESP master: the daemon hosts an MTS-ESP shared-memory master so compatible synths can follow your current tuning.
 - Per-key colors: key LEDs show your layout colors; presses can be highlighted.
-- Layout import: import `.ltn` layout files into `.wtn` and place/rotate them on the target key grid.
+- Layout import: import `.ltn` Lumatone layout files into `.wtn` layout files and place/rotate them on the target key grid.
 - Note labels: optional on-key labels (Unicode note spelling) and tooltips (ASCII spellings).
 - Preview mode: audition edits without permanently saving to disk.
 - Isomorphic layout check: the editor can flag boards that are not isomorphic (grid direction steps are inconsistent).
