@@ -18,7 +18,7 @@ Features (musician-facing):
 
 - Multiple tunings / layouts: store several `.wtn` layouts (e.g. 12-EDO, 19-EDO, 31-EDO, 53-EDO) and switch between them.
 - Two-board support (four-board support planned): use one or two keyboards as `Board0` / `Board1` with independent or joined layouts.
-- Microtonal pitch via MIDI multi-channel quasi-standard (Lumatone-style: pitch is encoded as `(channel-1)*edo + note + pitch_offset`, i.e. 16 channels x 128 notes).
+- Microtonal pitch via MIDI multi-channel tuning (Lumatone-style: pitch is encoded as `(channel-1)*edo + note + pitch_offset`, i.e. 16 channels x 128 notes = up to 2048 pitches).
 - MTS-ESP master: the daemon hosts an MTS-ESP shared-memory master so compatible synths can follow your current tuning.
 - Per-key colors: key LEDs show your layout colors; presses can be highlighted.
 - Layout import: import `.ltn` Lumatone layout files into `.wtn` layout files and place/rotate them on the target key grid.
