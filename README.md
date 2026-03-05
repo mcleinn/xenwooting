@@ -32,7 +32,7 @@ Features (musician-facing):
 - Optional: a second compatible keyboard for `Board1`.
 - Linux machine (tested in headless setups); ALSA MIDI available.
 
-RGB is optional, but requires the vendor RGB SDK. See `InstallRGB.md`.
+RGB is optional, but requires [the vendor RGB SDK](https://github.com/WootingKb/wooting-rgb-sdk). See `InstallRGB.md`.
 
 ## Web App Addresses
 
