@@ -267,7 +267,7 @@ Important:
 
 ## Hex-Grid Board Geometry + LTN->WTN Mapping (Import / Placement Mode)
 
-The configurator can project Lumatone `.ltn` layouts onto Wooting `.wtn` layouts using explicit
+The configurator can project `.ltn` layouts onto `.wtn` layouts using explicit
 hex-grid geometry tables (not pixel hit-testing).
 
 ### Geometry Tables
@@ -275,9 +275,9 @@ hex-grid geometry tables (not pixel hit-testing).
 Files:
 
 - `webconfigurator/web/src/hexgrid/boardGrids.ts`
-  - `WTN_GRIDS.{Board0,Board1}`: Wooting boards in a hex-grid **visible-key** index space
+  - `WTN_GRIDS.{Board0,Board1}`: WTN boards in a hex-grid **visible-key** index space
     (53 keys per board, indices `0..52`).
-  - `LTN_GRIDS.Board0..Board4`: Lumatone boards (56 keys per board, indices `0..55`).
+  - `LTN_GRIDS.Board0..Board4`: LTN boards (56 keys per board, indices `0..55`).
 
 Each key has an integer coordinate `(x, y)` in a hex lattice where neighbors are:
 

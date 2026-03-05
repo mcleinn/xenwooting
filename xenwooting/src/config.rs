@@ -110,7 +110,7 @@ impl Default for ControlBarConfig {
 }
 
 fn default_midi_out_name() -> String {
-    "XenWooting".to_string()
+    "XenWTN".to_string()
 }
 
 fn default_refresh_hz() -> f32 {
@@ -144,7 +144,7 @@ fn default_aftertouch_delta() -> f32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardConfig {
-    /// Wooting Analog device_id (u64), as string.
+    /// Analog device_id (u64), as string.
     ///
     /// TOML integers are signed (i64) and cannot represent the full u64 range, so we store it
     /// as a string in config (e.g. "16353264950129218108").
@@ -228,7 +228,7 @@ impl ActionBindings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RgbConfig {
-    /// If true, xenwooting will attempt to drive Wooting RGB SDK.
+    /// If true, xenwooting will attempt to drive the RGB SDK.
     #[serde(default = "default_true")]
     pub enabled: bool,
 

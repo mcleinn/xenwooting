@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 
 // 4x14 playable grid (56 cells). Not every cell maps to a physical key on ANSI 60%.
 //
-// xenWooting.json contains key *geometry* and current keymap. The keymap values are user-configurable,
+// Geometry source file contains key *geometry* and current keymap. The keymap values are user-configurable,
 // so we do NOT use them to identify physical keys. Instead we map keys by position (row y, then x).
 
 const HID = {
@@ -64,8 +64,8 @@ const HID = {
   ShiftRight: 0xe5,
 }
 
-export async function loadPlayableGeometry(xenWootingJsonPath) {
-  const raw = await fs.readFile(xenWootingJsonPath, 'utf8')
+export async function loadPlayableGeometry(geometryJsonPath) {
+  const raw = await fs.readFile(geometryJsonPath, 'utf8')
   const keys = JSON.parse(raw)
 
   /** @type {Map<number, Array<any>>} */

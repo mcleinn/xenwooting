@@ -143,14 +143,11 @@ export default function BoardsPage() {
     <div className="boardsPage">
       <header className="boardsTop">
         <div className="boardsTitle">Board Grids</div>
-        <a className="boardsLink" href="/wtn/">
-          Back to configurator
-        </a>
       </header>
 
       <main className="boardsMain">
         <details className="acc" open>
-          <summary className="accSum">WTN (Wooting) combined</summary>
+          <summary className="accSum">WTN combined</summary>
           <div className="accBody">
             <div className="combo">
               <div className="comboTop">
@@ -175,8 +172,8 @@ export default function BoardsPage() {
           </div>
         </details>
 
-        <details className="acc">
-          <summary className="accSum">LTN (Lumatone) combined</summary>
+        <details className="acc" open>
+          <summary className="accSum">LTN combined</summary>
           <div className="accBody">
             <div className="combo">
               <div className="comboTop">

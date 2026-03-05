@@ -9,7 +9,9 @@ type KeyboardViewProps = {
   rotate180?: boolean
   xOffsetU?: number
   noteNamesByIdx?: Map<number, string>
+  noteTooltipByIdx?: Map<number, string>
   displayMode: 'label' | 'number' | 'both'
+  isoBadge?: { text: string; variant: 'ok' | 'bad' | 'unknown'; title?: string }
   overlayByIdx?: Map<number, { note: number; chan: number; col: string }>
   placementActive?: boolean
   onHoverKey?: (board: 'Board0' | 'Board1', idx: number) => void
@@ -31,7 +33,9 @@ export function KeyboardView({
   rotate180,
   xOffsetU,
   noteNamesByIdx,
+  noteTooltipByIdx,
   displayMode,
+  isoBadge,
   overlayByIdx,
   placementActive,
   onHoverKey,
@@ -176,6 +180,16 @@ export function KeyboardView({
       <header className="kbdHeader">
         <div className="kbdTitle">{title}</div>
         <div className="kbdHeaderRight">
+          {isoBadge && (
+            <div
+              className={`kbdBadge ${
+                isoBadge.variant === 'ok' ? 'kbdBadgeOk' : isoBadge.variant === 'bad' ? 'kbdBadgeBad' : 'kbdBadgeUnknown'
+              }`}
+              title={isoBadge.title || ''}
+            >
+              {isoBadge.text}
+            </div>
+          )}
           <div className="kbdMeta">{keys.length} keys</div>
         </div>
       </header>
@@ -191,9 +205,11 @@ export function KeyboardView({
             const overlay = overlayByIdx?.get(wtnIdx)
             const rgb = overlay ? `#${overlay.col}` : cell ? `#${cell.col}` : '#444444'
             const name = noteNamesByIdx?.get(wtnIdx) || ''
+            const tip = noteTooltipByIdx?.get(wtnIdx) || `${boardId} idx ${wtnIdx}`
             const showLabel = displayMode === 'label'
             const showNumber = displayMode === 'number'
             const showChan = displayMode === 'number'
+            const labelIsWide = showLabel && name.includes('/')
 
             const x0 = rotate180 ? geometry.width - (k.x + k.w) : k.x
             const y0 = rotate180 ? geometry.height - (k.y + k.h) : k.y
@@ -236,7 +252,7 @@ export function KeyboardView({
                   onHoverEnd?.()
                 }}
                 onClick={() => toggle(wtnIdx)}
-                title={`${boardId} idx ${wtnIdx}`}
+                title={tip}
               >
                 {cell && showChan && (
                   <div className="keyTop">
@@ -251,7 +267,9 @@ export function KeyboardView({
                     </>
                   )}
                   {cell && showNumber && <div className="keySolo">{overlay ? overlay.note : cell.note}</div>}
-                  {cell && showLabel && name && <div className="keySolo keySoloLabel">{name}</div>}
+                  {cell && showLabel && name && (
+                    <div className={`keySolo keySoloLabel ${labelIsWide ? 'keySoloLabelWide' : ''}`}>{name}</div>
+                  )}
                 </div>
               </button>
             )

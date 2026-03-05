@@ -305,7 +305,7 @@ fn write_default_config(path: &Path) -> Result<()> {
     }
 
     let mut cfg = Config {
-        midi_out_name: "XenWooting".to_string(),
+        midi_out_name: "XenWTN".to_string(),
         refresh_hz: 250.0,
         press_threshold: 0.10,
         press_threshold_step: 0.01,
@@ -402,7 +402,7 @@ fn compute_rgb_index_by_device_id(
         return HashMap::new();
     }
 
-    // Enumerate Wooting HID devices via sysfs.
+    // Enumerate keyboard HID devices via sysfs.
     // We rely on HID_UNIQ as the serial string.
     let mut best_by_serial: HashMap<String, (u16, u16, String)> = HashMap::new();
     // serial -> (vid, pid, sort_key)
@@ -538,7 +538,7 @@ fn main() -> Result<()> {
     // Install signal handlers as early as possible.
     install_signal_handlers();
 
-    // Wooting Analog SDK init (required before any other SDK call)
+    // Analog SDK init (required before any other SDK call)
     if !sdk::is_initialised() {
         let _ = sdk::initialise().0?;
     }
@@ -698,7 +698,7 @@ fn main() -> Result<()> {
         if !devs.is_empty() {
             break devs;
         }
-        eprintln!("No Wooting Analog devices detected; waiting...");
+        eprintln!("No Analog devices detected; waiting...");
         thread::sleep(Duration::from_millis(1000));
     };
 

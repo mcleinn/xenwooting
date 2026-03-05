@@ -11,10 +11,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # xenharmlib is installed for python3.12 on this machine.
 from xenharmlib import EDOTuning  # type: ignore
 from xenharmlib import UpDownNotation  # type: ignore
+from xenharmlib.notation.updown import (  # type: ignore
+    DownwardsEnharmStrategy,
+    MixedLeftEnharmStrategy,
+    MixedRightEnharmStrategy,
+    UpwardsEnharmStrategy,
+)
 
 
 _NOTATION_LOCK = threading.Lock()
-_NOTATION_BY_EDO: dict[int, tuple[EDOTuning, UpDownNotation]] = {}
+_NOTATION_BY_EDO: dict[int, EDOTuning] = {}
+_UPDOWN_BY_EDO_STRAT: dict[tuple[int, str], UpDownNotation] = {}
 
 
 _CACHE_LOCK = threading.Lock()
@@ -75,7 +82,7 @@ def encode_notation(short_repr: str) -> str:
     return f"{note}{_NOTATION_REPLACEMENTS.get(key, '')}{octave}"
 
 
-def _get_notation(edo: int) -> tuple[EDOTuning, UpDownNotation] | None:
+def _get_tuning(edo: int) -> EDOTuning | None:
     if edo < 5 or edo > 72:
         return None
     with _NOTATION_LOCK:
@@ -84,11 +91,37 @@ def _get_notation(edo: int) -> tuple[EDOTuning, UpDownNotation] | None:
             return hit
         try:
             tuning = EDOTuning(edo)
-            notation = UpDownNotation(tuning)
         except Exception:
             return None
-        _NOTATION_BY_EDO[edo] = (tuning, notation)
-        return tuning, notation
+        _NOTATION_BY_EDO[edo] = tuning
+        return tuning
+
+
+def _get_updown(edo: int, strat: str) -> tuple[EDOTuning, UpDownNotation] | None:
+    tuning = _get_tuning(edo)
+    if tuning is None:
+        return None
+    key = (edo, strat)
+    with _NOTATION_LOCK:
+        n = _UPDOWN_BY_EDO_STRAT.get(key)
+        if n is not None:
+            return tuning, n
+        try:
+            n = UpDownNotation(tuning)
+            if strat == "up":
+                n.enharm_strategy = UpwardsEnharmStrategy(n)
+            elif strat == "down":
+                n.enharm_strategy = DownwardsEnharmStrategy(n)
+            elif strat == "mixL":
+                n.enharm_strategy = MixedLeftEnharmStrategy(n)
+            elif strat == "mixR":
+                n.enharm_strategy = MixedRightEnharmStrategy(n)
+            else:
+                return None
+        except Exception:
+            return None
+        _UPDOWN_BY_EDO_STRAT[key] = n
+        return tuning, n
 
 
 def _cache_get(edo: int, pitch: int) -> dict[str, str] | None | object:
@@ -112,21 +145,40 @@ def _cache_set(edo: int, pitch: int, value: dict[str, str] | None) -> None:
 _MISSING = object()
 
 
-def note_name_for_pitch(edo: int, pitch: int) -> dict[str, str] | None:
+def note_name_for_pitch(edo: int, pitch: int) -> dict | None:
     cached = _cache_get(edo, pitch)
     if cached is not _MISSING:
         return cached  # may be None
 
-    hit = _get_notation(edo)
+    hit = _get_updown(edo, "mixL")
     if hit is None:
         _cache_set(edo, pitch, None)
         return None
     tuning, notation = hit
     try:
         ep = tuning.pitch(pitch)
-        note = notation.guess_note(ep)
-        short = note.short_repr
-        out = {"short": short, "unicode": encode_notation(short)}
+
+        def one(n: UpDownNotation):
+            note = n.guess_note(ep)
+            short = note.short_repr
+            return {"short": short, "unicode": encode_notation(short)}
+
+        primary = one(notation)
+
+        alts: list[dict[str, str]] = []
+        seen = {primary["short"]}
+        for strat in ("up", "down", "mixR"):
+            hit2 = _get_updown(edo, strat)
+            if hit2 is None:
+                continue
+            _, n2 = hit2
+            v = one(n2)
+            if v["short"] in seen:
+                continue
+            seen.add(v["short"])
+            alts.append(v)
+
+        out = {"short": primary["short"], "unicode": primary["unicode"], "alts": alts}
         _cache_set(edo, pitch, out)
         return out
     except Exception:

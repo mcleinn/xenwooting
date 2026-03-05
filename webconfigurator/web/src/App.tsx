@@ -18,7 +18,7 @@ import { KeyboardView } from './KeyboardView'
 import type { Boards, Geometry, LayoutInfo } from './types'
 import { parseLtnText, type LtnData } from './ltn/parse'
 import { buildWtnCombinedLookup, invRotateHex, rotateHex, subHex, addHex, type HexCoord } from './hexgrid/project'
-import { LTN_GRIDS, WTN_GRIDS, xyKey } from './hexgrid/boardGrids'
+import { HEX_NEIGHBOR_DELTAS, LTN_GRIDS, WTN_GRIDS, xyKey } from './hexgrid/boardGrids'
 
 const C0_HZ = 16.351_597_831_287_414
 
@@ -76,6 +76,9 @@ function App() {
 
   const [hoveredKey, setHoveredKey] = useState<{ board: 'Board0' | 'Board1'; idx: number } | null>(null)
 
+  // Display preference for enharmonic spellings on key labels.
+  const [enharmLabelMode, setEnharmLabelMode] = useState<'both' | 'first' | 'second'>('both')
+
   const [previewMode, setPreviewMode] = useState(false)
   const previewPushTimer = useRef<number | null>(null)
 
@@ -99,8 +102,12 @@ function App() {
 
   // Note names (unicode) via xenharm service (proxied by node backend).
   // key: `${edo}:${pitch}` -> { short, unicode } | null
-  const [noteNameCache, setNoteNameCache] = useState<Map<string, { short: string; unicode: string } | null>>(new Map())
+  const [noteNameCache, setNoteNameCache] = useState<
+    Map<string, { short: string; unicode: string; alts: Array<{ short: string; unicode: string }> } | null>
+  >(new Map())
   const noteNamesFetchTimer = useRef<number | null>(null)
+  const noteNamesRetryTimer = useRef<number | null>(null)
+  const [noteNamesRetryTick, setNoteNamesRetryTick] = useState(0)
 
   useEffect(() => {
     let cancelled = false
@@ -195,6 +202,7 @@ function App() {
           palette.push(col)
         }
       }
+      palette.sort()
       if (palette.length < 2) return
 
       const { board, idx } = hoveredKey
@@ -202,7 +210,10 @@ function App() {
       if (!cur) return
       const curCol = String(cur.col || '').trim().toUpperCase()
       const at = palette.indexOf(curCol)
-      const nextCol = palette[(at >= 0 ? at + 1 : 0) % palette.length]
+      const backwards = e.shiftKey
+      const nextCol = backwards
+        ? palette[(at >= 0 ? at - 1 + palette.length : palette.length - 1) % palette.length]
+        : palette[(at >= 0 ? at + 1 : 0) % palette.length]
       if (!nextCol || nextCol === cur.col) return
 
       const next: Boards = {
@@ -268,6 +279,182 @@ function App() {
     }
     return out
   }, [placement, boards, visMap, wtnLookup])
+
+  const isoBadgeByBoard = useMemo(() => {
+    if (!boards || !visMap) return null
+
+    const bds = boards
+    const vmap = visMap
+    const overlay = overlayByBoard
+    const edo = Math.max(1, edoDivisions)
+    // Use the 3 positive-direction axes for undirected edge checks.
+    const axisDirs = HEX_NEIGHBOR_DELTAS.filter(([dx, dy]) => dx > 0 || (dx === 0 && dy > 0))
+
+    function axisInfo(dx: number, dy: number): { axis: string; dir: string; compass: string; fallback: string } {
+      // Visual directions (in the combined grid):
+      // - +y moves right
+      // - +x moves down
+      // Our 3 checked axes are pairs of opposite directions.
+      const k = `${dx},${dy}`
+      if (k === '0,2') return { axis: '←/→', dir: '→', compass: 'W/E', fallback: 'E' }
+      if (k === '1,1') return { axis: '↖/↘', dir: '↘', compass: 'NW/SE', fallback: 'SE' }
+      if (k === '1,-1') return { axis: '↗/↙', dir: '↙', compass: 'NE/SW', fallback: 'SW' }
+      return { axis: `${dx},${dy}`, dir: `${dx},${dy}`, compass: '', fallback: `${dx},${dy}` }
+    }
+
+    function compute(board: 'Board0' | 'Board1') {
+      const internalIdxs = vmap[board].internalByVis
+      const pts: Array<{ x: number; y: number; pitch: number }> = []
+      const pitchByXY = new Map<string, number>()
+      const metaByXY = new Map<string, { idx: number; chan: number; note: number; pitch: number }>()
+      let missing = 0
+
+      for (const internalIdx of internalIdxs) {
+        const visKey = vmap[board].visByInternal.get(internalIdx)
+        if (visKey === undefined) {
+          missing++
+          continue
+        }
+        const coord = WTN_GRIDS[board].byKey.get(visKey)
+        if (!coord) {
+          missing++
+          continue
+        }
+
+        const overlayCell = placement ? overlay?.[board].get(internalIdx) : undefined
+        const baseCell = bds[board][internalIdx]
+        const cell = overlayCell || baseCell
+        if (!cell) {
+          missing++
+          continue
+        }
+        if (!overlayCell && baseCell?.set === false) {
+          missing++
+          continue
+        }
+
+        const pitch = (Math.max(0, Math.min(15, cell.chan - 1)) * edo + cell.note + pitchOffset) | 0
+        const x = coord.x
+        const y = coord.y
+        pts.push({ x, y, pitch })
+        pitchByXY.set(xyKey(x, y), pitch)
+        metaByXY.set(xyKey(x, y), { idx: internalIdx, chan: cell.chan, note: cell.note, pitch })
+      }
+
+      const dirInfo = axisDirs.map(([dx, dy]) => {
+        const info = axisInfo(dx, dy)
+        const counts = new Map<number, number>()
+        const edgesList: Array<{ from: { idx: number; chan: number; note: number; pitch: number }; to: { idx: number; chan: number; note: number; pitch: number }; dp: number }> = []
+        let edges = 0
+        for (const p of pts) {
+          const from = metaByXY.get(xyKey(p.x, p.y))
+          if (!from) continue
+          const to = metaByXY.get(xyKey(p.x + dx, p.y + dy))
+          if (!to) continue
+          edges++
+          const dp = (to.pitch - from.pitch) | 0
+          counts.set(dp, (counts.get(dp) || 0) + 1)
+          edgesList.push({ from, to, dp })
+        }
+
+        let expected: number | null = null
+        let expectedCount = -1
+        for (const [dp, c] of counts.entries()) {
+          if (c > expectedCount) {
+            expected = dp
+            expectedCount = c
+          }
+        }
+        const mismatches = expected !== null ? edgesList.filter((e) => e.dp !== expected) : []
+
+        return { dx, dy, edges, counts, expected, mismatches, info }
+      })
+
+      const anyInconsistent = dirInfo.some((d) => d.counts.size > 1)
+      const allPresentAndConstant = dirInfo.every((d) => d.edges > 0 && d.counts.size === 1)
+
+      let variant: 'ok' | 'bad' | 'unknown' = 'unknown'
+      let text = 'Iso?'
+      if (allPresentAndConstant) {
+        variant = 'ok'
+        text = 'Iso'
+      } else if (anyInconsistent) {
+        variant = 'bad'
+        text = 'Non-iso'
+      }
+
+      const fmtStep = (n: number) => {
+        if (n > 0) return `+${n}`
+        return String(n)
+      }
+
+      const lines: string[] = []
+      lines.push(`Isomorphic layout check (${board})`)
+      lines.push(`An isomorphic layout means: moving in the same grid direction always changes pitch by the same amount.`)
+      lines.push(`{...} shows the different pitch steps observed in that direction; one value means consistent.`)
+      lines.push(`Visible keys with pitch: ${pts.length}/${internalIdxs.length} (missing ${missing}).`)
+      lines.push(`Using effective mapping${placement ? ' (includes placement overlay)' : ''}.`)
+
+      for (const d of dirInfo) {
+        const label = `${d.info.axis}${d.info.compass ? ` (${d.info.compass})` : ''}`
+        if (d.edges === 0) {
+          lines.push(`${label}: no neighbor links found`)
+          continue
+        }
+        const vals = Array.from(d.counts.keys()).sort((a, b) => a - b)
+        const shown = vals.slice(0, 6).map(fmtStep)
+        const more = vals.length > 6 ? ', …' : ''
+        lines.push(`${label}: ${d.edges} links; steps {${shown.join(', ')}${more}}`)
+      }
+
+      if (variant === 'bad') {
+        lines.push('')
+        lines.push('Examples that break isomorphism:')
+        let shown = 0
+        for (const d of dirInfo) {
+          if (shown >= 12) break
+          if (!d.mismatches.length || d.expected === null) continue
+          for (const m of d.mismatches.slice(0, 4)) {
+            if (shown >= 12) break
+            lines.push(
+              `${d.info.dir} (${d.info.fallback}): expected ${fmtStep(d.expected)} but got ${fmtStep(m.dp)} at idx ${m.from.idx} ch${m.from.chan}:${m.from.note} -> idx ${m.to.idx} ch${m.to.chan}:${m.to.note}`,
+            )
+            shown++
+          }
+        }
+      } else if (variant === 'unknown') {
+        const missingDirs = dirInfo.filter((d) => d.edges === 0).map((d) => `${d.info.axis}${d.info.compass ? ` (${d.info.compass})` : ''}`)
+        if (missingDirs.length) {
+          lines.push('')
+          lines.push(`Cannot confirm isomorphism: no neighbor links for ${missingDirs.join(', ')}.`)
+        }
+      }
+
+      return { text, variant, title: lines.join('\n') }
+    }
+
+    return {
+      Board0: compute('Board0'),
+      Board1: compute('Board1'),
+    }
+  }, [boards, visMap, overlayByBoard, placement, edoDivisions, pitchOffset])
+
+  // Hotkey: 'e' toggles enharmonic spelling display globally (visual only).
+  // Cycles: both -> first -> second -> both
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName?.toLowerCase()
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return
+      if (e.key.toLowerCase() !== 'e') return
+      if (displayMode === 'number') return
+
+      setEnharmLabelMode((m) => (m === 'both' ? 'first' : m === 'first' ? 'second' : 'both'))
+      e.preventDefault()
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [displayMode])
 
   const startPlacement = useCallback(
     (ltn: LtnData, anchor: HexCoord) => {
@@ -419,35 +606,42 @@ function App() {
 
     if (missing.length === 0) return
 
+    // Keep batches small so the service stays responsive (especially for higher EDOs).
+    const batch = missing.slice(0, 64)
+
     // Debounce so editing doesn't spam the server.
     if (noteNamesFetchTimer.current !== null) {
       window.clearTimeout(noteNamesFetchTimer.current)
       noteNamesFetchTimer.current = null
     }
     noteNamesFetchTimer.current = window.setTimeout(() => {
-      fetchNoteNames(edo, missing)
+      fetchNoteNames(edo, batch)
         .then((r) => {
           const results = r?.results || {}
           setNoteNameCache((prev) => {
             const next = new Map(prev)
-            for (const p of missing) {
+            for (const p of batch) {
               const v = results[String(p)]
               const key = `${edo}:${p}`
               if (v && typeof v.unicode === 'string' && typeof v.short === 'string') {
-                next.set(key, { short: v.short, unicode: v.unicode })
-              } else {
-                next.set(key, null)
+                const alts = Array.isArray(v.alts)
+                  ? v.alts
+                      .filter((x) => x && typeof x === 'object' && typeof x.unicode === 'string' && typeof x.short === 'string')
+                      .map((x) => ({ short: x.short, unicode: x.unicode }))
+                  : []
+                next.set(key, { short: v.short, unicode: v.unicode, alts })
               }
             }
             return next
           })
         })
         .catch(() => {
-          setNoteNameCache((prev) => {
-            const next = new Map(prev)
-            for (const p of missing) next.set(`${edo}:${p}`, null)
-            return next
-          })
+          // Avoid poisoning the cache on transient failures; retry shortly.
+          if (noteNamesRetryTimer.current !== null) return
+          noteNamesRetryTimer.current = window.setTimeout(() => {
+            noteNamesRetryTimer.current = null
+            setNoteNamesRetryTick((x) => (x + 1) | 0)
+          }, 450)
         })
     }, 80)
 
@@ -456,14 +650,30 @@ function App() {
         window.clearTimeout(noteNamesFetchTimer.current)
         noteNamesFetchTimer.current = null
       }
+      if (noteNamesRetryTimer.current !== null) {
+        window.clearTimeout(noteNamesRetryTimer.current)
+        noteNamesRetryTimer.current = null
+      }
     }
-  }, [boards, edoDivisions, pitchOffset, noteNameCache, placement, overlayByBoard])
+  }, [boards, edoDivisions, pitchOffset, noteNameCache, placement, overlayByBoard, noteNamesRetryTick])
 
   const noteNamesByBoard = useMemo(() => {
     if (!boards) return null
     const edo = Math.max(1, edoDivisions)
     const b0 = new Map<number, string>()
     const b1 = new Map<number, string>()
+
+    const showForPitch = (pitch: number): string | null => {
+      const pitchKey = `${edo}:${pitch}`
+      const v = noteNameCache.get(pitchKey)
+      if (!v || !v.unicode) return null
+
+      const a = v.unicode
+      const b = v.alts && v.alts.length ? v.alts[0]?.unicode : ''
+      if (enharmLabelMode === 'first') return a
+      if (enharmLabelMode === 'second') return b || a
+      return b ? `${a}/${b}` : a
+    }
     for (const [b, out] of [
       ['Board0', b0],
       ['Board1', b1],
@@ -472,19 +682,50 @@ function App() {
         const overlay = placement ? overlayByBoard?.[b].get(i) : undefined
         if (overlay) {
           const pitch = (Math.max(0, Math.min(15, overlay.chan - 1)) * edo + overlay.note + pitchOffset) | 0
-          const v = noteNameCache.get(`${edo}:${pitch}`)
-          if (v && v.unicode) out.set(i, v.unicode)
+          const uni = showForPitch(pitch)
+          if (uni) out.set(i, uni)
           continue
         }
 
         const c = boards[b][i]
         if (c.set === false) continue
         const pitch = (Math.max(0, Math.min(15, c.chan - 1)) * edo + c.note + pitchOffset) | 0
-        const v = noteNameCache.get(`${edo}:${pitch}`)
-        if (v && v.unicode) out.set(i, v.unicode)
+        const uni = showForPitch(pitch)
+        if (uni) out.set(i, uni)
       }
     }
     return { Board0: b0, Board1: b1 }
+  }, [boards, edoDivisions, pitchOffset, noteNameCache, placement, overlayByBoard, enharmLabelMode])
+
+  const noteTooltipByBoard = useMemo(() => {
+    if (!boards) return null
+    const edo = Math.max(1, edoDivisions)
+    const mk = () => new Map<number, string>()
+    const out = { Board0: mk(), Board1: mk() }
+    for (const b of ['Board0', 'Board1'] as const) {
+      for (let i = 0; i < boards[b].length; i++) {
+        const overlay = placement ? overlayByBoard?.[b].get(i) : undefined
+        const cell = overlay || boards[b][i]
+        if (!cell) continue
+        if (!overlay && (boards[b][i].set === false)) continue
+        const pitch = (Math.max(0, Math.min(15, cell.chan - 1)) * edo + cell.note + pitchOffset) | 0
+        const v = noteNameCache.get(`${edo}:${pitch}`)
+        if (!v) continue
+        const lines: string[] = []
+        // Native browser tooltips (title=...) can't be styled, so avoid Bravura-only glyphs here.
+        // If we have an enharmonic alternative, show the first two spellings as `A/B`.
+        const a = v.short
+        const b2 = v.alts && v.alts.length ? v.alts[0]?.short : ''
+        lines.push(b2 ? `${a}/${b2}` : a)
+
+        // If there are more alternatives beyond the first, list them on the next line.
+        if (v.alts && v.alts.length > 1) {
+          lines.push('Alt: ' + v.alts.slice(1).map((x) => x.short).join(' | '))
+        }
+        out[b].set(i, lines.join('\n'))
+      }
+    }
+    return out
   }, [boards, edoDivisions, pitchOffset, noteNameCache, placement, overlayByBoard])
 
   const selectionCount = selected.size
@@ -621,7 +862,13 @@ function App() {
 
   function applyEnumerate() {
     if (!boards) return
-    const inc = clampInt(enumInc, 1, 127)
+    const incRaw = Number.parseInt(enumInc.trim(), 10)
+    if (!Number.isFinite(incRaw) || incRaw === 0) {
+      setStatus('Enumerate: increment must be a non-zero integer.')
+      setTimeout(() => setStatus(''), 1800)
+      return
+    }
+    const inc = Math.max(-127, Math.min(127, incRaw | 0))
 
     const ordered = selectedOrder.filter((id) => selected.has(id)).map(parseCellId).filter(Boolean) as Array<{
       board: 'Board0' | 'Board1'
@@ -639,24 +886,54 @@ function App() {
       return
     }
     const baseNote = baseCell.note | 0
+    const baseChan = clampInt(String(baseCell.chan | 0), 1, 16)
+    const edo = Math.max(1, edoDivisions)
+    const basePitch = ((Math.max(0, Math.min(15, baseChan - 1)) * edo + baseNote + pitchOffset) | 0) as number
 
     const next: Boards = {
       Board0: boards.Board0.map((c) => ({ ...c })),
       Board1: boards.Board1.map((c) => ({ ...c })),
     }
 
+    let stoppedAt: number | null = null
     for (let k = 0; k < ordered.length; k++) {
       const { board, idx } = ordered[k]
       const cell = next[board][idx]
       if (!cell) continue
       cell.set = true
-      const n = clampInt(String(baseNote + k * inc), 0, 127)
-      cell.note = n
+
+      const targetPitch = (basePitch + k * inc) | 0
+
+      // Try to keep channel as low as possible, but when the note would exceed 127,
+      // represent the same pitch using the next channel (note -= edo each step).
+      let chan = baseChan
+      let note = (targetPitch - pitchOffset - (chan - 1) * edo) | 0
+      while (note > 127 && chan < 16) {
+        chan++
+        note -= edo
+      }
+      while (note < 0 && chan > 1) {
+        chan--
+        note += edo
+      }
+
+      if (note < 0 || note > 127) {
+        stoppedAt = k
+        break
+      }
+
+      cell.chan = chan
+      cell.note = note
     }
 
     setBoards(next)
     pushPreview(next)
     closeEnumerate()
+
+    if (stoppedAt !== null) {
+      setStatus(`Enumerate stopped at item ${stoppedAt + 1}: cannot represent pitch within chan 1..16 and note 0..127.`)
+      setTimeout(() => setStatus(''), 2400)
+    }
   }
 
   async function exitPreviewMode() {
@@ -714,7 +991,7 @@ function App() {
     try {
       const r = await saveLayout(layoutId, boards)
       await exitPreviewMode()
-      setStatus(r.xenwootingReloaded ? 'Saved + reloaded XenWooting.' : 'Saved (reload failed).')
+      setStatus(r.xenwootingReloaded ? 'Saved + reloaded daemon.' : 'Saved (reload failed).')
       // Refresh from disk so UI matches canonical .wtn.
       const l = await fetchLayout(layoutId)
       setLayoutName(l.name)
@@ -782,6 +1059,15 @@ function App() {
     }
   }
 
+  function onEditorEnter(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key !== 'Enter') return
+    if (placement) return
+    if (enumOpen || addOpen || settingsOpen) return
+    if (!boards || selected.size === 0) return
+    e.preventDefault()
+    applyEdits()
+  }
+
   function onKeyHighlight(board: 'Board0' | 'Board1', idx: number, down: boolean) {
     if (!layoutId) return
     highlightKey(layoutId, board, idx, down).catch(() => {})
@@ -791,10 +1077,7 @@ function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <div className="brandTitle">XenWooting configurator</div>
-          <a className="brandLink" href="/wtn/boards">
-            Boards
-          </a>
+          <div className="brandTitle">XenWTN configurator</div>
         </div>
 
         <div className="controls">
@@ -820,17 +1103,33 @@ function App() {
                     return
                   }
                   if (action === 'add') {
+                    const base = f.name.replace(/\.ltn$/i, '')
+                    const m = base.match(/(\d+)/)
+                    const edoFromName = m ? Number.parseInt(m[1] || '', 10) : NaN
+                    const edoDefault = Number.isFinite(edoFromName) ? String(edoFromName) : String(edoDivisions)
+
                     setAddLtn(ltn)
-                    const d = String(edoDivisions)
-                    setAddEdo(d)
-                    setAddName(`${d}-EDO`)
-                    setAddNameTouched(false)
+                    setAddEdo(edoDefault)
+                    setAddName(base)
+                    // Keep filename-based name stable even if EDO changes.
+                    setAddNameTouched(true)
                     setAddOpen(true)
                   }
                 })
                 .catch((err) => setStatus(`LTN parse failed: ${errMsg(err)}`))
             }}
           />
+
+          <button
+            className="btnSecondary"
+            type="button"
+            onClick={() => {
+              window.open('/wtn/boards', '_blank', 'noopener,noreferrer')
+            }}
+            title="Open board configuration in a new window"
+          >
+            Board config
+          </button>
 
           <button
             className="btnSecondary"
@@ -989,7 +1288,7 @@ function App() {
               onPointerDown={(e) => e.stopPropagation()}
             >
               <div className="modalTitle">Add Layout</div>
-              <div className="modalSub">Create a new XenWooting layout from an .ltn file.</div>
+              <div className="modalSub">Create a new layout from an .ltn file.</div>
 
               <div className="grid">
                 <label className="field">
@@ -1076,7 +1375,7 @@ function App() {
                 Leave first selected note as-is; assign following notes by increment.
               </div>
               <label className="field">
-                <span className="fieldLabel">Increment (min 1)</span>
+                <span className="fieldLabel">Increment (non-zero integer)</span>
                 <input
                   ref={enumInputRef}
                   className="input"
@@ -1122,6 +1421,7 @@ function App() {
                   inputMode="numeric"
                   value={editChan}
                   onChange={(e) => setEditChan(e.target.value)}
+                  onKeyDown={onEditorEnter}
                   placeholder={selectionCount === 0 ? '(select)' : chanMixed ? '(mixed)' : '(keep)'}
                 />
               </label>
@@ -1133,6 +1433,7 @@ function App() {
                   inputMode="numeric"
                   value={editNote}
                   onChange={(e) => setEditNote(e.target.value)}
+                  onKeyDown={onEditorEnter}
                   placeholder={selectionCount === 0 ? '(select)' : noteMixed ? '(mixed)' : '(keep)'}
                 />
               </label>
@@ -1171,6 +1472,7 @@ function App() {
                         setEditColPick(norm)
                       }
                     }}
+                    onKeyDown={onEditorEnter}
                   />
                 </div>
               </label>
@@ -1214,7 +1516,7 @@ function App() {
               </div>
             )}
             <div className="hint">
-              Click to select. Ctrl/Meta to multi-select. Shift to add range. Blank fields keep values.
+              Click to select. Ctrl/Meta to multi-select. Shift to add range. Blank fields keep values. Press `c` to cycle the hovered key’s color through the currently visible colors. Press `e` to toggle enharmonic label display (first / second / both).
             </div>
           </section>
 
@@ -1253,7 +1555,9 @@ function App() {
                 rotate180
                 xOffsetU={3}
                 noteNamesByIdx={noteNamesByBoard?.Board0}
+                noteTooltipByIdx={noteTooltipByBoard?.Board0}
                 displayMode={displayMode}
+                isoBadge={isoBadgeByBoard?.Board0}
                 overlayByIdx={overlayByBoard?.Board0}
                 placementActive={placement !== null}
                 onHoverKey={(board, idx) => setHoveredKey({ board, idx })}
@@ -1272,7 +1576,9 @@ function App() {
                 geometry={geometry}
                 cells={boards.Board1}
                 noteNamesByIdx={noteNamesByBoard?.Board1}
+                noteTooltipByIdx={noteTooltipByBoard?.Board1}
                 displayMode={displayMode}
+                isoBadge={isoBadgeByBoard?.Board1}
                 overlayByIdx={overlayByBoard?.Board1}
                 placementActive={placement !== null}
                 onHoverKey={(board, idx) => setHoveredKey({ board, idx })}

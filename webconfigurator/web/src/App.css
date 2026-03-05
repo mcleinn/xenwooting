@@ -24,28 +24,12 @@
   gap: 2px;
 }
 
-.brandLink {
-  font-size: 12px;
-  color: var(--muted);
-  text-decoration: none;
-}
-
-.brandLink:hover {
-  color: var(--text);
-  text-decoration: underline;
-}
-
 .brandTitle {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   font-weight: 650;
-  font-size: 14px;
+  font-size: 18px;
   opacity: 0.95;
-}
-
-.brandSub {
-  font-size: 12px;
-  color: var(--muted);
 }
 
 .controls {
@@ -213,7 +197,8 @@
 }
 
 .btn {
-  background: rgba(80, 160, 255, 0.18);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
 }
 
 .btnDanger {
@@ -331,6 +316,36 @@
   gap: 10px;
 }
 
+.kbdBadge {
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(0, 0, 0, 0.25);
+  color: rgba(255, 255, 255, 0.88);
+  letter-spacing: 0.03em;
+  user-select: none;
+}
+
+.kbdBadgeOk {
+  border-color: rgba(70, 200, 140, 0.55);
+  background: rgba(30, 120, 80, 0.18);
+  color: rgba(210, 255, 235, 0.95);
+}
+
+.kbdBadgeBad {
+  border-color: rgba(255, 90, 90, 0.55);
+  background: rgba(160, 40, 40, 0.18);
+  color: rgba(255, 225, 225, 0.95);
+}
+
+.kbdBadgeUnknown {
+  border-color: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.8);
+}
+
 .kbdTitle {
   font-weight: 650;
   letter-spacing: 0.04em;
@@ -352,11 +367,13 @@
 
 .key {
   position: absolute;
+  z-index: 1;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 10px;
   padding: 6px 7px;
   color: rgba(255, 255, 255, 0.92);
   box-shadow: none;
+  outline: none;
   cursor: pointer;
   transition: transform 90ms ease, border-color 90ms ease, filter 90ms ease;
   overflow: hidden;
@@ -413,6 +430,13 @@
   transform: translateY(17px);
 }
 
+/* Two spellings joined with '/' need a smaller size to fit. */
+.keySoloLabelWide {
+  font-size: 28px;
+  transform: translateY(14px);
+  letter-spacing: 0;
+}
+
 .keyAllMode .keyInner {
   gap: 10px;
 }
@@ -427,10 +451,16 @@
   line-height: 1.05;
 }
 
-.key:hover {
+.key:not(.keySelected):hover {
+  z-index: 3;
   transform: translateY(-1px);
-  border-color: rgba(255, 255, 255, 0.34);
+  outline: 5px solid rgba(25, 80, 180, 0.85);
+  outline-offset: 0px;
   filter: brightness(1.08);
+}
+
+.key:not(.keySelected):not(.keyOverlay):hover {
+  border-color: rgba(25, 80, 180, 0.75);
 }
 
 .key:active {
@@ -438,13 +468,34 @@
 }
 
 .keySelected {
-  border-color: rgba(255, 255, 255, 0.72);
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.22);
+  z-index: 5;
+  outline: 7px solid rgba(25, 80, 180, 0.95);
+  outline-offset: 0px;
+  border-color: rgba(15, 52, 125, 0.95);
+  box-shadow: 0 0 0 1px rgba(10, 18, 34, 0.65);
+}
+
+.keySelected:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.08);
+}
+
+/* When a key is both overlayed and selected, keep overlay red but add a blue outer ring. */
+.keyOverlay.keySelected {
+  outline: 7px solid rgba(25, 80, 180, 0.85);
+  outline-offset: 0px;
+  box-shadow: 0 0 0 2px rgba(255, 70, 70, 0.22);
 }
 
 .keyOverlay {
+  z-index: 2;
   border-color: rgba(255, 70, 70, 0.95);
   box-shadow: 0 0 0 2px rgba(255, 70, 70, 0.22);
+}
+
+.keyOverlay:not(.keySelected):hover {
+  outline: 5px solid rgba(25, 80, 180, 0.65);
+  outline-offset: 0px;
 }
 
 .keyOverlay .keyChan,

@@ -78,7 +78,10 @@ export async function highlightKey(layoutId: string, board: 'Board0' | 'Board1',
 export async function fetchNoteNames(
   edo: number,
   pitches: number[],
-): Promise<{ edo: number; results: Record<string, { short: string; unicode: string }> }> {
+): Promise<{
+  edo: number
+  results: Record<string, { short: string; unicode: string; alts?: Array<{ short: string; unicode: string }> }>
+}> {
   const res = await fetch(apiUrl('api/note-names'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
