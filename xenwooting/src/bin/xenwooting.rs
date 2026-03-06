@@ -1586,6 +1586,10 @@ fn main() -> Result<()> {
                 && last_activity.elapsed()
                     >= Duration::from_secs(cfg.rgb.screensaver_timeout_sec as u64)
             {
+                info!(
+                    "RGB screensaver: blank after {}s idle",
+                    cfg.rgb.screensaver_timeout_sec
+                );
                 paint_off(&rgb_index_by_device_id);
                 screensaver_active = true;
             }
@@ -1617,8 +1621,11 @@ fn main() -> Result<()> {
 
         let key_id = (device_id, hid.clone());
 
-        // Any edge counts as activity (even suppressed wake keys).
-        last_activity = Instant::now();
+        // Count only down/up as inactivity-resetting activity.
+        // Update edges can be noisy due to analog jitter and should not prevent blanking.
+        if kind != "update" {
+            last_activity = Instant::now();
+        }
 
         // Maintain pressed-key tracking even when suppressed.
         if kind == "down" {
@@ -1630,6 +1637,7 @@ fn main() -> Result<()> {
         // Wake behavior: first key-down after blanking wakes the LEDs but is ignored.
         if screensaver_active && kind == "down" {
             // Restore base LEDs immediately.
+            info!("RGB screensaver: wake");
             paint_base(&wtn, true, &rgb_index_by_device_id);
             screensaver_active = false;
             suppressed_keys.insert(key_id.clone());
