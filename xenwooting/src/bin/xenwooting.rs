@@ -747,7 +747,9 @@ fn main() -> Result<()> {
     let mut rgb_index_by_device_id: HashMap<u64, u8> = HashMap::new();
 
     let mut octave_shift: i8 = 0; // persistent shifts MIDI channel index
-    let mut octave_hold: bool = false; // momentary +1 channel (Space)
+                                  // Momentary +1 channel (Space), per physical keyboard.
+                                  // This makes Board0 Space affect only Board0 notes (same for Board1).
+    let mut octave_hold_by_device: HashSet<u64> = HashSet::new();
 
     let velocity_profiles: Vec<VelocityProfile> = vec![
         VelocityProfile::Linear,
@@ -1695,16 +1697,16 @@ fn main() -> Result<()> {
                     continue;
                 }
                 HIDCodes::Space => {
-                    octave_hold = true;
-                    info!("octave_hold on");
+                    octave_hold_by_device.insert(device_id);
+                    info!("octave_hold on (device_id={})", device_id);
                     continue;
                 }
                 _ => {}
             }
         } else if kind == "up" {
             if let HIDCodes::Space = hid {
-                octave_hold = false;
-                info!("octave_hold off");
+                octave_hold_by_device.remove(&device_id);
+                info!("octave_hold off (device_id={})", device_id);
                 continue;
             }
         }
@@ -1864,7 +1866,11 @@ fn main() -> Result<()> {
             };
             if let Some(cell) = wtn.cell(wtn_board, idx) {
                 let base_ch = cell.chan_1based.saturating_sub(1);
-                let hold = if octave_hold { 1i16 } else { 0i16 };
+                let hold = if octave_hold_by_device.contains(&device_id) {
+                    1i16
+                } else {
+                    0i16
+                };
                 let shifted = (base_ch as i16) + (octave_shift as i16) + hold;
                 let out_ch: u8 = shifted.clamp(0, 15) as u8;
                 let note = cell.key;
