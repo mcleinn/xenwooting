@@ -1050,6 +1050,48 @@ fn main() -> Result<()> {
     // Peak-tracked velocity state per key (device_id + HID).
     let mut vel_state: HashMap<(u64, HIDCodes), VelState> = HashMap::new();
 
+    // RGB screensaver: blank LEDs after inactivity; wake on next key-down.
+    // The wake key-down is ignored (no MIDI, no action binding).
+    let mut screensaver_active = false;
+    let mut last_activity = Instant::now();
+    let mut pressed_keys: HashSet<(u64, HIDCodes)> = HashSet::new();
+    let mut suppressed_keys: HashSet<(u64, HIDCodes)> = HashSet::new();
+
+    let paint_off = |rgb_map: &HashMap<u64, u8>| {
+        if !rgb_enabled {
+            return;
+        }
+        let off = (0u8, 0u8, 0u8);
+        for (dev_id, _bcfg) in board_by_device.iter() {
+            let Some(&dev_idx) = rgb_map.get(dev_id) else {
+                continue;
+            };
+            for (_hid, loc0) in hid_map.all_locs().into_iter() {
+                try_send_drop(
+                    &rgb_tx,
+                    RgbCmd::SetKey(RgbKey {
+                        device_index: dev_idx,
+                        row: loc0.led_row,
+                        col: loc0.led_col,
+                        rgb: off,
+                    }),
+                );
+            }
+            // Also blank the reserved/control bar row.
+            for c in 0..14u8 {
+                try_send_drop(
+                    &rgb_tx,
+                    RgbCmd::SetKey(RgbKey {
+                        device_index: dev_idx,
+                        row: control_bar_row,
+                        col: c,
+                        rgb: off,
+                    }),
+                );
+            }
+        }
+    };
+
     let refresh_vel_led_bases = |wtn: &Wtn, vel_state: &mut HashMap<(u64, HIDCodes), VelState>| {
         for ((device_id, hid), st) in vel_state.iter_mut() {
             let Some(bcfg) = board_by_device.get(device_id) else {
@@ -1530,10 +1572,27 @@ fn main() -> Result<()> {
         }
 
         let edge = match rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(e) => e,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Ok(e) => Some(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(_) => break,
         };
+
+        if edge.is_none() {
+            // Idle tick: possibly activate screensaver.
+            if rgb_enabled
+                && !screensaver_active
+                && pressed_keys.is_empty()
+                && cfg.rgb.screensaver_timeout_sec > 0
+                && last_activity.elapsed()
+                    >= Duration::from_secs(cfg.rgb.screensaver_timeout_sec as u64)
+            {
+                paint_off(&rgb_index_by_device_id);
+                screensaver_active = true;
+            }
+            continue;
+        }
+
+        let edge = edge.unwrap();
 
         let (device_id, hid, analog, kind, ts) = match edge {
             KeyEdge::Down {
@@ -1557,6 +1616,33 @@ fn main() -> Result<()> {
         };
 
         let key_id = (device_id, hid.clone());
+
+        // Any edge counts as activity (even suppressed wake keys).
+        last_activity = Instant::now();
+
+        // Maintain pressed-key tracking even when suppressed.
+        if kind == "down" {
+            pressed_keys.insert(key_id.clone());
+        } else if kind == "up" {
+            pressed_keys.remove(&key_id);
+        }
+
+        // Wake behavior: first key-down after blanking wakes the LEDs but is ignored.
+        if screensaver_active && kind == "down" {
+            // Restore base LEDs immediately.
+            paint_base(&wtn, true, &rgb_index_by_device_id);
+            screensaver_active = false;
+            suppressed_keys.insert(key_id.clone());
+            continue;
+        }
+
+        // Suppressed keys do nothing until released.
+        if suppressed_keys.contains(&key_id) {
+            if kind == "up" {
+                suppressed_keys.remove(&key_id);
+            }
+            continue;
+        }
 
         let Some(bcfg) = board_by_device.get(&device_id) else {
             continue;

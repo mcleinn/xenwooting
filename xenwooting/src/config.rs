@@ -232,6 +232,12 @@ pub struct RgbConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// After this many seconds of inactivity, switch off all LEDs (screensaver).
+    ///
+    /// Set to 0 to disable.
+    #[serde(default = "default_screensaver_timeout_sec")]
+    pub screensaver_timeout_sec: u32,
+
     /// Map wtn_board -> rgb_sdk_device_index (0-based). If missing, uses wtn_board as index.
     ///
     /// TOML table keys are strings, so we store keys as strings (e.g. "0" = 1).
@@ -247,6 +253,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_screensaver_timeout_sec() -> u32 {
+    60
+}
+
 fn default_highlight_hex() -> String {
     "FFFFFF".to_string()
 }
@@ -255,6 +265,7 @@ impl Default for RgbConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            screensaver_timeout_sec: default_screensaver_timeout_sec(),
             device_index_by_wtn_board: HashMap::new(),
             highlight_hex: default_highlight_hex(),
         }
