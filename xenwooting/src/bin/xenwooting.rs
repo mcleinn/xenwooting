@@ -1,4 +1,4 @@
-use alsa::seq::{EvNote, Event, EventType, PortCap, PortType, Seq};
+use alsa::seq::{EvCtrl, EvNote, Event, EventType, PortCap, PortType, Seq};
 use alsa::Direction;
 use anyhow::{Context, Result};
 use log::info;
@@ -258,6 +258,22 @@ impl AlsaMidiOut {
             duration: 0,
         };
         let mut e = Event::new(EventType::Keypress, &ev);
+        e.set_source(self.port);
+        e.set_subs();
+        e.set_direct();
+        self.seq
+            .event_output_direct(&mut e)
+            .context("Failed to output ALSA event")?;
+        Ok(())
+    }
+
+    fn send_cc(&mut self, ch: u8, cc: u8, value: u8) -> Result<()> {
+        let ev = EvCtrl {
+            channel: ch,
+            param: cc as u32,
+            value: value as i32,
+        };
+        let mut e = Event::new(EventType::Controller, &ev);
         e.set_source(self.port);
         e.set_subs();
         e.set_direct();
@@ -685,6 +701,23 @@ fn main() -> Result<()> {
     // MIDI out
     let mut midi_out = AlsaMidiOut::new(&cfg.midi_out_name)?;
     info!("ALSA MIDI out ready: {}", cfg.midi_out_name);
+
+    // Cache: base MIDI channels used by each wtn_board in the current mapping.
+    let compute_used_channels = |wtn: &Wtn, board: u8| -> HashSet<u8> {
+        let mut s: HashSet<u8> = HashSet::new();
+        for i in 0..56usize {
+            if let Some(cell) = wtn.cell(board, i) {
+                s.insert(cell.chan_1based.saturating_sub(1));
+            }
+        }
+        s
+    };
+    let mut used_ch_by_board: HashMap<u8, HashSet<u8>> = HashMap::new();
+    used_ch_by_board.insert(0, compute_used_channels(&wtn, 0));
+    used_ch_by_board.insert(1, compute_used_channels(&wtn, 1));
+
+    // Per-device last sent damper (CC64) value (0..127). Used to reduce CC spam.
+    let mut last_damper_cc64_by_device: HashMap<u64, u8> = HashMap::new();
 
     let rgb_enabled = cfg.rgb.enabled && !no_rgb;
     let (rgb_tx, rgb_rx) = crossbeam_channel::bounded::<RgbCmd>(1024);
@@ -1245,6 +1278,8 @@ fn main() -> Result<()> {
                                             fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
                                         wtn_mtime = base_wtn_mtime;
                                         wtn = base_wtn.clone();
+                                        used_ch_by_board.insert(0, compute_used_channels(&wtn, 0));
+                                        used_ch_by_board.insert(1, compute_used_channels(&wtn, 1));
                                         refresh_vel_led_bases(&wtn, &mut vel_state);
                                         paint_base(&wtn, false, &rgb_index_by_device_id);
                                         info!(
@@ -1283,6 +1318,8 @@ fn main() -> Result<()> {
                             base_wtn_mtime = Some(modified);
                             if !preview_enabled {
                                 wtn = base_wtn.clone();
+                                used_ch_by_board.insert(0, compute_used_channels(&wtn, 0));
+                                used_ch_by_board.insert(1, compute_used_channels(&wtn, 1));
                                 wtn_mtime = base_wtn_mtime;
                                 refresh_vel_led_bases(&wtn, &mut vel_state);
                                 paint_base(&wtn, false, &rgb_index_by_device_id);
@@ -1338,6 +1375,8 @@ fn main() -> Result<()> {
                 } else {
                     // Restore base config.
                     wtn = base_wtn.clone();
+                    used_ch_by_board.insert(0, compute_used_channels(&wtn, 0));
+                    used_ch_by_board.insert(1, compute_used_channels(&wtn, 1));
                     wtn_mtime = base_wtn_mtime;
                     preview_wtn_mtime = None;
                     refresh_vel_led_bases(&wtn, &mut vel_state);
@@ -1357,6 +1396,8 @@ fn main() -> Result<()> {
                         match Wtn::load(&preview_wtn_path) {
                             Ok(new_wtn) => {
                                 wtn = new_wtn;
+                                used_ch_by_board.insert(0, compute_used_channels(&wtn, 0));
+                                used_ch_by_board.insert(1, compute_used_channels(&wtn, 1));
                                 preview_wtn_mtime = Some(modified);
                                 refresh_vel_led_bases(&wtn, &mut vel_state);
                                 paint_base(&wtn, false, &rgb_index_by_device_id);
@@ -1798,6 +1839,67 @@ fn main() -> Result<()> {
             }
         }
 
+        // Damper pedal (CC64): supports analog values (0..127) while held.
+        // This is treated as an "action" but must run on down/update/up.
+        if let Some(action) = actions_by_hid.get(&hid) {
+            if action.as_str() == "damper" {
+                // Determine which wtn board this physical key belongs to.
+                let Some(bcfg) = board_by_device.get(&device_id) else {
+                    continue;
+                };
+                let wtn_board = bcfg.wtn_board;
+
+                // Determine which MIDI channels are used by this board in the current mapping.
+                let base_chs: Vec<u8> = used_ch_by_board
+                    .get(&wtn_board)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+
+                // Apply current octave shift and per-device octave hold so CC targets the same
+                // channels the board is currently outputting notes on.
+                let hold = if octave_hold_by_device.contains(&device_id) {
+                    1i16
+                } else {
+                    0i16
+                };
+                let mut out_chs: HashSet<u8> = HashSet::new();
+                for base in base_chs {
+                    let shifted = (base as i16) + (octave_shift as i16) + hold;
+                    out_chs.insert(shifted.clamp(0, 15) as u8);
+                }
+
+                // Map analog (0..1) to CC value (0..127). Rescale so press_threshold == 0.
+                let press_threshold =
+                    f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
+                let value: u8 = if kind == "up" {
+                    0
+                } else {
+                    let norm =
+                        ((analog - press_threshold) / (1.0 - press_threshold)).clamp(0.0, 1.0);
+                    (norm * 127.0).round() as u8
+                };
+
+                // Rate limit by remembering the last sent value per device.
+                let last = last_damper_cc64_by_device
+                    .get(&device_id)
+                    .copied()
+                    .unwrap_or(255);
+                if value != last {
+                    for ch in out_chs.iter().copied() {
+                        let _ = midi_out.send_cc(ch, 64, value);
+                    }
+                    last_damper_cc64_by_device.insert(device_id, value);
+                }
+
+                if kind == "up" {
+                    last_damper_cc64_by_device.remove(&device_id);
+                }
+                continue;
+            }
+        }
+
         if kind == "down" {
             if let Some(action) = actions_by_hid.get(&hid) {
                 match action.as_str() {
@@ -1813,6 +1915,8 @@ fn main() -> Result<()> {
                         wtn_mtime = base_wtn_mtime;
                         if !preview_enabled {
                             wtn = base_wtn.clone();
+                            used_ch_by_board.insert(0, compute_used_channels(&wtn, 0));
+                            used_ch_by_board.insert(1, compute_used_channels(&wtn, 1));
                             refresh_vel_led_bases(&wtn, &mut vel_state);
                             paint_base(&wtn, false, &rgb_index_by_device_id);
                         }
@@ -1833,6 +1937,8 @@ fn main() -> Result<()> {
                         wtn_mtime = base_wtn_mtime;
                         if !preview_enabled {
                             wtn = base_wtn.clone();
+                            used_ch_by_board.insert(0, compute_used_channels(&wtn, 0));
+                            used_ch_by_board.insert(1, compute_used_channels(&wtn, 1));
                             refresh_vel_led_bases(&wtn, &mut vel_state);
                             paint_base(&wtn, false, &rgb_index_by_device_id);
                         }

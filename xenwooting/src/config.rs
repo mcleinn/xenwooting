@@ -218,10 +218,11 @@ impl ActionBindings {
         // NOTE: HIDCodes does not include a dedicated "Fn" key. On some layouts the physical
         // key labeled Fn may present as another HID code (often RightAlt/RightMeta/etc.).
         // Treat these as defaults only; override in config after you confirm what your device emits.
-        by_action.insert("layout_prev".to_string(), "RightCtrl".to_string());
         by_action.insert("layout_next".to_string(), "RightAlt".to_string());
         by_action.insert("octave_down".to_string(), "LeftAlt".to_string());
         by_action.insert("octave_up".to_string(), "ContextMenu".to_string());
+        // Damper pedal (CC64). Use a physical control-bar key by default.
+        by_action.insert("damper".to_string(), "LeftMeta".to_string());
         Self { by_action }
     }
 }
