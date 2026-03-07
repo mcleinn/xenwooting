@@ -1,0 +1,984 @@
+! chordnam.par
+! encoding: UTF-8
+!
+! List of chords for Scala by Manuel Op de Coul.
+! See command CHORDS and the View:List of chords dialog.
+!
+! number of names:
+844
+! maximum number of intervals:
+9
+! There are four different ways to specify a chord in this file:
+! - As a list of absolute frequency ratios separated by colons, like 
+!   4:5:6
+! - As a list of relative intervals in cents or as a ratio, like 
+!   50.0 50.0 400.0 or 28/27 36/35 5/4
+! - As a list of relative steps of an equal temperament separated by dashes, 
+!   like 4-3-3. Which equal temperament to be used should be specified by a 
+!   statement like <SCALA_SCALE_DEF 2^(1/31)>
+! - As a list of tones in a certain notation system (see command SET NOTATION)
+!   separated by spaces, like C Eb G Bb. The octave can also be specified if
+!   necessary with a period, like F.-1 C.0 F.0 C.1
+!   The notation system to be used should be specified by a statement like
+!   <SCALA_NOTATION E31>
+! The rest of the line with the chord must contain the chord name. If it
+! begins with a digit, then the name must be preceded by a '='-character.
+! If the chord is a list of note names, then the name must always be 
+! preceded by a '='-character. Don't forget this!
+! Any violation of this file's syntax will result in a "Error in file format"
+! message.
+!
+! Note that for chord spellings there is no consistent system and names can
+! be different and more than one for the same chord.
+!
+! ASS stands for Anomalous Saturated Suspension.
+! BP stands for Bohlen-Pierce.
+! NM stands for Neo-Medieval; they were provided by Margo Schulter. This
+! chord notation was inspired by the "partitions" of Jacobus of Liège, 
+! specifying first the outer interval of the sonority, and then the adjacent
+! intervals in ascending order, cf.
+! outer|lower-upper or outer|lower-middle-upper
+!
+! just chords:
+!
+1:2:3  Triunisonus
+1:2:3:4:5:6:7:8  Harmonics 1-8
+(1:2:3:4:5:6:7:8)  Subharmonics 1-8
+1:2:3:5:8:13  Fibonacci Chord
+1:3:4:7:11:18  Lucas Chord
+1:3:5:15  Genus [35]
+1:3:9  NM Quasi-Stable Twin Twelfth
+1:6:9  NM Quasi-Stable Sextupla-Sesquialtera Triple
+2:3:4  =8/5 Chord, NM Trine "8|5-4"
+3:4:5  Fourth-Sixth Chord, Major Triad 2nd inversion
+3:4:6  NM Converse Trine "8|4-5"
+3:5:7  BP Wide Triad
+3:5:7:9  BP Primary Tetrad
+3:5:7:15:21:35  Hexany 1 3 5 7
+3:5:9:15  =9-Limit ASS 1 (Anomalous Saturated Suspension)
+3:5:9:15:27:45  Hexany 1 3 5 9
+3:7:9:15:21  Hendrix
+3:7:9:21  =9-Limit ASS 2
+3:9:15:17:51  =17-Hendrix
+3:7:15:21  =15-Limit ASS 1
+3:9:11:15:33  =11-Hendrix
+3:9:11:33  =11-Limit ASS
+3:9:13:15:39  =13-Hendrix
+3:9:13:39  =13-Limit ASS
+3:9:15:19:57  =19-Hendrix
+4:5:6  Major Triad
+4:5:6:7  Harmonic Dominant Seventh
+4:5:6:7:9  Harmonic Dominant Ninth
+4:5:6:7:9:11  Harmonic Eleventh
+4:5:6:7:9:11:13  Harmonic Thirteenth
+4:5:6:7:9:11:13:15  Harmonic Fourteenth
+4:5:6:9  Added Ninth
+4:5:7  Harmonic 7/3 Triad
+4:6:7  Harmonic 7/5 Triad
+4:6:7:9  Erlich Split Ninth
+4:6:7:9:11  Catler Split Eleventh
+4:6:9  Quintal Triad, NM Split Ninth
+4:6:9:16  Quintal Tetrad
+4:10:14:19  Hendrix Chord (Monzo)
+5:6:7  Diminished Triad, Odim
+5:6:7:8  Harmonic Dominant Seventh 1st inversion
+5:6:7:9  Harmonic Half-diminished Seventh
+5:6:8  Neapolitan Sixth, Major Triad 1st inversion
+5:6:8:9  Added Second 2nd inversion
+5:7:9  BP Narrow Triad, BP Wide Triad 1st inversion
+5:7:9:11  Harmonic Half-diminished Ninth
+5:7:9:12  Tristan Chord, Harmonic Half-diminished Seventh
+5:7:9:15  BP Primary Tetrad 1st inversion
+5:7:15:35  =15-Limit ASS 2
+6:7:8  Subminor Quartal Triad
+6:7:8:9:10:12 Otonal Pentad
+6:7:8:10  Harmonic Dominant Seventh 2nd inversion
+6:7:9  Subminor Triad, NM Septimal Split Fifth 5|m3-M3
+6:7:9:10  Subminor Sixth
+6:7:9:11  Undecimal Subminor Seventh
+6:7:9:11:13  Tridecimal Subminor Ninth
+6:7:10  Diminished Triad, Odim 1st inversion
+6:8:9  Suspended Fourth, Quartal Triad 1st inversion, NM 5|4-Maj2
+6:8:9:10  Sixth Suspended Fourth
+6:8:9:12  Pythagorean Quadrichord
+6:15:21:28  Hendrix Chord (Erlich)
+7:8:10:12  Harmonic Dominant Seventh 3rd inversion
+7:8:12  Subminor Quartal Triad 1st inversion
+7:9:10:12  Harmonic Half-diminished Seventh 2nd inversion
+7:9:11  Isoharmonic Augmented Triad
+7:9:11:21  Ovalpatine Triad 2nd inversion
+7:9:12  Subminor Triad 1st inversion
+7:9:15  BP Wide Triad 2nd inversion
+7:9:15:21  BP Primary Tetrad 2nd inversion
+7:10:12  Diminished Triad, Odim 2nd inversion
+8:9:10:12  Added Second 
+8:9:12  Suspended Second, Quartal Triad 2nd inversion, NM 5|Maj2-4
+8:10:11:12:14  =11-Limit Major Prime Chord
+8:10:11:12:13:14  =13-Limit Major Prime Chord
+8:10:12:14:17  Dominant Ninth Minor
+8:10:12:15  Major Seventh
+8:10:12:15:18  Major Ninth
+8:10:12:19  Hendrix Chord (Smith)
+8:10:13  Quasi-Augmented Triad
+8:10:14:19  Hendrix Chord (Monzo)
+8:10:14:19:23  Yarman's 'Hendrix' Chord
+8:10:15  Major Quintal Triad
+8:11:14  NM Subfocal Tritonic Seventh
+8:12:15  Major Quintal Triad
+9:10:12  Ritsu E-A Trichord
+9:10:12:14  Harmonic Half-diminished Seventh 3rd inversion
+9:10:12:15  Second-Fourth-Sixth Chord, Minor Seventh 3rd inversion
+9:10:12:16  Added Second 1st inversion
+9:11:12  Ryukyu E-A Trichord
+9:11:13  Isoharmonic Diminished Triad
+9:11:13:15  Isoharmonic Diminished Seventh
+(9:11:13:15)  Isosubharmonic Diminished Seventh
+9:11:21:27  Ovalpatine Triad, Isoharmonic Augmented Triad Tritave 1st inversion
+9:12:14  Subminor Triad 2nd inversion
+9:12:16  Quartal Triad, NM Twin Fourth min7|4-4
+9:12:16:20  Carole King Chord
+10:11:12:13:15  Saba Pentachord
+10:12:14:17  Harmonic Diminished Seventh (Ellis)
+10:12:15  Minor Triad
+10:12:15:16  Major Seventh 1st inversion
+10:12:15:17  Harmonic Minor Sixth
+10:12:15:18  Minor Seventh
+(3:4:5:7)  Vogel's Tristan Chord
+(4:5:6:7)  Subharmonic Half-diminished Seventh, Minor Prime Chord
+(4:5:6:7:9)  Subharmonic Dominant Ninth
+(5:6:7:9)  Subharmonic Seventh
+(9:10:13:15)  Subharmonic Trinidad Tetrad
+10:13:15  Ultramajor Triad, Tendo Triad, NM Ultra-Gothic Split Fifth 5|Ultmaj3-ultmin3
+10:13:15:18  Harmonic Trinidad Tetrad
+11:13:15  Augmented Quartal Triad
+11:21:27:33  Ovalpatine Triad 1st inversion, Isoharmonic Augmented Triad Tritave 2nd inversion
+12:13:14:16  Bayati Tetrachord, Buzurg Tetrachord
+12:13:15:16  Hijaz Tetrachord
+12:13:15:16:18  Hijaz Pentachord
+12:13:16 Tsaharuk Triad
+12:14:18:21  Subminor Seventh, NM Septimal Minor Seventh Quad
+12:14:18:21:24  Swiss Tetrad
+12:14:18:21:27  Subminor Ninth
+12:14:21  Subminor 7/m3 Triad
+12:15:16  Ryukyu D-G Trichord
+12:15:16:18  Added Fourth 
+12:15:16:20  Major Seventh 2nd inversion
+12:15:18:20  Added Sixth, Minor Seventh 1st inversion
+12:15:18:20:27  Added Sixth/Ninth
+12:15:20  Minor Triad 1st inversion
+12:15:21:28  Hendrix Chord (Erlich)
+12:16:19  Quasi-Equal Minor Triad 2nd inversion
+13:14:16  Buzurg Triad
+13:18:23  NM Trevicesimal Tritonic Seventh Triple
+14:15:17:19:20:21  Segah-Ferahnak Pentachord
+14:17:20:23  Isoharmonic Contracting Diminished Seventh
+14:17:21  Supraminor Triad, NM Middle Split Fifth 5|Supmin3-submaj3
+14:18:21  Supermajor Triad, NM Septimal Split Fifth 5|M3-m3
+14:18:21:24  Supermajor Added Sixth, NM Septimal Major Sixth Quad
+14:18:21:27  Supermajor Seventh
+14:21:24  Supermajor 6/5 Triad
+15:16:20:24  Major Seventh 3rd inversion
+15:16:17:18  Harmonic Semitone Tetrachord
+15:18:20:24  Third-Fourth Chord, Minor Seventh 2nd inversion
+15:18:20:25  Dominant Seventh 2nd inversion
+15:18:21:25  Contracting Diminished Seventh
+15:20:24  Minor Triad 2nd inversion
+15:21:35:45:105 Inverted Hendrix
+15:33:45:55:165 Inverted 11-Hendrix
+15:39:45:65:195 Inverted 13-Hendrix
+15:45:51:85:255 Inverted 17-Hendrix
+15:45:57:95:285 Inverted 19-Hendrix
+16:18:20:24:27  Added Second & Sixth
+16:18:21:25:28  Altered Pentad
+16:19:24  Quasi-Equal Minor Triad
+16:20:24:27:36  Added Sixth & Ninth
+16:20:24:27:36:45  Added Sixth & Ninth & Augmented Eleventh
+16:20:25  Augmented
+16:20:25:28  Augmented Dominant Seventh
+16:20:25:30  Augmented Major Seventh
+16:21:24:28  Pepper's Square
+16:24:40:56:60:90:135  Battaglia Chord
+17:21:28  Submajor 6/3 Triad
+18:22:27  Neutral Triad
+18:22:27:30:33  Neutral Pentad
+18:22:27:33  Neutral Seventh, Neutral Tetrad
+18:23:27  NM Trevicesimal Split Fifth 5|Maj3-min3
+19:24:32  Quasi-Equal Minor Triad 1st inversion
+20:23:30  Inframinor Triad
+20:24:30:35  Minor Harmonic Seventh
+20:24:30:36:45  Minor Ninth
+20:25:30:36  Dominant Seventh
+20:25:30:36:45  Dominant Ninth
+20:25:30:36:45:54  Dominant Eleventh
+20:25:30:36:48  Dominant Augmented Ninth "7#9", Altered Dominant
+20:25:28:35  French Sixth
+20:28:35  Subharmonic Tritonic Seventh
+21:22:28  Miyako-bushi C-F Trichord
+21:23:25:28  Ushshaq Tetrachord
+21:24:26:28  Septimal Rast Tetrachord
+21:24:27:28  Septimal 'Ajam Tetrachord
+21:24:28  Ritsu C-F Trichord, Folk Music Trichord
+21:25:30:35  Diminished Seventh 3rd inversion
+21:27:28  Ryukyu C-F Trichord
+21:27:35  Sensamagic triad
+21:28:34  Supraminor 6/4 Triad
+21:30:35  Subharmonic Diminished Triad, Udim 2nd inversion
+22:24:26:28:33  Saba Pentachord
+22:26:33  NM Tredecimal Split Fifth 5|min3-Maj3
+22:26:33:39  NM Tredecimal Minor Seventh Quad
+22:28:33  NM Undecimal Split Fifth 5|Maj3-min3
+24:27:29:34:36  Nikriz Pentachord
+24:27:30:32  Rast Tetrachord
+24:27:30:36:40  Major Pentachord
+24:27:30:36:40:45  Reduced Hexany 1 3 5 9
+24:27:32  Ritsu Bb-Eb Trichord
+24:27:32:36  Quartal Tetrad 2nd inversion, NM Quintal/Quartal Quad
+24:28:30:35:40:42  Reduced Hexany 1 3 5 7
+24:32:45  Fourth-Seventh Chord
+24:33:40  Ptolemismic Triad
+25:30:35:42  Diminished Seventh (Paule White)
+25:30:36  Diminished
+25:30:36:42  Diminished Seventh (Poole)
+25:30:36:45  Half-diminished Seventh
+25:30:40:48  Major Seventh Augmented Fifth
+26:30:39  Ultraminor Triad, Arto Triad, NM Ultra-Gothic Split Fifth 5|ultmin3-Ultmaj3
+26:32:39  NM Tredecimal Middle Split Fifth 5|Supmin3-submaj3
+26:33:39  NM Tredecimal Split Fifth 5|M3-m3
+26:33:39:44  NM Tredecimal Major Sixth Quad
+27:28:36  Miyako-bushi E-A Trichord
+27:32:36  Minyo C-F Trichord
+27:36:48:64  Quartal Tetrad
+28:33:42  NM Undecimal Split Fifth 5|m3-M3
+28:35:40  Septimal Hard-diminished
+30:32:36:40:45  Segah Pentachord
+30:35:42  Subharmonic Diminished Triad, Udim
+30:35:42:50  Diminished Seventh 1st inversion
+30:39:45:52  NM Ultra-Gothic Major Sixth Quad
+32:36:39:45:48  Nikriz Pentachord
+32:36:45:54  Double Diminished Seventh
+32:37:48  Rooted Inframinor Triad
+32:39:48  Rooted Neutral Triad
+32:41:48  Rooted Supermajor Triad
+33:36:42:44  Hijaz of Qutb al-Din al-Shirazi Tetrachord
+34:36:42:45  Arax Tetrachord
+34:38:51  Quasi-meantone Suspended Second
+34:42:51  Submajor Triad, NM Middle Split Fifth 5|submaj3-Supmin3
+35:42:50:60  Diminished Seventh 2nd inversion, Untempered Starling Tetrad
+35:42:60  Supermajor 6/3 Triad, Subharmonic Diminished Triad, Udim 1st inversion
+36:39:44:48  Dudon Old Esfahan Mohajira Tetrachord
+36:45:54:64  Diatonic Dominant Seventh
+38:48:57  Inverse Quasi-Equal Minor Triad
+38:51:57  Quasi-meantone Suspended Fourth
+39:44:49:52  Mahur Tetrachord
+39:45:52  Island Triad
+40:45:48:56:60  Nikriz Pentachord
+40:45:50:56:60  Pencgâh Pentachord
+40:45:50:60:72  Untempered Starling Pentad
+42:45:48:56:63  Iranian Pentachord
+42:45:51:56:63  Segah Pentachord
+42:45:56  Miyako-bushi F-Bb Trichord
+42:46:50:54:63  Saba Pentachord
+42:46:50:55:63  Saba Pentachord  
+42:46:50:54:55:63  Saba Pentachord
+42:46:50:56:63  Hüseyni Pentachord
+42:48:51:56:63  Müstear Pentachord
+42:49:60  Mynucumic Triad 2
+42:51:68  Supraminor 6/3 Triad, NM Larger "Phi-like" Sixth
+42:52:63  NM Tredecimal Middle Split Fifth 5|submaj3-Supmin3
+44:48:52:56:57:66  Saba Pentachord
+44:55:70  Valinorsmic Augmented Triad
+44:56:66:77  NM Rebounding Seventh, Focal Seventh
+45:48:56:60  Hijaz Tetrachord 7-limit
+46:54:69  NM Trevicesimal Split Fifth 5|m3-M3
+46:54:69:81  NM Trevicesimal Minor Seventh Quad
+46:56:69  NM Trevicesimal Middle Split Fifth 5|Supmin3-submaj3
+48:54:56:63  Nahawand Tetrachord
+48:54:56:63:72  Buselik Pentachord
+48:54:57:64  Buselik Tetrachord
+48:54:57:64:72  Buselik Pentachord
+48:54:58:67:72  Nikriz Pentachord
+49:56:64  Double Septimal Whole-Tone
+51:54:60:68  Kürdi Tetrachord
+52:63:78  NM Tredecimal Supraminor Triad 5|Supmin3-submaj3
+52:63:84  NM Smaller "Phi-like" Sixth
+54:56:63:72  Septimal Kürdi Tetrachord
+54:58:67:72  Hijaz Tetrachord
+54:58:67:72:81  Hijaz Pentachord
+54:64:81  NM Pythagorean Split Fifth 5|m3-M3
+54:64:81:96  NM Pythagorean Minor Seventh Quad
+54:69:81:92  NM Trevicesimal Major Sixth Quad
+55:65:77  Cuthbert Triad
+56:63:72:78:84  Najdi Pentachord
+56:66:84:99  NM Undecimal Minor Seventh Quad
+56:69:84  NM Trevicesimal Middle Split Fifth 5|submaj3-Supmin3
+60:64:72:79:90  Hüzzam Pentachord
+60:66:71:80:90  Hüseyni Pentachord
+63:78:91:104  Ibn Sina Sixth
+63:81:91  Squbemic Triad 2
+64:81:96  NM Pythagorean Split Fifth 5|M3-m3
+64:81:96:108  NM Pythagorean Major Sixth Quad
+65:78:100  Ratwolf Triad
+66:72:78:88:99  Hüseyni Pentachord
+66:72:81:88  Dudon Mohajira Tetrachord
+66:84:99:112  NM Undecimal Major Sixth Quad
+70:77:91:100 Sinbadmic Tetrad
+70:84:105:120  Subharmonic Minor Sixth
+70:90:105:126  Supermajor Tetrad
+72:79:89:96  Dudon Sumer Tetrachord
+72:81:88:96  Rast Tetrachord
+72:81:88:96:108  Rast Pentachord
+72:81:104  Squbemic Triad 1
+72:81:104:117  Squbemic Tetrad 2
+72:81:112:126  Squbemic Tetrad 1
+74:96:111  Rooted Ultramajor Triad
+78:84:96:104:117  Hijaz Pentachord
+78:91:108  Kestrel Triad 1
+81:88:96:108  Ushshaq Tetrachord
+84:99:112  Minyo F-Bb Trichord
+88:99:108:126:132  Nirizi Pentachord
+90:96:112:120:135  Hijaz Pentachord
+91:112:130  Mynucumic Triad 1
+96:105:114:124:126:144  Saba Pentachord
+96:105:114:128  Ushshaq Tetrachord
+96:105:114:128:144  Hüseyni Pentachord
+102:108:120:136:153  Kürdi Pentachord
+114:122:138:150:171  Hüzzam Pentachord
+120:135:144:160:180  Müstear Pentachord
+120:135:152:160  Mahur Tetrachord
+120:140:165:192  =11-Limit Orwell Tetrad
+126:162:189:224  NM Septimal Rebounding Seventh
+130:169:220  Parizek Triad 1
+132:143:156:176  Bayati Tetrachord
+132:147:156:176  Buselik Tetrachord
+132:147:156:176:198  Buselik Pentachord
+135:160:192:225  Diminished Seventh 3rd inversion
+143:169:198  Kestrel Triad 2
+143:169:198:234  Kestrel Tetrachord
+143:169:220  Parizek Triad 2
+150:162:189:200  Çargâh Tetrachord
+150:162:189:200:225  Çargâh Pentachord
+160:192:225:270  Diminished Seventh
+165:195:231:275  Garibert Tetrad
+192:225:270:320  Diminished Seventh 1st inversion
+192:240:243:256  New Enharmonic Permuted Tetrachord
+210:252:280:315:360:420 Untonal Pentad
+220:264:320:385  Untempered Magical Seventh
+225:270:320:384  Diminished Seventh 2nd inversion (Helmholtz)
+240:243:256:320  New Enharmonic Tetrachord
+330:385:450:528  Guanyin Tetrad
+600:675:744:800  Rast Tetrachord
+600:675:744:800:900  Rast Pentachord
+660:770:840:924:1155  =11-Limit Minor Prime Chord
+1001:1155:1365:1573  Nicolic Tetrad
+2197:2535:2925:3375  Island Tetrad
+8580:9240:10010:10920:12012:15015  =13-Limit Minor Prime Chord
+13122:16384:19683  NM Schismic Split Fifth 5|S3-s3
+16384:19683:24576  NM Schismic Split Fifth 5|s3-S3
+!
+<SCALA_SCALE_DEF 2^(1/7)>
+!
+2-2  =7-tone Neutral Triad
+!
+! Sethares' 10 tone chords:
+<SCALA_SCALE_DEF 2^(1/10)>
+!
+3-3-4  =10-tone Neutral Chord
+5-2  =10-tone Tritone Chord II
+5-3  =10-tone Tritone Chord I
+!
+! 12 tone chords:
+<SCALA_SCALE_DEF 2^(1/12)>
+<SCALA_NOTATION E12>
+!
+1-1  Semitone Trichord
+1-1-1  Semitone Tetrachord
+1-1-1-1  Chromatic Pentachord
+1-1-1-1-1  Chromatic Hexachord
+1-1-2-3-1  All-interval Hexachord
+1-1-3-1-3  Schönberg Anagram Hexachord
+1-1-4-2  Bardos Chord
+1-2  Phrygian Trichord
+1-2-2  Dorian Tetrachord, Intense Diatonic (652), Kürdi (Kurd)
+1-2-2-1-2  Locrian Hexachord
+1-2-4  All-interval Tetrachord 2
+1-3  Major-Minor Trichord I
+1-3-2  All-interval Tetrachord 1
+1-4-3  Major Seventh 3rd inversion
+1-6  Viennese Trichord 1st inversion
+2-1  Minor Trichord
+2-1-2  Minor Tetrachord, Phrygian Tetrachord, Buselik, Nahawand
+2-1-2-2  Minor Pentachord
+2-1-2-2-2  Minor Hexachord
+2-2  Whole-Tone Trichord
+2-2-1  Major Tetrachord, Lydian Tetrachord, Jahargah, 'Ajam, Acem
+2-2-1-2  Major Pentachord
+2-2-1-2-2  Major Hexachord
+2-2-2  Secundal Tetrachord
+2-2-3  Added Second "2" "add2", Mu Major
+2-2-3-2  Added Second & Sixth "6/2"
+2-3  Second-Fourth Chord "4/2"
+2-3-2  Second-Fourth-Fifth Chord "sus2,4", "5/4/2"
+2-3-3  Half-diminished Seventh 3rd inversion
+2-3-4  Second-Fourth-Sixth Chord "6/4/2", Minor Seventh 3rd inversion
+2-4  Double Diminished, Augmented Sixth 2nd inversion
+2-4-3  Double Diminished Seventh, Dominant Seventh 3rd inversion
+2-5  Suspended Second "sus2", Second-Fifth Chord "5/2"
+2-5-2  Sixth Suspended Second "6sus2"
+2-5-3  Dominant Seventh Suspended Second "7sus2"
+2-5-4  Major Seventh Suspended Second "maj7sus2"
+3-1  Major-Minor Trichord II
+3-1-3  Major-Minor Tetrachord, Bimodal Chord
+3-1-4  Augmented-Major Tetrachord
+3-2  Minor Quartal Triad
+3-2-3  Third-Fourth Chord "4/3", Minor Seventh 2nd inversion
+3-2-4  Dominant Seventh 2nd inversion
+3-3  Diminished "mb5", Minor Trine
+3-3-2  Dominant Seventh 1st inversion
+3-3-3  Diminished Seventh "dim"
+3-3-3-3  Strawinsky's Sacre-chord
+3-3-3-3-2-3-3-3  Alpha Chord
+3-3-4  Half-diminished Seventh "m7b5", Eulenspiegel Chord, Franco-Swedish Sixth
+3-3-4-3  Half-diminished Ninth Minor "m9b5"
+3-3-5  Diminished-Major Seventh "mmaj7b5"
+3-3-6  Sixths Chord 2nd inversion
+3-4  Minor Triad "m"
+3-4-1  Major Seventh 1st inversion
+3-4-2  Minor Sixth "m6", Half-diminished Seventh 1st inversion
+3-4-2-5  Minor Sixth Added Ninth "m6/9"
+3-4-3  Minor Seventh "m7", Germano-Swedish Sixth
+3-4-3-3  Minor Seventh Ninth Minor "m7b9"
+3-4-3-4  Minor Ninth "m9"
+3-4-3-4-3  Minor Eleventh "m11"
+3-4-3-4-3-4  Minor Thirteenth "m13"
+3-4-4  Minor-Major Seventh "mmaj7"
+3-4-4-3  Minor-Major Ninth "mmaj9"
+3-4-4-3-3  Minor-Major Eleventh "mmaj11"
+3-4-4-3-3-4  Minor-Major Thirteenth "mmaj13"
+3-4-7  Minor Added Ninth "madd9"
+3-5  Neapolitan Sixth, Major Triad 1st inversion
+3-5-3  Major Seventh Augmented Fifth "maj7#5"
+3-6  Minor Trine 1st inversion
+3-6-3  Sixths Chord
+3-7  Minor Quintal Triad, Italo-Swedish Sixth
+4-1-2  Added Fourth "add4"
+4-1-4  Major Seventh 2nd inversion
+4-2  Hard-diminished "b5"
+4-2-2-5  Enigmatic Pentachord
+4-2-2-7  Augmented-Diminished Ninth
+4-2-3  Half-diminished Seventh 2nd inversion
+4-2-4  Hard-diminished Seventh "7b5", French Sixth
+4-2-4-3  Hard-diminished Minor Ninth "b9b5"
+4-2-4-3-8  Hard-diminished Minor Ninth Added Thirteenth "13b9b5"
+4-2-4-4  Hard-diminished Ninth "9b5"
+4-2-4-5  Hard-diminished Seventh & Augmented Ninth "#9b5"
+4-2-8  Hard-diminished Added Ninth "b5add9"
+4-3  Major Triad "maj"
+4-3-2  Sixte Ajoutée "6", Minor Seventh 1st inversion
+4-3-2-1-4  Ninth Added Sixth "9/6"
+4-3-2-5  Added Sixth & Ninth "6/9"
+4-3-2-5-4  Added Sixth & Ninth & Augmented Eleventh "6/9#11"
+4-3-3  Dominant Seventh "7", German Sixth
+4-3-3-3  Dominant Ninth Minor "7b9"
+4-3-3-3-2  Dominant Ninth Minor & Augmented "7#9b9"
+4-3-3-3-4  Dominant Ninth Minor Added Eleventh "11b9"
+4-3-3-3-5  Augmented Eleventh Minor Ninth "b9#11"
+4-3-3-3-5-3  Augmented Thirteenth Minor Ninth "13b9#11"
+4-3-3-3-8  Dominant Ninth Minor Added Thirteenth "13b9"
+4-3-3-4  Dominant Ninth "9"
+4-3-3-4-3  Dominant Eleventh "11"
+4-3-3-4-3-4  Dominant Thirteenth "13"
+4-3-3-4-4  Dominant Ninth Augmented Eleventh "9#11"
+4-3-3-4-4-3  Augmented Thirteenth "13#11", "7#11", Lydian Dominant
+4-3-3-4-4-3-4  Augmented Fifteenth "#15"
+4-3-3-5  Dominant Augmented Ninth "7#9", Altered Dominant
+4-3-3-7  Dominant Seventh Added Eleventh "7/11"
+4-3-3-7-4  "11/7/6"
+4-3-3-11 Dominant Seventh Added Thirteenth "7/13"
+4-3-4  Major Seventh "maj7" "*"
+4-3-4-3  Major Ninth "maj9"
+4-3-4-3-3  Major Eleventh "maj11"
+4-3-4-3-3-4  Major Thirteenth "maj13"
+4-3-4-3-4  Lydian "*#11"
+4-3-4-7  Lydian "*#11"
+4-3-7  Added Ninth "add9"
+4-4  Augmented "aug" "#5", Major Trine
+4-4-2  Augmented Dominant Seventh "7+", "7#5"
+4-4-2-3  Augmented Dominant Seventh Minor Ninth "7#5b9"
+4-4-2-4  Augmented Dominant Ninth "9#5"
+4-4-2-5  Augmented Dominant Seventh Augmented Ninth "7#5#9"
+4-4-3  Augmented Major Seventh "maj7#5"
+4-4-3-3  Augmented Major Ninth "maj9#5"
+4-4-4  Major Augmented Tetrad
+4-4-6  Augmented Added Ninth "#5add9"
+4-5  Minor Triad 1st inversion
+4-5-2  Sixth-Seventh Chord "7/6"
+4-5-5  Sixth-Ninth Chord "9/6"
+4-6  Augmented Sixth "aug6", Italian Sixth
+4-7  Major Quintal Triad
+4-7-3  Seventh-Ninth Chord "9/7"
+5-1  Viennese Trichord, Hard-interval Triad
+5-1-1  Dream Chord
+5-2  Suspended Fourth "sus4", Georgian Triad
+5-2-2  Sixth Suspended Fourth "6sus4"
+5-2-3  Dominant Seventh Suspended Fourth "7sus4"
+5-2-3-4  Dominant Ninth Suspended Fourth "9sus4"
+5-2-3-4-7  Thirteenth Suspended Fourth "13sus4"
+5-2-4  Major Seventh Suspended Fourth "maj7sus4"
+5-2-6-3-1  Boesmans all-interval chord
+5-2-7  Fourth-Ninth Chord "9/4" "sus4add9"
+5-3  Minor Triad 2nd inversion
+5-4  Fourth-Sixth Chord, Major Triad 2nd inversion, "6/4"
+5-5  Quartal Triad
+5-5-5  Quartal Tetrad
+E A D.1 G.1 B.1  =So What Chord
+5-6  Fourth-Seventh Chord "7/4"
+6-2  Augmented Sixth 1st inversion
+6-3  Minor Trine 2nd inversion
+6-3-3  Sixths Chord 1st inversion
+6-5  Viennese Trichord 2nd inversion
+F B D#.1 G#.1  =Tristan Chord
+C F# Bb E.1 A.1 D.2  =Scriabin's Mystic Chord, Prometheus Chord
+E B Db.1 F.1 Ab.1  =Elektra Chord
+7-3  Minor Quintal Triad
+7-4  Major Quintal Triad
+7-7  Quintal Triad
+7-7-7-7  Fifths Chord
+7-7-10  Quintal Tetrad
+C G# B E.1 A.1  =Farben Chord
+E.-1 D G C.1  =Steely Dan Chord
+12-7-5-4-3  Overtone
+3-4-5-7-12  Undertone
+292.0475 268.6118 292.0475  Tempered Kestrel Tetrad
+C E F# G A# C#.1  =Petrushka Chord
+E.-2 G.-2 B.-2 G.-1 G E.1 G.1 B.1  =Psalms Chord
+C Bb E.1 D.2 G#.3 F#.3  =Whole-Tone Chord
+!
+! Messiaen's chords:
+!
+B.-1 E Gb G Bb Eb.1 F.1 A.1  =orangé
+Bb.-1 Eb F G B C.1 Gb.1 Ab.1  =rouge
+A.-1 D F G Ab Eb.1 Gb.1 Bb.1  =gris et or
+C#.-1 C G# D.1  =vert pâle et argent
+D.-1 E C#.1 A.1  =bleu
+G A C.1 D.1 F.1 B.1 E.2  =Accord sur dominante
+C E G Bb D.1 F#.1 G#.1 B.1  =Accord de la résonance
+Db G C.1 F#.1 B.1 F.2  =Accord en quartes
+!
+! 13 tone chords:
+<SCALA_SCALE_DEF 2^(1/13)>
+3-5-3  =13-tone NM Minor Seventh Quad
+4-4  =13-tone NM Submajor Split Fifth
+4-4-3  =13-tone NM Tritonic Minor Seventh Quad
+5-2  =13-tone NM Crunchy Pepper's Triple
+5-3-2  =13-tone NM Major Sixth Quad
+5-8  =13-tone NM Converse Trine
+8-5  =13-tone NM Trine
+!
+! 15 tone chords:
+<SCALA_SCALE_DEF 2^(1/15)>
+!
+4-2-4-2-4-2 Chopsticks Hexachord
+4-5-4  =15-tone Minor Seventh
+5-4-4  =15-tone Dominant Seventh
+5-4-5  =15-tone Major Seventh
+!
+! 16 tone chords:
+<SCALA_SCALE_DEF 2^(1/16)>
+!
+1-3-3-3-3  =16-tone Hexachord
+4-5-4  =16-tone Diminished Seventh
+13-14  =16-tone Narrow Metallic Triad
+14-13  =16-tone Wide Metallic Triad
+!
+! 17 tone chords:
+<SCALA_SCALE_DEF 2^(1/17)>
+!
+1-3-3  =17-tone Phrygian Quad
+1-5-1  =17-tone Modern Hijaz
+2-2-3  =17-tone Modern Bayyati
+2-3-2  =17-tone Modern Iraq
+3-1-3  =17-tone Aeolian Quad
+3-2-2  =17-tone Modern Rast
+3-3-1  =17-tone Ionian Quad
+4-4-4  =17-tone NM Diminished Seventh
+4-4-5  =17-tone NM Quasi-Helmholtz Seventh
+4-6  =17-tone Minor Triad
+4-6-4  =17-tone NM Minor Seventh Quad
+5-5  =17-tone Neutral Triad, NM Neutral Split Fifth
+6-4  =17-tone Major Triad
+6-4-3  =17-tone NM Major Sixth Quad
+6-4-4  =17-tone NM Rebounding Seventh
+6-5  =17-tone Augmented Fifth
+6-9  =17-tone NM Augmented Sixth Triple
+7-3  =17-tone Suspended Fourth
+7-7  =17-tone Quartal Triad
+7-10  =17-tone NM Converse Trine
+8-6  =17-tone NM Quasi-Trevicesimal Subfocal Tritonic Seventh
+10-7  =17-tone NM Trine
+!
+! 19 tone chords:
+<SCALA_SCALE_DEF 2^(1/19)>
+<SCALA_NOTATION E19>
+!
+4-7  =19-tone Flat Triad
+5-6  =19-tone Minor Triad
+5-6-4  =19-tone Minor Augmented Sixth
+6-5  =19-tone Major Triad
+6-6-7  =19-tone Marvel Augmented Triad
+7-4  =19-tone Sharp Triad
+7-7-5  =Sensamagic Tetrad
+7-8  Canovian Chord
+Ab.-1 C D  F#  =19-tone French Sixth
+Ab.-1 C D# F#  =19-tone English Sixth
+Ab.-1 C Eb F#  =19-tone German Sixth, Diminished Seventh
+Ab.-1 C F#  =19-tone Italian Sixth
+!
+! 20 tone chords:
+<SCALA_SCALE_DEF 2^(1/20)>
+5-7  =20-tone Upminor Triad
+7-5  =20-tone Downmajor Triad
+5-7-4  =20-tone Upminor Seventh
+7-5-4  =20-tone Downseventh
+7-4-6  =20-tone Downmajor Seventh
+5-7-5  =20-tone Upminor Seventh
+!
+! 22 tone chords:
+<SCALA_SCALE_DEF 2^(1/22)>
+!
+3-3-3  =22-tone Equal Tetrachord
+4-3  =22-tone Major Add9 Triad
+5-5  =22-tone Tiny Triad
+5-5-5  =22-tone Tiny Seventh
+5-8  =22-tone Subminor Triad
+5-8-5  =22-tone Sub Seventh
+5-8-7  =22-tone Sub Major Seventh
+5-13  =22-tone Subminor Seventh Triad
+6-5  =22-tone Harmonic Diminished Triad
+6-6  =22-tone Magical Triad
+6-6-6  =22-tone Magical Seventh
+6-7  =22-tone Minor Triad
+6-7-4  =22-tone Harmonic Minor Sixth
+6-7-5  =22-tone Minor Sub Seventh
+6-7-6  =22-tone Minor Seventh
+6-13  =22-tone Minor Seventh Triad
+7-5  =22-tone Squished Major Triad
+7-6  =22-tone Major Triad
+7-6-5  =22-tone Harmonic Seventh
+7-6-7  =22-tone Major Seventh
+7-6-8  =22-tone Major Super Seventh
+7-7  =22-tone Augmented Triad
+7-7-8  =22-tone Marvel Augmented Tetrad
+7-11  =22-tone Harmonic Dominant Seventh Triad
+7-13  =22-tone Major Seventh Triad
+8-5  =22-tone Supermajor Triad
+8-5-5  =22-tone Super Sub Seventh
+8-5-6  =22-tone Super Minor Seventh
+8-5-8  =22-tone Super Seventh
+8-8  =22-tone Giant Triad
+8-8-5  =22-tone Giant Sixth
+9-4  =22-tone Suspended Triad
+11-7  =22-tone Harmonic Half-Diminished Seventh Triad
+13-5  =22-tone Subminor Seventh Triad
+!
+! 24 tone chords:
+<SCALA_SCALE_DEF 2^(1/24)>
+!
+2-4-2  Zamzama
+2-4-6  Athar Kurd
+2-6-2  Higazi (Hijaz), Nagriz (Hisar), Chromatic Mezotetrachord
+3-3-2  Saba
+3-3-2-6  Saba Pentachord
+3-3-3-5  Rakb
+3-3-4  Bayati, Shur
+3-3-4-4  Bayati Pentachord
+3-4  Sikah (Segâh)
+3-4-2  Hüzzam
+3-4-3  Mohajira, Iraq
+3-4-4  Sikah (Segâh)
+3-5-2  Athanasopoulos Byzantine Chromatic
+3-6-1  'Awg 'ara
+3-6-2  'Awg 'ara
+4-2-6  Nakriz, Nawa Athar
+4-3-3  Rast, Nagdi, Neutral Diatonic, Islamic Diatonic
+4-3-5-2  Zawil
+5-2  Müstear
+5-9  =24-tone NM Ultra-Gothic Split Fifth 5|ultmin3-Ultmaj3
+5-9-5  =24-tone NM Ultra-Gothic Minor Seventh Quad
+5-14  =24-tone NM Bivalent Ultra-Gothic Triple
+6-1-3  Sazkar
+6-2-2-4  Sipahr
+7-7  =24-tone Neutral Triad, NM Neutral Split Fifth
+7-7-7  Ives Fundamental Major, 24-tone Neutral Seventh
+8-2  Baharsurak
+8-6-5  =24-tone NM Rebounding Seventh
+9-5  =24-tone NM Ultra-Gothic Split Fifth 5|Ultmaj3-ultmin3
+9-5-5  =24-tone NM Ultra-Gothic Major Sixth Quad
+11-8  =24-tone NM Ultra-Gothic Subfocal Tritonic Seventh
+!
+! 29 tone chords:
+<SCALA_SCALE_DEF 2^(1/29)>
+!
+6-11  =29-tone NM Ultra-Gothic Split Fifth 5|ultmin3-Ultmaj3
+6-11-6  =29-tone NM Ultra-Gothic Minor Seventh Quad
+6-17  =29-tone NM Bivalent Ultra-Gothic Triple
+7-10  =29-tone NM Split Fifth 5|min3-Maj3
+7-10-7  =29-tone NM Minor Seventh Quad
+8-9  =29-tone NM Middle Split Fifth 5|Supmin3-submaj3
+9-8  =29-tone NM Middle Split Fifth 5|submaj3-Supmin3
+10-7  =29-tone NM Split Fifth 5|Maj3-min3
+10-7-5  =29-tone NM Major Sixth Quad
+10-7-7  =29-tone NM Rebounding Seventh
+12-17  =29-tone NM Converse Trine
+12-12  =29-tone Quartal Triad
+14-10  =29-tone NM Tritonic Subfocal Seventh
+17-12  =29-tone NM Trine
+!
+! 31 tone chords:
+<SCALA_NOTATION E31>
+!
+C Eb; G =31-tone Subminor Triad
+C Eb G  =31-tone Minor Triad
+C E; G  =31-tone Neutral Triad
+C E G   =31-tone Major Triad
+C E| G  =31-tone Supermajor Triad
+C D E G A =31-tone Added Second & Sixth "2/6"
+C Eb G A D.1 =31-tone Minor Sixth Added Ninth "m6/9"
+C E G A D.1  =31-tone Added Sixth & Ninth "6/9"
+C E G Bb; =31-tone Harmonic Dominant Seventh
+C E G Bb  =31-tone Dominant Seventh
+C E G Bb; D.1  =31-tone Harmonic Dominant Ninth
+C E G Bb; D.1 F|.1  =31-tone Harmonic Eleventh
+C E G Bb; D.1 F|.1 A;.1  =31-tone Harmonic Thirteenth
+C E G# C.1  =31-tone Marvel Augmented Triad
+!
+! 36 tone chords:
+<SCALA_SCALE_DEF 2^(1/36)>
+!
+4-5-6  =36-tone Shur Tetrachord
+5-4-6   Savas (654)
+4-6-5   Savas Barys Diatonic
+8-13   =36-tone Subminor Triad, NM Quasi-Septimal Split Fifth 5|m3-M3
+8-13-8 =36-tone Subminor Seventh, NM Quasi-Septimal Minor Seventh Quad
+10-11  =36-tone Supraminor Triad, NM Middle Split Fifth 5|Supmin3-submaj3
+10-15  =36-tone Supraminor Triad 1st inversion, NM Near-Phi Sixth
+11-10  =36-tone Submajor Triad, NM Middle Split Fifth 5|submaj3-Supmin3
+12-9-8 =36-tone NM Smaller Rebounding Seventh
+13-8   =36-tone Supermajor Triad, NM Quasi-Septimal Split Fifth 5|M3-m3
+13-8-7 =36-tone Supermajor Added Sixth, NM Quasi-Septimal Major Sixth Quad
+13-8-9 =36-tone NM Larger Rebounding Seventh
+17-12  =36-tone NM Smaller Tritone Subfocal Seventh
+17-13  =36-tone NM Larger Tritone Subfocal Seventh
+!
+! 46 tone chords:
+<SCALA_SCALE_DEF 2^(1/46)>
+!
+10-17  =46-tone NM Minimal Split Fifth 5|minim3-Max3
+10-17-10  =46-tone NM Minimal Seventh Quad
+11-16  =46-tone NM Quasi-Undecimal Split Fifth 5|min3-Maj3
+11-16-11  =46-tone NM Minor Seventh Quad
+12-15  =46-tone NM Schismalike Split Fifth 5|s3-S3
+13-14  =46-tone NM Middle Split Fifth 5|Supmin3-submaj3
+14-13  =46-tone NM Middle Split Fifth 5|submaj3-Supmin3
+15-12  =46-tone NM Schismalike Split Fifth 5|S3-s3
+16-11  =46-tone NM Quasi-Undecimal Split Fifth 5|Maj3-min3
+16-11-10  =46-tone NM Rebounding Seventh
+16-11-8  =46-tone NM Major Sixth Quad
+17-10  =46-tone NM Maximal Split Fifth 5|Max3-minim3
+17-10-9  =46-tone NM Maximal Sixth Quad
+19-19  =46-tone Quartal Triad
+19-27  =46-tone NM Converse Trine
+21-16  =46-tone NM Tritonic Subfocal Seventh
+27-19  =46-tone NM Trine
+!
+! 48 tone chords:
+<SCALA_SCALE_DEF 2^(1/48)>
+!
+3-3-6-8  Hemiolic Chromatic and Diatonic Mixed
+5-5-5-5  Equal Pentachord
+15-13-11-17-14-12  =48-tone Harmonic Thirteenth
+!
+! 53 tone chords:
+<SCALA_SCALE_DEF 2^(1/53)>
+!
+4-9-9  Kürdi Tetrachord
+4-9-9-9  Kürdi Pentachord
+5-8-13  Araban
+5-8-5-9  Hicaz
+5-9-5  Hüzzam Tetrachord
+5-9-5-12  Hüzzam Pentachord
+5-9-8  Iraq, Segah Tetrachord
+5-9-8-9  Segah Pentachord
+5-9-8-5-9  Iraq Hexachord
+5-9-9-8  Ferahnâk
+5-12-5  Sedaraban, Hicaz
+5-13-4  Evicârâ
+6-7-9  Shur
+8-5-5  Saba
+8-5-9  Acem, Tahir, Beyati, Hüseyniasiran, Nisabur
+8-5-9-8-5  Hüseyniasiran Hexachord
+8-5-9-9  Hüseyni Pentachord
+9-4-9  Buselik, Nihâvend
+9-4-9-9  Buselik Pentachord
+9-5-8  Müstear Tetrachord
+9-5-8-9  Müstear Pentachord
+9-5-12 Neveser
+9-5-12-5  Nikriz Pentachord
+9-8-5  Turkish Rast Tetrachord
+9-8-5-9  Turkish Rast Pentachord
+9-9-4  Çargâh Tetrachord
+9-9-4-9  Çargâh Pentachord
+9-9-8-5  Pencgâh
+!
+! 72 tone chords:
+<SCALA_SCALE_DEF 2^(1/72)>
+!
+5-19-6  Xenakis Byzantine Liturgical Chromatic
+7-16-7  Xenakis Byzantine Liturgical Soft Chromatic
+12-11-7  Xenakis Byzantine Liturgical Diatonic
+!
+! The numbers between parentheses are the catalogue numbers in
+! John Chalmers: Divisions of the Tetrachord.
+! Miscellaneous chords:
+!
+14/13 8/7 13/12  Buzurg (390), Hijaz Tetrachord 13-Limit
+59/54 66/59 12/11  Dudon Tetrachord A
+13/12 59/52 64/59  Dudon Tetrachord B
+17/16 19/17 64/57  Finnamore Tetrachord
+9/8 12/11 88/81  Modern Rast, Avicenna (457)
+9/8 36/35 35/34 34/33 33/32 256/243  Al-Hwarizmi's tetrachord division
+!256/243 531441/524288 256/243 256/243 2187/2048 256/243  Al-Kindi's tetrachord division
+!
+<SCALA_NOTATION E144>
+C E\ G Bbv D.1 Fv.1 B\.1 Gb\.2 =Keenan's first Blackjack Chord 1
+C E\ G B\ D.1 Gb\.1 Bbv.1 Fv.2 =Keenan's first Blackjack Chord 2
+C E\ G Bbv B\ D.1 Fv.1 Gb\.1   =Keenan's first Blackjack Chord 3
+C E\ G Bbv D.1 Gb\.1 B\.1 Fv.2 =Keenan's first Blackjack Chord, Paul version
+C E^ G D.1 G#/.1 D#/.2 Gb\.2 A#/.2 =Keenan's second Blackjack Chord
+!
+! From John Chalmers: Divisions of the Tetrachord, 1993
+!
+16/15 15/14 7/6     Al-Farabi's Intense Chromatic (307)
+49/48 8/7 8/7       Al-Farabi's Diatonic (394)
+9/8 11/10 320/297   Al-Farabi's Diatonic (460)
+11/10 13/12 160/143 Al-Farabi (473)
+10/9 10/9 27/25     Al-Farabi's 10/9 Diatonic (475)
+11/10 13/12 160/143 Al-Farabi's Strong Disjunct
+28/27 36/35 5/4     Archytas' Enharmonic (106)
+28/27 243/224 32/27 Archytas' Chromatic (248)
+28/27 8/7 9/8       Archytas' Diatonic, Ptolemy's Diatonon Toniaion (393)
+40/39 26/25 5/4     Avicenna's (Ibn Sina) Enharmonic (108)
+36/35 10/9 7/6      Avicenna's Chromatic (311)
+14/13 13/12 8/7     Avicenna's Soft Diatonic (390)
+35/33 11/10 8/7     Avicenna (395)
+77/72 12/11 8/7     Avicenna (396)
+13/12 9/8 128/117   Avicenna (458)
+14/13 9/8 208/189   Avicenna (459)
+10/9 13/12 72/65    Avicenna (476)
+12/11 12/11 121/108 Avicenna (478)
+13/12 13/12 192/169 Avicenna (479)
+14/13 14/13 169/147 Avicenna (480)
+15/14 15/14 784/675 Avicenna (481)
+32/31 31/30 5/4     Didymos' Enharmonic (103)
+16/15 25/24 6/5     Didymos' Chromatic (215)
+16/15 10/9 9/8      Didymos' Diatonic (455)
+40/39 39/38 19/15   Eratostenes' Enharmonic (71)
+20/19 19/18 6/5     Eratostenes' Chromatic (212)
+256/243 9/8 9/8     Eratostenes' Diatonic, Pythagorean Diatonic, Ptolemy's Diatonon Ditoniaion (454)
+46/45 24/23 5/4     Ptolemy's Enharmonic (104)
+30/29 29/28 56/45   Ptolemy (121)
+80/77 77/74 37/30   Ptolemy (156)
+28/27 15/14 6/5     Ptolemy's Soft Chromatic (213)
+22/21 12/11 7/6     Ptolemy's Intense Chromatic (308)
+20/19 38/35 7/6     Ptolemy (310)
+21/20 10/9 8/7      Ptolemy's Diatonon Malakon, Soft Diatonic (392)
+20/19 19/17 17/15   Ptolemy (430)
+16/15 9/8 10/9      Ptolemy's Diatonon Syntonon, Intense Diatonic (455)
+12/11 11/10 10/9    Ptolemy's Diatonon Homalon, Equable Diatonic (474)
+256/243 2187/2048 32/27 Pythagorean Chromatic, Gaudentius (249)
+19/18 21/19 8/7     Safiyu-d-Din (391)
+64/59 59/54 9/8     Safiyu-d-Din (451)
+48/43 86/81 9/8     Safiyu-d-Din (452)
+40/39 13/12 6/5     Barbour (216)
+55/54 12/11 6/5     Barbour (217)
+27/26 13/12 32/27   Barbour? (247)
+64/63 9/8 7/6       Barbour Chromatic (312)
+512/499 499/486 81/64  Boethius Enharmonic (75)
+256/243 81/76 19/16 Boethius Chromatic (241)
+135/128 128/125 100/81  Daniélou (154)
+128/125 250/243 81/64  Euler (79)
+256/243 76/67 5427/4864  Euler (427)
+256/243 81/80 5/4   Fox-Strangways? (111)
+16/15 75/64 16/15   Helmholtz Chromatic (306), Tartini Neochromatic
+256/243 243/224 7/6 Hipkins (314)
+136/135 18/17 5/4   Hofmann (114)
+256/255 17/16 5/4   Hofmann (115)
+100/99 11/10 6/5    Hofmann (228)
+20/19 19/16 16/15   Kornerup (240)
+10/9 18/17 17/15    Kornerup (429)
+21/20 64/63 5/4     Pachymeres/Tartini Enharmonic (110)
+2187/2048 16777216/14348907 2187/2048  Palmer Tetrachord (482)
+121/108 9/8 128/121 Partch (469)
+10/9 63/55 22/21    Partch (572)
+21/20 200/189 6/5   Perrett (220)
+21/20 16/15 25/21   Perrett (235)
+21/20 15/14 32/27   Perrett Chromatic (253)
+243/230 230/216 32/27  Philolaus? (257)
+18/17 17/16 32/27   Quintilianus Chromatic (245)
+25/24 128/125 5/4   Salinas Enharmonic (109)
+48/47 47/46 23/18   Schlesinger (44)
+28/27 27/26 26/21   Schlesinger (135)
+16/15 30/29 29/24   Schlesinger (210)
+32/31 31/29 29/24   Schlesinger (211)
+19/18 12/11 22/19   Schlesinger (343)
+16/15 15/13 13/12   Schlesinger (362)
+24/23 23/20 10/9    Schlesinger (380)
+16/15 35/32 8/7     Vogel (397)
+36/35 256/243 315/256  Vogel (524)
+64/63 16/15 315/256 Vogel (525)
+100/99 66/65 13/10  Wilson (4)
+85/84 56/55 22/17   Wilson (12)
+56/55 55/54 9/7     Wilson (26)
+36/35 70/69 23/18   Wilson (45)
+30/29 116/115 23/18 Wilson (47)
+64/63 28/27 81/64   Wilson (80)
+57/56 28/27 24/19   Wilson (85)
+96/95 19/18 5/4     Wilson Enharmonic (113)
+23/22 22/21 28/23   Wilson Chromatic (190)
+52/51 85/78 6/5     Wilson (227)
+96/95 10/9 19/16    Wilson (242)
+66/65 10/9 13/11    Wilson (275)
+24/23 23/22 11/9    Winnington-Ingram (176)
+256/243 6/5 135/128 Xenakis (221)
+12/11 13/12 44/39   Young exquisite 3/4-tone Hellenic lyre (443)
+11/10 11/10 400/363 Quasi-Equal Diatonic (477)
+! More can be typed in from John Chalmers' book
+!
+! Aristoxenos' tetrachords:
+!
+50.0   50.0   400.0  Enharmonic (597)
+50.0   150.0  300.0  Chromatic/Enharmonic (621)
+50.0   250.0  200.0  Diatonic with Enharmonic Diesis (635)
+66.6667 66.6666 366.6667  Soft Chromatic (604)
+66.6667 133.3333 300.0  Unnamed 1:2 Chromatic (622)
+66.6667 233.3333 200.0  Diatonic with Soft Chromatic Diesis (643)
+75.0   75.0   350.0  Hemiolic Chromatic (610)
+75.0   225.0  200.0  Diatonic with Hemiolic Chromatic Diesis (647)
+83.3333 83.3334 333.3333  Parachromatic (615)
+100.0  100.0  300.0  Intense Chromatic (624)
+100.0  150.0  250.0  Soft Diatonic (638)
+! Intense Diatonic, see above
+166.6667 166.6666 166.6667  Equal Diatonic (658)
+!
+! Tiby's Greek Orthodox tetrachords
+<SCALA_SCALE_DEF 4/3^(1/28)>
+12-13-3  Tiby (659)
+12-5-11  Tiby (660)
+12-9-7  Tiby (661)
+9-12-7  Tiby (662)
+!
+<SCALA_SCALE_DEF 4/3^(1/3)>
+1-1-1  Semi-tempered Equal Diatonic (722)
+!
+<SCALA_SCALE_DEF 4/3^(1/10)>
+2-4-4  Semi-tempered Intense Diatonic (721)
+4-3-3  Semi-tempered Neutral Diatonic, Islamic Diatonic (723)

@@ -2,12 +2,14 @@ use alsa::seq::{EvNote, Event, EventType, PortCap, PortType, Seq};
 use alsa::Direction;
 use anyhow::{Context, Result};
 use log::info;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::hash::Hasher;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -96,6 +98,54 @@ fn install_signal_handlers() {
 }
 
 const C0_HZ: f64 = 16.351_597_831_287_414; // A4=440 reference, C0
+
+const LIVE_STATE_PATH: &str = "/tmp/xenwooting-live.json";
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveLayout {
+    id: String,
+    name: String,
+    edo: i32,
+    pitch_offset: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveMode {
+    press_threshold: f32,
+    aftertouch: String,
+    octave_shift: i8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveState {
+    version: u8,
+    ts_ms: u128,
+    layout: LiveLayout,
+    mode: LiveMode,
+    pressed: HashMap<String, Vec<i32>>,
+    layout_pitches: HashMap<String, Vec<Option<i32>>>,
+}
+
+fn write_file_atomic(path: &Path, text: &str) -> Result<()> {
+    let tmp = PathBuf::from(format!(
+        "{}.tmp-{}-{}",
+        path.display(),
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    {
+        let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(text.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        let _ = f.sync_all();
+    }
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
 
 // (analog_to_u7 helpers removed; aftertouch is peak-mapped like the Teensy firmware)
 
@@ -1052,6 +1102,135 @@ fn main() -> Result<()> {
     // Peak-tracked velocity state per key (device_id + HID).
     let mut vel_state: HashMap<(u64, HIDCodes), VelState> = HashMap::new();
 
+    // Live HUD state published for /wtn/live.
+    let live_state_path = PathBuf::from(LIVE_STATE_PATH);
+    let mut live_last_publish = Instant::now();
+    let mut live_last_hash: u64 = 0;
+
+    let compute_layout_pitches = |wtn: &Wtn,
+                                  edo: i32,
+                                  pitch_offset: i32,
+                                  octave_shift: i8|
+     -> HashMap<String, Vec<Option<i32>>> {
+        let mut out: HashMap<String, Vec<Option<i32>>> = HashMap::new();
+        for board in 0..=1u8 {
+            let mut pitches: Vec<Option<i32>> = Vec::with_capacity(56);
+            for idx in 0..56usize {
+                let Some(cell) = wtn.cell(board, idx) else {
+                    pitches.push(None);
+                    continue;
+                };
+                let base_ch = (cell.chan_1based.saturating_sub(1)) as i16;
+                let shifted = base_ch + (octave_shift as i16);
+                let out_ch = shifted.clamp(0, 15) as i32;
+                let pitch = out_ch * edo + (cell.key as i32) + pitch_offset;
+                pitches.push(Some(pitch));
+            }
+            out.insert(format!("Board{}", board), pitches);
+        }
+        out
+    };
+
+    let mut publish_live =
+        |wtn: &Wtn,
+         layouts: &Vec<xenwooting::config::LayoutConfig>,
+         layout_index: usize,
+         press_threshold_bits: &AtomicU32,
+         aftertouch_mode: &AftertouchMode,
+         octave_shift: i8,
+         board_by_device: &HashMap<u64, xenwooting::config::BoardConfig>,
+         vel_state: &HashMap<(u64, HIDCodes), VelState>| {
+            // Rate-limit: this is a HUD, not a high-rate telemetry stream.
+            if live_last_publish.elapsed() < Duration::from_millis(40) {
+                return;
+            }
+            live_last_publish = Instant::now();
+
+            let layout = match layouts.get(layout_index) {
+                Some(v) => v,
+                None => return,
+            };
+            let edo = layout.edo_divisions;
+            let pitch_offset = layout.pitch_offset;
+
+            let mut pressed0: HashSet<i32> = HashSet::new();
+            let mut pressed1: HashSet<i32> = HashSet::new();
+            for ((device_id, _hid), st) in vel_state.iter() {
+                let Some(bcfg) = board_by_device.get(device_id) else {
+                    continue;
+                };
+                let (out_ch, note, playing) = match st {
+                    VelState::Tracking {
+                        out_ch,
+                        note,
+                        playing,
+                        ..
+                    } => (*out_ch, *note, *playing),
+                    VelState::Aftershock {
+                        out_ch,
+                        note,
+                        playing,
+                        ..
+                    } => (*out_ch, *note, *playing),
+                };
+                if !playing {
+                    continue;
+                }
+                let pitch = (out_ch as i32) * edo + (note as i32) + pitch_offset;
+                if bcfg.wtn_board == 0 {
+                    pressed0.insert(pitch);
+                } else if bcfg.wtn_board == 1 {
+                    pressed1.insert(pitch);
+                }
+            }
+
+            let mut v0: Vec<i32> = pressed0.into_iter().collect();
+            let mut v1: Vec<i32> = pressed1.into_iter().collect();
+            v0.sort();
+            v1.sort();
+
+            let mut pressed: HashMap<String, Vec<i32>> = HashMap::new();
+            pressed.insert("Board0".to_string(), v0);
+            pressed.insert("Board1".to_string(), v1);
+
+            let layout_pitches = compute_layout_pitches(wtn, edo, pitch_offset, octave_shift);
+            let press_threshold = f32::from_bits(press_threshold_bits.load(Ordering::Relaxed));
+
+            let state = LiveState {
+                version: 1,
+                ts_ms: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                layout: LiveLayout {
+                    id: layout.id.clone(),
+                    name: layout.name.clone(),
+                    edo,
+                    pitch_offset,
+                },
+                mode: LiveMode {
+                    press_threshold,
+                    aftertouch: aftertouch_mode.name().to_string(),
+                    octave_shift,
+                },
+                pressed,
+                layout_pitches,
+            };
+
+            let text = match serde_json::to_string(&state) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(text.as_bytes());
+            let h = hasher.finish();
+            if h == live_last_hash {
+                return;
+            }
+            live_last_hash = h;
+            let _ = write_file_atomic(&live_state_path, &text);
+        };
+
     // RGB screensaver: blank LEDs after inactivity; wake on next key-down.
     // The wake key-down is ignored (no MIDI, no action binding).
     let mut screensaver_active = false;
@@ -1128,7 +1307,29 @@ fn main() -> Result<()> {
         }
     };
 
+    // Publish an initial live state so /wtn/live can load immediately.
+    publish_live(
+        &wtn,
+        &layouts,
+        layout_index,
+        press_threshold_bits.as_ref(),
+        &aftertouch_mode,
+        octave_shift,
+        &board_by_device,
+        &vel_state,
+    );
+
     while RUNNING.load(Ordering::SeqCst) {
+        publish_live(
+            &wtn,
+            &layouts,
+            layout_index,
+            press_threshold_bits.as_ref(),
+            &aftertouch_mode,
+            octave_shift,
+            &board_by_device,
+            &vel_state,
+        );
         // If a keyboard is plugged/unplugged, RGB device indices become available/change.
         // Repaint the base LEDs so newly connected boards immediately show the current layout.
         if rgb_enabled && last_rgb_check.elapsed() >= Duration::from_millis(250) {
@@ -1595,6 +1796,17 @@ fn main() -> Result<()> {
                 paint_off(&rgb_index_by_device_id);
                 screensaver_active = true;
             }
+
+            publish_live(
+                &wtn,
+                &layouts,
+                layout_index,
+                press_threshold_bits.as_ref(),
+                &aftertouch_mode,
+                octave_shift,
+                &board_by_device,
+                &vel_state,
+            );
             continue;
         }
 

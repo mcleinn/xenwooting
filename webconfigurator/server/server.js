@@ -5,6 +5,7 @@ import TOML from '@iarna/toml'
 
 import { formatWtn, readWtnFile, writeWtnFile } from './wtn.js'
 import { loadPlayableGeometry } from './geometry.js'
+import { findChordNames, loadScalaChordNamesDb } from './chords.js'
 
 const APP_BASE = '/wtn'
 const API_BASE = `${APP_BASE}/api`
@@ -28,7 +29,23 @@ const PREVIEW_ENABLED_PATH = process.env.XENWTN_PREVIEW_ENABLED_PATH || '/tmp/xe
 const PREVIEW_WTN_PATH = process.env.XENWTN_PREVIEW_WTN_PATH || '/tmp/xenwooting-preview.wtn'
 const HIGHLIGHT_PATH = process.env.XENWTN_HIGHLIGHT_PATH || '/tmp/xenwooting-highlight.txt'
 
+const LIVE_STATE_PATH = process.env.XENWTN_LIVE_STATE_PATH || '/tmp/xenwooting-live.json'
+
 const XENHARM_URL = process.env.XENHARM_URL || 'http://127.0.0.1:3199'
+
+const SCALA_CHORD_DB_PATH = path.resolve(new URL('./data/scala/chordnam.par', import.meta.url).pathname)
+let SCALA_CHORD_DB = null
+;(async () => {
+  try {
+    SCALA_CHORD_DB = await loadScalaChordNamesDb(SCALA_CHORD_DB_PATH)
+    // eslint-disable-next-line no-console
+    console.log(`Loaded Scala chord names: ${SCALA_CHORD_DB_PATH}`)
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn(`Failed to load chord names db (${SCALA_CHORD_DB_PATH}): ${String(e?.message || e)}`)
+    SCALA_CHORD_DB = null
+  }
+})()
 
 // Simple in-memory cache for note names.
 // key: `${edo}:${pitch}` -> { short, unicode, alts?: [{short, unicode}] } | null
@@ -432,6 +449,83 @@ app.post(`${API_BASE}/note-names`, async (req, res) => {
    }
 
   res.json({ edo, results })
+})
+
+app.post(`${API_BASE}/chord-names`, async (req, res) => {
+  const edo = Number.parseInt(String(req.body?.edo ?? ''), 10)
+  const pitchClasses = req.body?.pitchClasses
+  if (!Number.isInteger(edo) || edo < 1 || edo > 999) {
+    res.status(400).json({ error: 'Expected body: { edo: int >= 1, pitchClasses: int[] }' })
+    return
+  }
+  if (!Array.isArray(pitchClasses)) {
+    res.status(400).json({ error: 'Expected body: { edo: int, pitchClasses: int[] }' })
+    return
+  }
+  const pcs = []
+  for (const pc of pitchClasses) {
+    const n = Number.parseInt(String(pc), 10)
+    if (!Number.isFinite(n)) continue
+    pcs.push(n | 0)
+  }
+  const results = findChordNames(SCALA_CHORD_DB, edo, pcs)
+  res.json({ edo, results })
+})
+
+app.get(`${API_BASE}/live/state`, async (_req, res) => {
+  try {
+    const raw = await fs.readFile(LIVE_STATE_PATH, 'utf8')
+    const body = JSON.parse(raw)
+    res.json(body)
+  } catch (e) {
+    res.status(404).json({ error: `Live state not available (${LIVE_STATE_PATH})` })
+  }
+})
+
+// Server-sent events: streams the live state whenever it changes.
+app.get(`${API_BASE}/live/stream`, async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  res.flushHeaders?.()
+
+  let closed = false
+  req.on('close', () => {
+    closed = true
+  })
+
+  const sendState = async () => {
+    try {
+      const raw = await fs.readFile(LIVE_STATE_PATH, 'utf8')
+      // Validate JSON once so clients don't crash on partial writes.
+      const obj = JSON.parse(raw)
+      res.write(`event: state\n`)
+      res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    } catch {
+      // If missing/unreadable, just skip.
+    }
+  }
+
+  // Send immediately.
+  await sendState()
+
+  let lastMtimeMs = 0
+  const timer = setInterval(async () => {
+    if (closed) {
+      clearInterval(timer)
+      return
+    }
+    try {
+      const st = await fs.stat(LIVE_STATE_PATH)
+      const m = Number(st.mtimeMs || 0)
+      if (m && m !== lastMtimeMs) {
+        lastMtimeMs = m
+        await sendState()
+      }
+    } catch {
+      // ignore
+    }
+  }, 200)
 })
 
 app.get(`${API_BASE}/geometry`, async (_req, res) => {

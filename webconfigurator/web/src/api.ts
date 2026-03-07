@@ -91,6 +91,25 @@ export async function fetchNoteNames(
   return res.json()
 }
 
+export async function fetchLiveState(): Promise<unknown> {
+  const res = await fetch(apiUrl('api/live/state'))
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function fetchChordNames(
+  edo: number,
+  pitchClasses: number[],
+): Promise<{ edo: number; results: Array<{ rootPc: number; rel: number[]; pattern: string; names: string[] }> }> {
+  const res = await fetch(apiUrl('api/chord-names'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ edo, pitchClasses }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
 export async function addLayout(body: {
   name: string
   edoDivisions: number

@@ -1,0 +1,305 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import './LivePage.css'
+import { fetchChordNames, fetchNoteNames } from './api'
+
+type LiveState = {
+  version: number
+  ts_ms: number
+  layout: { id: string; name: string; edo: number; pitch_offset: number }
+  mode: { press_threshold: number; aftertouch: string; octave_shift: number }
+  pressed: { Board0?: number[]; Board1?: number[] }
+  layout_pitches: { Board0?: Array<number | null>; Board1?: Array<number | null> }
+}
+
+type NoteName = { short: string; unicode: string; alts?: Array<{ short: string; unicode: string }> }
+type ChordRootResult = { rootPc: number; rel: number[]; pattern: string; names: string[] }
+
+function apiUrl(path: string) {
+  return new URL(path.replace(/^\//, ''), window.location.href).toString()
+}
+
+function mod(n: number, m: number) {
+  const x = n % m
+  return x < 0 ? x + m : x
+}
+
+function englishInterval12(semitones: number): string {
+  // 0..11 only
+  const s = mod(semitones, 12)
+  switch (s) {
+    case 0:
+      return 'Unison'
+    case 1:
+      return 'Minor 2'
+    case 2:
+      return 'Major 2'
+    case 3:
+      return 'Minor 3'
+    case 4:
+      return 'Major 3'
+    case 5:
+      return 'Perfect 4'
+    case 6:
+      return 'Tritone'
+    case 7:
+      return 'Perfect 5'
+    case 8:
+      return 'Minor 6'
+    case 9:
+      return 'Major 6'
+    case 10:
+      return 'Minor 7'
+    case 11:
+      return 'Major 7'
+    default:
+      return ''
+  }
+}
+
+function formatNoteUnicode(v: NoteName | null | undefined) {
+  if (!v?.unicode) return ''
+  const alt = v.alts && v.alts.length ? v.alts[0]?.unicode : ''
+  return alt ? `${v.unicode}/${alt}` : v.unicode
+}
+
+function uniqSorted(nums: number[]) {
+  const s = new Set<number>()
+  for (const n of nums) s.add(n)
+  return Array.from(s.values()).sort((a, b) => a - b)
+}
+
+function fitText(el: HTMLElement, container: HTMLElement, startPx: number, minPx: number) {
+  let size = startPx
+  el.style.fontSize = `${size}px`
+  // Keep a little padding so it doesn't touch edges.
+  const maxW = container.clientWidth * 0.96
+  const maxH = container.clientHeight * 0.60
+  while (size > minPx && (el.scrollWidth > maxW || el.scrollHeight > maxH)) {
+    size -= 2
+    el.style.fontSize = `${size}px`
+  }
+}
+
+export default function LivePage() {
+  const [live, setLive] = useState<LiveState | null>(null)
+  const [view, setView] = useState<'notes' | 'pcs' | 'delta' | 'intervals'>('notes')
+  const [noteCache, setNoteCache] = useState<Map<string, NoteName | null>>(new Map())
+  const [chord, setChord] = useState<ChordRootResult[]>([])
+  const lastLayoutKey = useRef<string>('')
+  const fetchLock = useRef(false)
+
+  const mainWrapRef = useRef<HTMLDivElement | null>(null)
+  const mainTextRef = useRef<HTMLDivElement | null>(null)
+
+  // Subscribe to live state.
+  useEffect(() => {
+    let closed = false
+    const es = new EventSource(apiUrl('api/live/stream'))
+    es.addEventListener('state', (ev: MessageEvent) => {
+      if (closed) return
+      try {
+        const obj = JSON.parse(String(ev.data || 'null'))
+        if (obj && typeof obj === 'object') setLive(obj)
+      } catch {
+        // ignore
+      }
+    })
+    es.onerror = () => {
+      // EventSource will retry; keep silent.
+    }
+    return () => {
+      closed = true
+      es.close()
+    }
+  }, [])
+
+  const edo = live?.layout?.edo || 12
+  const pitchOffset = live?.layout?.pitch_offset || 0
+  const layoutName = live?.layout?.name || live?.layout?.id || 'Live'
+
+  const pressed = useMemo(() => {
+    const a = Array.isArray(live?.pressed?.Board0) ? live!.pressed.Board0! : []
+    const b = Array.isArray(live?.pressed?.Board1) ? live!.pressed.Board1! : []
+    return uniqSorted([...a, ...b])
+  }, [live])
+
+  const pitchClasses = useMemo(() => {
+    return uniqSorted(pressed.map((p) => mod(p, edo)))
+  }, [pressed, edo])
+
+  const pitchClassesKey = useMemo(() => pitchClasses.join(','), [pitchClasses])
+
+  // Prefetch note names for the current layout mapping (both boards), plus any currently pressed pitches.
+  useEffect(() => {
+    if (!live) return
+    const key = `${live.layout?.id || ''}:${edo}:${pitchOffset}`
+    const wantFull = key && key !== lastLayoutKey.current
+    const lp0 = Array.isArray(live.layout_pitches?.Board0) ? live.layout_pitches.Board0! : []
+    const lp1 = Array.isArray(live.layout_pitches?.Board1) ? live.layout_pitches.Board1! : []
+    const pitches: number[] = []
+
+    if (wantFull) {
+      for (const x of [...lp0, ...lp1]) {
+        if (typeof x === 'number' && Number.isFinite(x)) pitches.push(x)
+      }
+      lastLayoutKey.current = key
+    }
+
+    for (const p of pressed) pitches.push(p)
+    const uniq = uniqSorted(pitches)
+    if (uniq.length === 0) return
+
+    // Small lock so we don't run overlapping batches.
+    if (fetchLock.current) return
+    fetchLock.current = true
+
+    const batches: number[][] = []
+    for (let i = 0; i < uniq.length; i += 64) batches.push(uniq.slice(i, i + 64))
+
+    ;(async () => {
+      try {
+        for (const batch of batches) {
+          // Only fetch missing keys.
+          const missing = batch.filter((p) => !noteCache.has(`${edo}:${p}`))
+          if (missing.length === 0) continue
+          const r = await fetchNoteNames(edo, missing)
+          const results = r?.results || {}
+          setNoteCache((prev) => {
+            const next = new Map(prev)
+            for (const p of missing) {
+              const v = results[String(p)]
+              if (v && typeof v.unicode === 'string' && typeof v.short === 'string') next.set(`${edo}:${p}`, v)
+            }
+            return next
+          })
+        }
+      } finally {
+        fetchLock.current = false
+      }
+    })().catch(() => {
+      fetchLock.current = false
+    })
+  }, [live, edo, pitchOffset, pressed, noteCache])
+
+  // Fetch chord names (Scala db) for the combined pitch-class set.
+  useEffect(() => {
+    if (!live) return
+    if (pitchClasses.length === 0) {
+      setChord([])
+      return
+    }
+    fetchChordNames(edo, pitchClasses)
+      .then((r) => setChord(Array.isArray(r?.results) ? r.results : []))
+      .catch(() => {})
+  }, [live, edo, pitchClassesKey, pitchClasses])
+
+  const mainText = useMemo(() => {
+    if (pressed.length === 0) return ''
+    if (view === 'pcs') {
+      return pressed
+        .map((p) => mod(p, edo))
+        .sort((a, b) => a - b)
+        .join(' ')
+    }
+    if (view === 'delta') {
+      const rootPitch = pressed[0]
+      const rootPc = mod(rootPitch, edo)
+      const rootName = formatNoteUnicode(noteCache.get(`${edo}:${rootPitch}`) || null) || `pc${rootPc}`
+      const deltas = uniqSorted(pressed.map((p) => mod(p - rootPitch, edo))).filter((d) => d !== 0)
+      const parts = [`${rootName} (${rootPc})`, ...deltas.map((d) => `+${d}`)]
+      return parts.join(' ')
+    }
+    // notes / intervals
+    return pressed
+      .map((p) => formatNoteUnicode(noteCache.get(`${edo}:${p}`) || null) || String(p))
+      .join(' ')
+  }, [pressed, view, edo, noteCache])
+
+  const intervalLines = useMemo(() => {
+    if (pitchClasses.length < 2) return []
+    // chord[] includes one entry per possible root; keep them all.
+    const wantAllRoots = view === 'intervals'
+    const maxLines = wantAllRoots ? 8 : 4
+
+    // Derive a root pitch name per rootPc.
+    const rootPitchByPc = new Map<number, number>()
+    for (const p of pressed) {
+      const pc = mod(p, edo)
+      const cur = rootPitchByPc.get(pc)
+      if (cur === undefined || p < cur) rootPitchByPc.set(pc, p)
+    }
+
+    const out: string[] = []
+    const roots = chord.length ? chord : pitchClasses.map((rootPc) => ({ rootPc, rel: [], pattern: '', names: [] }))
+    for (const r of roots) {
+      if (out.length >= maxLines) break
+      const rootPitch = rootPitchByPc.get(r.rootPc)
+      const rootName =
+        rootPitch !== undefined ? formatNoteUnicode(noteCache.get(`${edo}:${rootPitch}`) || null) : `pc${r.rootPc}`
+
+      const rel = Array.isArray(r.rel) && r.rel.length ? r.rel : pitchClasses.map((pc) => mod(pc - r.rootPc, edo)).sort((a, b) => a - b)
+      const deltas = rel.filter((d) => d !== 0)
+      const deltaText = deltas
+        .map((d) => {
+          if (edo === 12) return `+${d} (${englishInterval12(d)})`
+          return `+${d}`
+        })
+        .join(' ')
+
+      const names = Array.isArray(r.names) ? r.names.filter(Boolean) : []
+      const nameText = names.length ? ` - ${names.join(', ')}` : ''
+      out.push(`${rootName} (${r.rootPc}): ${deltaText}${nameText}`.trim())
+    }
+    if (roots.length > maxLines) out.push('...')
+    return out
+  }, [pitchClasses, chord, pressed, edo, noteCache, view])
+
+  useEffect(() => {
+    const wrap = mainWrapRef.current
+    const el = mainTextRef.current
+    if (!wrap || !el) return
+    // Reset quickly then fit.
+    el.style.fontSize = '180px'
+    fitText(el, wrap, 180, 22)
+  }, [mainText])
+
+  useEffect(() => {
+    const onResize = () => {
+      const wrap = mainWrapRef.current
+      const el = mainTextRef.current
+      if (!wrap || !el) return
+      fitText(el, wrap, 180, 22)
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  const onToggleView = () => {
+    setView((v) => (v === 'notes' ? 'pcs' : v === 'pcs' ? 'delta' : v === 'delta' ? 'intervals' : 'notes'))
+  }
+
+  return (
+    <div className="liveRoot" onClick={onToggleView} onTouchStart={onToggleView}>
+      <div className="liveCorner liveTL">{layoutName}</div>
+      <div className="liveCorner liveTR">edo {edo} off {pitchOffset}</div>
+      <div className="liveCorner liveBL">thr {live?.mode?.press_threshold?.toFixed?.(2) ?? ''}</div>
+      <div className="liveCorner liveBR">
+        at {live?.mode?.aftertouch || ''} oct {live?.mode?.octave_shift ?? 0}
+      </div>
+
+      <div className="liveMain" ref={mainWrapRef}>
+        <div className="liveMainText" ref={mainTextRef}>
+          {mainText || ' '}
+        </div>
+        <div className="liveIntervals">
+          {intervalLines.map((l, i) => (
+            <div key={i} className="liveIntervalsLine">
+              {l}
+            </div>
+          ))}
+        </div>
+        <div className="liveHint">tap to change view: {view}</div>
+      </div>
+    </div>
+  )
+}

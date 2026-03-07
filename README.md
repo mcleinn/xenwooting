@@ -40,6 +40,7 @@ When the configurator server is running (default):
 
 - Configurator UI: `http://<host>:3174/wtn/`
 - Board geometry/debug page: `http://<host>:3174/wtn/boards`
+- Live HUD view: `http://<host>:3174/wtn/live`
 - Configurator API base: `http://<host>:3174/wtn/api/`
 
 The note-name service runs locally by default:
@@ -134,6 +135,7 @@ This project depends on and/or is inspired by:
 - MTS-ESP (ODDSound Ltd.)
 - xenharmlib (Fabian Vallon)
 - `.ltn` layout file format from the Lumatone ecosystem (used for import)
+- Scala chord-name database (`chordnam.par`) (Manuel Op de Coul)
 
 ## Utilities
 
