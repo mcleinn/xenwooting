@@ -47,6 +47,24 @@ let SCALA_CHORD_DB = null
   }
 })()
 
+// Best-effort: precompute approximation map for the currently active EDO.
+// This avoids extra work during play when chord names are requested.
+let LIVE_LAST_EDO = null
+setInterval(async () => {
+  if (!SCALA_CHORD_DB) return
+  try {
+    const raw = await fs.readFile(LIVE_STATE_PATH, 'utf8')
+    const obj = JSON.parse(raw)
+    const edo = Number.parseInt(String(obj?.layout?.edo ?? ''), 10)
+    if (!Number.isInteger(edo) || edo < 1 || edo > 999) return
+    if (LIVE_LAST_EDO === edo) return
+    LIVE_LAST_EDO = edo
+    SCALA_CHORD_DB.ensureApproxForEdo?.(edo)
+  } catch {
+    // ignore
+  }
+}, 1000)
+
 // Simple in-memory cache for note names.
 // key: `${edo}:${pitch}` -> { short, unicode, alts?: [{short, unicode}] } | null
 const NOTE_NAME_CACHE = new Map()

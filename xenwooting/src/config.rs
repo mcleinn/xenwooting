@@ -123,7 +123,7 @@ fn default_press_threshold() -> f32 {
 }
 
 fn default_press_threshold_step() -> f32 {
-    0.01
+    0.05
 }
 
 fn default_velocity_peak_track_ms() -> u32 {
