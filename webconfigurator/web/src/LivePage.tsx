@@ -67,6 +67,20 @@ function nameScore(name: string) {
   if (lower.includes('1st inversion')) score += 20
   if (lower.includes('3rd inversion')) score += 40
   if (lower.includes('4th inversion')) score += 50
+
+  // Prefer shorter, widely-readable names over very technical ones.
+  if (lower.startsWith('nm ')) score += 350
+  if (lower.includes('split fifth')) score += 180
+  if (lower.includes('|')) score += 90
+  if (lower.includes('quasi-')) score += 80
+  if (lower.includes('ultra-gothic')) score += 120
+  if (lower.includes('tredecimal')) score += 80
+  if (lower.includes('trevicesimal')) score += 80
+  if (lower.includes('bivalent')) score += 60
+  if (lower.includes('subfocal')) score += 60
+  if (lower.includes('isoharmonic')) score += 60
+  if (lower.includes('neo-medieval')) score += 100
+
   // Prefer shorter, cleaner names.
   score += Math.min(200, s.length)
   // Penalize very "busy" names a bit.
@@ -130,6 +144,13 @@ export default function LivePage() {
   const fetchLock = useRef(false)
   const lastSeq = useRef<number>(-1)
   const noteCacheRef = useRef(noteCache)
+
+  const [namesPopover, setNamesPopover] = useState<{ open: boolean; title: string; names: string[] }>({
+    open: false,
+    title: '',
+    names: [],
+  })
+  const popoverTimer = useRef<number | null>(null)
 
   const mainWrapRef = useRef<HTMLDivElement | null>(null)
   const mainTextRef = useRef<HTMLDivElement | null>(null)
@@ -281,9 +302,8 @@ export default function LivePage() {
 
   const intervalLines = useMemo(() => {
     if (pitchClasses.length < 2) return []
-    // chord[] includes one entry per possible root; keep them all.
+
     const wantAllRoots = view === 'intervals'
-    const maxLines = wantAllRoots ? 32 : 4
 
     // Derive a root pitch name per rootPc.
     const rootPitchByPc = new Map<number, number>()
@@ -293,25 +313,36 @@ export default function LivePage() {
       if (cur === undefined || p < cur) rootPitchByPc.set(pc, p)
     }
 
-    const out: string[] = []
     const rootsRaw: ChordRootResult[] = chord.length
       ? chord
       : pitchClasses.map((rootPc) => ({ rootPc, rel: [], pattern: '', names: [] }))
 
-    const roots = [...rootsRaw].sort((a, b) => {
+    const rootsSorted = [...rootsRaw].sort((a, b) => {
       const sa = rootResultScore(a)
       const sb = rootResultScore(b)
       if (sa !== sb) return sa - sb
       return a.rootPc - b.rootPc
     })
 
+    const withNames = rootsSorted.filter((r) => Array.isArray(r.names) && r.names.length > 0)
+    const roots = wantAllRoots ? (withNames.length ? withNames : rootsSorted.slice(0, 1)) : rootsSorted.slice(0, 1)
+
+    const out: Array<{
+      rootPc: number
+      rootName: string
+      deltaText: string
+      bestName: string
+      allNames: string[]
+    }> = []
+
     for (const r of roots) {
-      if (out.length >= maxLines) break
       const rootPitch = rootPitchByPc.get(r.rootPc)
       const rootName =
         rootPitch !== undefined ? formatNoteUnicode(noteCache.get(`${edo}:${rootPitch}`) || null) : `pc${r.rootPc}`
 
-      const rel = Array.isArray(r.rel) && r.rel.length ? r.rel : pitchClasses.map((pc) => mod(pc - r.rootPc, edo)).sort((a, b) => a - b)
+      const rel = Array.isArray(r.rel) && r.rel.length
+        ? r.rel
+        : pitchClasses.map((pc) => mod(pc - r.rootPc, edo)).sort((a, b) => a - b)
       const deltas = rel.filter((d) => d !== 0)
       const deltaText = deltas
         .map((d) => {
@@ -320,19 +351,36 @@ export default function LivePage() {
         })
         .join(' ')
 
-      const names = Array.isArray(r.names)
+      const allNames = Array.isArray(r.names)
         ? [...r.names].filter(Boolean).sort((a, b) => nameScore(a) - nameScore(b) || a.localeCompare(b))
         : []
+      const best = bestName(allNames)
 
-      // Only show the first few names inline to keep the HUD readable.
-      const shown = names.slice(0, 4)
-      const more = names.length > 4 ? ` (+${names.length - 4} more)` : ''
-      const nameText = shown.length ? ` - ${shown.join(', ')}${more}` : ''
-      out.push(`${rootName} (${r.rootPc}): ${deltaText}${nameText}`.trim())
+      out.push({ rootPc: r.rootPc, rootName, deltaText, bestName: best, allNames })
     }
-    if (roots.length > maxLines) out.push('...')
+
     return out
   }, [pitchClasses, chord, pressed, edo, noteCache, view])
+
+  const closePopover = () => {
+    if (popoverTimer.current !== null) {
+      window.clearTimeout(popoverTimer.current)
+      popoverTimer.current = null
+    }
+    if (namesPopover.open) setNamesPopover({ open: false, title: '', names: [] })
+  }
+
+  const openPopover = (title: string, names: string[]) => {
+    if (popoverTimer.current !== null) {
+      window.clearTimeout(popoverTimer.current)
+      popoverTimer.current = null
+    }
+    setNamesPopover({ open: true, title, names })
+    popoverTimer.current = window.setTimeout(() => {
+      popoverTimer.current = null
+      setNamesPopover({ open: false, title: '', names: [] })
+    }, 4000)
+  }
 
   useEffect(() => {
     const wrap = mainWrapRef.current
@@ -364,6 +412,10 @@ export default function LivePage() {
       onPointerUp={(e) => {
         // Avoid triggering twice on touch devices.
         e.preventDefault()
+        const t = e.target as HTMLElement | null
+        if (t?.closest('.liveIntervals')) return
+        if (t?.closest('.livePopover')) return
+        closePopover()
         onToggleView()
       }}
     >
@@ -379,14 +431,73 @@ export default function LivePage() {
           {mainText || ' '}
         </div>
         <div className="liveIntervals">
-          {intervalLines.map((l, i) => (
-            <div key={i} className="liveIntervalsLine">
-              {l}
-            </div>
-          ))}
+          {intervalLines.map((it) => {
+            const title = `${it.rootName} (${it.rootPc})`
+            const best = it.bestName
+            const moreCount = Math.max(0, it.allNames.length - (best ? 1 : 0))
+            const showMore = view !== 'intervals' && moreCount > 0
+
+            if (view === 'intervals') {
+              return (
+                <div key={it.rootPc} className="liveIntervalsLine liveChordBlock">
+                  <div className="liveChordHeader">
+                    {title}: {it.deltaText}
+                  </div>
+                  {it.allNames.map((n, i) => (
+                    <div key={i} className="liveChordName">
+                      {n}
+                    </div>
+                  ))}
+                </div>
+              )
+            }
+
+            return (
+              <div key={it.rootPc} className="liveIntervalsLine liveChordLine">
+                <span className="liveChordHeader">
+                  {title}: {it.deltaText}
+                </span>
+                {best ? <span className="liveChordBest"> - {best}</span> : null}
+                {showMore ? (
+                  <button
+                    className="liveMoreBtn"
+                    type="button"
+                    onPointerUp={(ev) => {
+                      ev.preventDefault()
+                      ev.stopPropagation()
+                      openPopover(`${title} alternatives`, it.allNames)
+                    }}
+                  >
+                    (+{moreCount})
+                  </button>
+                ) : null}
+              </div>
+            )
+          })}
         </div>
         <div className="liveHint">tap to change view: {view}</div>
       </div>
+
+      {namesPopover.open ? (
+        <div
+          className="livePopover"
+          onPointerUp={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            closePopover()
+          }}
+        >
+          <div className="livePopoverTitle">{namesPopover.title}</div>
+          <div className="livePopoverList">
+            {namesPopover.names.map((n, i) => (
+              <div key={i} className="livePopoverRow">
+                {n}
+              </div>
+            ))}
+          </div>
+          <div className="livePopoverHint">tap to close</div>
+        </div>
+      ) : null}
     </div>
   )
 }
