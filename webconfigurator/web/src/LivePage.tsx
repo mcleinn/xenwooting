@@ -288,7 +288,7 @@ export default function LivePage() {
       return pressed
         .map((p) => mod(p, edo))
         .sort((a, b) => a - b)
-        .join(' ')
+        .join('-')
     }
     if (view === 'delta') {
       const rootPitch = pressed[0]
