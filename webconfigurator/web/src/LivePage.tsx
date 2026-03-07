@@ -283,7 +283,7 @@ export default function LivePage() {
     if (pitchClasses.length < 2) return []
     // chord[] includes one entry per possible root; keep them all.
     const wantAllRoots = view === 'intervals'
-    const maxLines = wantAllRoots ? 8 : 4
+    const maxLines = wantAllRoots ? 32 : 4
 
     // Derive a root pitch name per rootPc.
     const rootPitchByPc = new Map<number, number>()
@@ -321,11 +321,13 @@ export default function LivePage() {
         .join(' ')
 
       const names = Array.isArray(r.names)
-        ? [...r.names]
-            .filter(Boolean)
-            .sort((a, b) => nameScore(a) - nameScore(b) || a.localeCompare(b))
+        ? [...r.names].filter(Boolean).sort((a, b) => nameScore(a) - nameScore(b) || a.localeCompare(b))
         : []
-      const nameText = names.length ? ` - ${names.join(', ')}` : ''
+
+      // Only show the first few names inline to keep the HUD readable.
+      const shown = names.slice(0, 4)
+      const more = names.length > 4 ? ` (+${names.length - 4} more)` : ''
+      const nameText = shown.length ? ` - ${shown.join(', ')}${more}` : ''
       out.push(`${rootName} (${r.rootPc}): ${deltaText}${nameText}`.trim())
     }
     if (roots.length > maxLines) out.push('...')

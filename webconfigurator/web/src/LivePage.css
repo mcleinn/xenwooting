@@ -35,15 +35,20 @@
   font-size: 18px;
   line-height: 1.2;
   color: rgba(255, 255, 255, 0.82);
+  /* If there are many chord interpretations, allow finger scrolling. */
+  max-height: 28vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 6px 10px;
 }
 
-/* Interval lines include Unicode note names; render with Bravura. */
 .liveIntervalsLine {
+  /* Interval lines include Unicode note names; render with Bravura. */
   font-family: 'Bravura', 'Bravura Text', ui-sans-serif, system-ui, sans-serif;
-}
-
-.liveIntervalsLine {
   white-space: pre-wrap;
+  user-select: none;
+  padding: 2px 0;
 }
 
 .liveCorner {
