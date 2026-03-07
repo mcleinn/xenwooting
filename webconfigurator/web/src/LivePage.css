@@ -5,6 +5,7 @@
   color: #fff;
   overflow: hidden;
   -webkit-tap-highlight-color: transparent;
+  user-select: none;
 }
 
 .liveMain {
