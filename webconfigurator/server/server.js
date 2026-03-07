@@ -485,7 +485,10 @@ app.get(`${API_BASE}/live/state`, async (_req, res) => {
 // Server-sent events: streams the live state whenever it changes.
 app.get(`${API_BASE}/live/stream`, async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream')
-  res.setHeader('Cache-Control', 'no-cache')
+  // Important: SSE must not be transformed or buffered by proxies.
+  res.setHeader('Cache-Control', 'no-cache, no-transform')
+  // Nginx-style hint; harmless elsewhere.
+  res.setHeader('X-Accel-Buffering', 'no')
   res.setHeader('Connection', 'keep-alive')
   res.flushHeaders?.()
 
