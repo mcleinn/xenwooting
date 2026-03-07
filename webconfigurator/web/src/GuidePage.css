@@ -1,0 +1,339 @@
+.guideRoot {
+  min-height: 100vh;
+  background: radial-gradient(900px 500px at 15% 10%, rgba(255, 255, 255, 0.08), transparent 60%),
+    radial-gradient(800px 500px at 80% 0%, rgba(255, 255, 255, 0.06), transparent 55%),
+    linear-gradient(180deg, #0b0f14, #070a0d);
+  color: rgba(255, 255, 255, 0.92);
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  color-scheme: dark;
+}
+
+.guideTop {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(8, 10, 12, 0.78);
+  backdrop-filter: blur(10px);
+}
+
+.guideTitle {
+  font-weight: 750;
+  letter-spacing: 0.2px;
+}
+
+.guideControls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.gField {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.gLabel {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.gSelect {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.92);
+  padding: 7px 10px;
+  border-radius: 10px;
+  color-scheme: dark;
+}
+
+.gSelect option {
+  background: #0b0f14;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.gBtn,
+.gBtnSecondary {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.92);
+  padding: 7px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.gBtnSecondary {
+  background: rgba(96, 165, 250, 0.14);
+  border-color: rgba(96, 165, 250, 0.26);
+}
+
+.gBtn:disabled,
+.gBtnSecondary:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.guideMain {
+  padding: 16px;
+  max-width: 1150px;
+  margin: 0 auto;
+}
+
+.guideMeta {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 14px;
+  padding: 14px 14px;
+  margin-bottom: 14px;
+}
+
+.guideMetaTitle {
+  font-weight: 700;
+}
+
+.guideMetaRow {
+  margin-top: 6px;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.guideBad {
+  color: rgba(248, 113, 113, 0.92);
+}
+
+.guideSections {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.acc {
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+}
+
+.accSum {
+  cursor: pointer;
+  padding: 12px 14px;
+  font-weight: 700;
+  list-style: none;
+}
+
+.accSum::-webkit-details-marker {
+  display: none;
+}
+
+.accBody {
+  padding: 12px 12px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.chAcc {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+  margin-bottom: 10px;
+  break-inside: avoid;
+}
+
+.chSum {
+  cursor: pointer;
+  list-style: none;
+  padding: 12px 12px;
+  font-weight: 750;
+}
+
+.chSum::-webkit-details-marker {
+  display: none;
+}
+
+.chBody {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 12px;
+}
+
+.chordBlock {
+  padding: 0;
+}
+
+.chordTitle {
+  font-weight: 750;
+  font-size: 14px;
+}
+
+.chordSub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.namesAcc {
+  margin-top: 8px;
+  border: 1px dashed rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  padding: 8px 10px;
+}
+
+.namesSum {
+  cursor: pointer;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.8);
+  list-style: none;
+}
+
+.namesSum::-webkit-details-marker {
+  display: none;
+}
+
+.namesBody {
+  margin-top: 8px;
+}
+
+.nameRow {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
+  padding: 2px 0;
+}
+
+.invWrap {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.invAcc {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.02);
+  break-inside: avoid;
+}
+
+.invSum {
+  cursor: pointer;
+  list-style: none;
+  padding: 10px 10px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.84);
+}
+
+.invSum::-webkit-details-marker {
+  display: none;
+}
+
+.invBody {
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 10px;
+}
+
+.patRow {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  align-items: start;
+}
+
+.patCard {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.18);
+  break-inside: avoid;
+}
+
+.patActions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.invMore {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.hexSvg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.hexEdge {
+  stroke: rgba(255, 255, 255, 0.18);
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.hexDot {
+  stroke-width: 2;
+}
+
+.hexRing {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.85);
+  stroke-width: 2.5;
+}
+
+.empty {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.64);
+  padding: 8px;
+}
+
+@media print {
+  .guideTop {
+    position: static;
+    background: transparent;
+    border-bottom: 0;
+    backdrop-filter: none;
+  }
+  .gBtn,
+  .gBtnSecondary,
+  .gSelect {
+    display: none;
+  }
+  .acc,
+  .chordBlock,
+  .invAcc,
+  .patCard {
+    break-inside: avoid;
+  }
+  .guideRoot {
+    background: #ffffff;
+    color: #000000;
+  }
+  .guideMeta {
+    background: transparent;
+    border-color: rgba(0, 0, 0, 0.16);
+  }
+  .acc {
+    background: transparent;
+    border-color: rgba(0, 0, 0, 0.14);
+  }
+  .chordBlock {
+    background: transparent;
+    border-color: rgba(0, 0, 0, 0.14);
+  }
+  .invAcc {
+    background: transparent;
+    border-color: rgba(0, 0, 0, 0.14);
+  }
+  .hexEdge {
+    stroke: rgba(0, 0, 0, 0.22);
+  }
+  .hexRing {
+    stroke: rgba(0, 0, 0, 0.65);
+  }
+}

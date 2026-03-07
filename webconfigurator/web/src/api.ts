@@ -1,20 +1,33 @@
 import type { Boards, Geometry, LayoutDetail, LayoutInfo } from './types'
 
 function apiUrl(path: string) {
-  // Served under /wtn/ (Vite base). Keep requests relative.
-  return new URL(path.replace(/^\//, ''), window.location.href).toString()
+  // Always resolve from /wtn/ so /wtn, /wtn/live, /wtn/guide behave the same.
+  return new URL(path.replace(/^\//, ''), `${window.location.origin}/wtn/`).toString()
+}
+
+async function readJsonOrThrow(res: Response) {
+  const text = await res.text()
+  try {
+    return JSON.parse(text)
+  } catch {
+    const snip = text.slice(0, 120).replace(/\s+/g, ' ')
+    if (snip.toLowerCase().startsWith('<!doctype') || snip.toLowerCase().startsWith('<html')) {
+      throw new Error(`API returned HTML (server not restarted / dev proxy issue): ${snip}`)
+    }
+    throw new Error(`API returned non-JSON: ${snip}`)
+  }
 }
 
 export async function fetchLayouts(): Promise<{ layouts: LayoutInfo[] }> {
   const res = await fetch(apiUrl('api/layouts'))
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
 }
 
 export async function fetchLayout(id: string): Promise<LayoutDetail> {
   const res = await fetch(apiUrl(`api/layout/${encodeURIComponent(id)}`))
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
 }
 
 export async function saveLayout(
@@ -28,7 +41,7 @@ export async function saveLayout(
   })
   if (!res.ok) throw new Error(await res.text())
 
-  const body = await res.json().catch(() => null)
+  const body = await readJsonOrThrow(res).catch(() => null)
   return {
     xenwootingReloaded: Boolean(body?.xenwootingReloaded),
     xenwootingReloadError: body?.xenwootingReloadError || null,
@@ -38,7 +51,7 @@ export async function saveLayout(
 export async function fetchGeometry(): Promise<Geometry> {
   const res = await fetch(apiUrl('api/geometry'))
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
 }
 
 export async function previewEnable(layoutId: string, boards: Boards): Promise<void> {
@@ -88,13 +101,13 @@ export async function fetchNoteNames(
     body: JSON.stringify({ edo, pitches }),
   })
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
 }
 
 export async function fetchLiveState(): Promise<unknown> {
   const res = await fetch(apiUrl('api/live/state'))
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
 }
 
 export async function fetchChordNames(
@@ -107,7 +120,27 @@ export async function fetchChordNames(
     body: JSON.stringify({ edo, pitchClasses }),
   })
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
+}
+
+export async function fetchLayoutIsomorphic(id: string): Promise<{ layoutId: string; ok: boolean; edo: number; dq: number | null; dr: number | null; axis3: number | null; reason: string | null }> {
+  const res = await fetch(apiUrl(`api/layout/${encodeURIComponent(id)}/isomorphic`))
+  if (!res.ok) throw new Error(await res.text())
+  return readJsonOrThrow(res)
+}
+
+export async function fetchChordCatalogue(
+  edo: number,
+  opts?: { limit?: number; minTones?: number; maxTones?: number },
+): Promise<{ edo: number; results: Array<{ pcsRoot: number[]; pattern: string; bestName: string; allNames: string[] }> }> {
+  const q = new URLSearchParams()
+  q.set('edo', String(edo))
+  if (opts?.limit) q.set('limit', String(opts.limit))
+  if (opts?.minTones) q.set('minTones', String(opts.minTones))
+  if (opts?.maxTones) q.set('maxTones', String(opts.maxTones))
+  const res = await fetch(apiUrl(`api/chord-catalogue?${q.toString()}`))
+  if (!res.ok) throw new Error(await res.text())
+  return readJsonOrThrow(res)
 }
 
 export async function addLayout(body: {
@@ -121,7 +154,7 @@ export async function addLayout(body: {
     body: JSON.stringify(body),
   })
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
 }
 
 export async function updateLayoutSettings(
@@ -137,7 +170,7 @@ export async function updateLayoutSettings(
     body: JSON.stringify(body),
   })
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
 }
 
 export async function deleteLayout(id: string): Promise<{ ok: true; nextId: string }> {
@@ -145,5 +178,5 @@ export async function deleteLayout(id: string): Promise<{ ok: true; nextId: stri
     method: 'DELETE',
   })
   if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  return readJsonOrThrow(res)
 }

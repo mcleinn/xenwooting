@@ -10,6 +10,59 @@ import fs from 'node:fs/promises'
 const APPROX_MAX_ERR_CENTS = 15
 const APPROX_SHOW_ERR_OVER_CENTS = 3
 
+// Keep scoring compatible with the live HUD sorting.
+export function nameScore(name) {
+  const s = String(name || '')
+  const lower = s.toLowerCase()
+  let score = 0
+
+  // Prefer exact EDO12-embedded names when present.
+  if (lower.includes('-edo12')) score -= 800
+
+  // Prefer conventional major/minor triad names over overtone/undertone jargon.
+  if (lower.includes('major triad')) score -= 1200
+  if (lower.includes('minor triad')) score -= 1200
+  if (lower.includes('overtone')) score += 500
+  if (lower.includes('undertone')) score += 500
+
+  // Prefer exact / unqualified names over approximations with cents error.
+  if (lower.match(/~\d+c\b/)) score += 220
+
+  if (lower.includes('inversion')) score += 1000
+  if (lower.includes('2nd inversion')) score += 30
+  if (lower.includes('1st inversion')) score += 20
+  if (lower.includes('3rd inversion')) score += 40
+  if (lower.includes('4th inversion')) score += 50
+
+  // Prefer shorter, widely-readable names over very technical ones.
+  if (lower.startsWith('nm ')) score += 350
+  if (lower.includes('split fifth')) score += 180
+  if (lower.includes('|')) score += 90
+  if (lower.includes('quasi-')) score += 80
+  if (lower.includes('ultra-gothic')) score += 120
+  if (lower.includes('tredecimal')) score += 80
+  if (lower.includes('trevicesimal')) score += 80
+  if (lower.includes('bivalent')) score += 60
+  if (lower.includes('subfocal')) score += 60
+  if (lower.includes('isoharmonic')) score += 60
+  if (lower.includes('neo-medieval')) score += 100
+
+  // Prefer shorter, cleaner names.
+  score += Math.min(200, s.length)
+  // Penalize very "busy" names a bit.
+  score += (s.match(/[()"']/g) || []).length * 8
+  score += (s.match(/,/g) || []).length * 4
+  return score
+}
+
+export function bestName(names) {
+  if (!Array.isArray(names) || names.length === 0) return ''
+  const sorted = [...names]
+    .filter(Boolean)
+    .sort((a, b) => nameScore(a) - nameScore(b) || String(a).localeCompare(String(b)))
+  return sorted[0] || ''
+}
+
 function mod(n, m) {
   const x = n % m
   return x < 0 ? x + m : x
@@ -31,6 +84,22 @@ function stepPatternFromRelPcs(rel) {
   const steps = []
   for (let i = 1; i < rel.length; i++) steps.push(rel[i] - rel[i - 1])
   return steps.join('-')
+}
+
+function relPcsFromStepPattern(edo, pattern) {
+  const steps = String(pattern)
+    .split('-')
+    .map((x) => Number.parseInt(x, 10))
+    .filter((x) => Number.isFinite(x) && x > 0)
+  if (steps.length === 0) return []
+  const rel = [0]
+  let acc = 0
+  for (const s of steps) {
+    acc += s
+    // Scala patterns should stay within the octave; guard anyway.
+    rel.push(normPc(edo, acc))
+  }
+  return uniqSorted(rel)
 }
 
 function stepPatternFromPcs(edo, rootPc, pcs) {
@@ -214,7 +283,10 @@ export async function loadScalaChordNamesDb(filePath) {
 
     if (!embed12ByEdo.has(targetEdo)) {
       const m = new Map()
-      if (targetEdo % 12 === 0 && patterns12.size) {
+      // For EDOs divisible by 12, embed 12-EDO step patterns as exact equivalents.
+      // For EDO=12 itself this is redundant (it would produce duplicate -EDO12 names),
+      // so skip it.
+      if (targetEdo !== 12 && targetEdo % 12 === 0 && patterns12.size) {
         const f = targetEdo / 12
         for (const [pat12, names12] of patterns12.entries()) {
           const steps12 = String(pat12)
@@ -249,7 +321,7 @@ export function findChordNames(db, edo, pitchClasses) {
   if (!db || !db.byEdoExact) return []
   db.ensureForEdo?.(edo)
   const patternsExact = db.byEdoExact.get(edo) || new Map()
-  const patternsEmbed12 = db.embed12ByEdo?.get(edo) || new Map()
+  const patternsEmbed12 = edo === 12 ? new Map() : db.embed12ByEdo?.get(edo) || new Map()
   const patternsApprox = db.approxByEdo?.get(edo) || new Map()
 
   const pcs = []
@@ -278,4 +350,80 @@ export function findChordNames(db, edo, pitchClasses) {
     out.push({ rootPc, rel, pattern, names })
   }
   return out
+}
+
+export function buildChordCatalogue(db, edo, opts = {}) {
+  if (!db || !db.byEdoExact) return { edo, results: [] }
+  const e = Number.parseInt(String(edo ?? ''), 10)
+  if (!Number.isInteger(e) || e < 1 || e > 999) return { edo: e, results: [] }
+
+  db.ensureForEdo?.(e)
+  const patternsExact = db.byEdoExact.get(e) || new Map()
+  const patternsEmbed12 = e === 12 ? new Map() : db.embed12ByEdo?.get(e) || new Map()
+  const patternsApprox = db.approxByEdo?.get(e) || new Map()
+
+  const maxTones = Number.parseInt(String(opts.maxTones ?? 4), 10)
+  const minTones = Number.parseInt(String(opts.minTones ?? 3), 10)
+  const limit = Number.parseInt(String(opts.limit ?? 250), 10)
+
+  /** @type {Map<string, { pattern:string, pcsRoot:number[], names:string[] }>} */
+  const byPcsKey = new Map()
+
+  const allPatterns = new Set()
+  for (const k of patternsExact.keys()) allPatterns.add(k)
+  for (const k of patternsEmbed12.keys()) allPatterns.add(k)
+  for (const k of patternsApprox.keys()) allPatterns.add(k)
+
+  for (const pattern of allPatterns.values()) {
+    const pcsRoot = relPcsFromStepPattern(e, pattern)
+    if (!pcsRoot.length) continue
+    if (pcsRoot[0] !== 0) continue
+    if (pcsRoot.length < minTones || pcsRoot.length > maxTones) continue
+
+    const names0 = patternsExact.get(pattern) || []
+    const namesE = patternsEmbed12.get(pattern) || []
+    const names1 = patternsApprox.get(pattern) || []
+    const names = [...names0]
+    for (const n of namesE) if (!names.includes(n)) names.push(n)
+    for (const n of names1) if (!names.includes(n)) names.push(n)
+
+    const key = pcsRoot.join(',')
+    const prev = byPcsKey.get(key)
+    if (!prev) {
+      byPcsKey.set(key, { pattern: String(pattern), pcsRoot, names })
+    } else {
+      // Merge names; keep the earlier pattern string.
+      for (const n of names) if (!prev.names.includes(n)) prev.names.push(n)
+    }
+  }
+
+  const out = []
+  for (const v of byPcsKey.values()) {
+    let allNames = [...v.names].filter(Boolean)
+    if (e === 12) {
+      // In 12-EDO, hide redundant -EDO12 suffix variants.
+      allNames = allNames.filter((n) => !String(n).toLowerCase().endsWith('-edo12'))
+      // Also dedupe: keep only one of (X) vs (X-EDO12) if both slipped in.
+      const set = new Set(allNames.map((n) => String(n)))
+      allNames = allNames.filter((n) => {
+        const s = String(n)
+        if (set.has(`${s}-EDO12`)) return true
+        return true
+      })
+    }
+
+    allNames = allNames.sort((a, b) => nameScore(a) - nameScore(b) || String(a).localeCompare(String(b)))
+    const bn = bestName(allNames)
+    out.push({ pcsRoot: v.pcsRoot, pattern: v.pattern, bestName: bn, allNames })
+  }
+
+  out.sort((a, b) => {
+    const sa = nameScore(a.bestName)
+    const sb = nameScore(b.bestName)
+    if (sa !== sb) return sa - sb
+    if (a.pcsRoot.length !== b.pcsRoot.length) return a.pcsRoot.length - b.pcsRoot.length
+    return a.bestName.localeCompare(b.bestName)
+  })
+
+  return { edo: e, results: out.slice(0, Number.isFinite(limit) ? Math.max(1, limit) : 250) }
 }

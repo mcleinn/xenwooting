@@ -66,6 +66,15 @@ function nameScore(name: string) {
   // Prefer exact EDO12-embedded names when present.
   if (lower.includes('-edo12')) score -= 800
 
+  // Prefer conventional major/minor triad names.
+  if (lower.includes('major triad')) score -= 1200
+  if (lower.includes('minor triad')) score -= 1200
+  if (lower.includes('overtone')) score += 500
+  if (lower.includes('undertone')) score += 500
+
+  // Prefer exact / unqualified names over approximations with cents error.
+  if (lower.match(/~\d+c\b/)) score += 220
+
   if (lower.includes('inversion')) score += 1000
   if (lower.includes('2nd inversion')) score += 30
   if (lower.includes('1st inversion')) score += 20

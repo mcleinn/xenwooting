@@ -5,7 +5,8 @@ import TOML from '@iarna/toml'
 
 import { formatWtn, readWtnFile, writeWtnFile } from './wtn.js'
 import { loadPlayableGeometry } from './geometry.js'
-import { findChordNames, loadScalaChordNamesDb } from './chords.js'
+import { buildChordCatalogue, findChordNames, loadScalaChordNamesDb } from './chords.js'
+import { computeSharedIsomorphicAxisSteps } from './isomorphic.js'
 
 const APP_BASE = '/wtn'
 const API_BASE = `${APP_BASE}/api`
@@ -214,6 +215,31 @@ app.get(`${API_BASE}/layout/:id`, async (req, res) => {
       pitchOffset: Number(layout.pitch_offset ?? 0),
       boards,
     })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+app.get(`${API_BASE}/layout/:id/isomorphic`, async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const raw = await fs.readFile(CONFIG_TOML, 'utf8')
+    const cfg = TOML.parse(raw)
+    const layout = (Array.isArray(cfg.layouts) ? cfg.layouts : []).find((l) => String(l.id) === id)
+    if (!layout) {
+      res.status(404).json({ error: `Unknown layout id: ${id}` })
+      return
+    }
+
+    const wtnPathRel = String(layout.wtn_path || '')
+    const wtnPathAbs = path.join(CONFIG_DIR, wtnPathRel)
+    const boards = await readWtnFile(wtnPathAbs)
+    const edo = Number(layout.edo_divisions ?? 12)
+    const pitchOffset = Number(layout.pitch_offset ?? 0)
+
+    const geom = await loadPlayableGeometry(GEOMETRY_JSON)
+    const iso = computeSharedIsomorphicAxisSteps({ geometryKeys: geom, boards, edo, pitchOffset })
+    res.json({ layoutId: id, ok: Boolean(iso?.ok), edo: iso?.edo ?? edo, dq: iso?.dq ?? null, dr: iso?.dr ?? null, axis3: iso?.axis3 ?? null, reason: iso?.reason || null })
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })
   }
@@ -488,6 +514,25 @@ app.post(`${API_BASE}/chord-names`, async (req, res) => {
   }
   const results = findChordNames(SCALA_CHORD_DB, edo, pcs)
   res.json({ edo, results })
+})
+
+app.get(`${API_BASE}/chord-catalogue`, async (req, res) => {
+  const edo = Number.parseInt(String(req.query?.edo ?? ''), 10)
+  const limit = Number.parseInt(String(req.query?.limit ?? 250), 10)
+  const minTones = Number.parseInt(String(req.query?.minTones ?? 3), 10)
+  const maxTones = Number.parseInt(String(req.query?.maxTones ?? 4), 10)
+
+  if (!Number.isInteger(edo) || edo < 1 || edo > 999) {
+    res.status(400).json({ error: 'Expected query: edo=int>=1' })
+    return
+  }
+  if (!SCALA_CHORD_DB) {
+    res.status(500).json({ error: 'Chord db not loaded' })
+    return
+  }
+
+  const body = buildChordCatalogue(SCALA_CHORD_DB, edo, { limit, minTones, maxTones })
+  res.json(body)
 })
 
 app.get(`${API_BASE}/live/state`, async (_req, res) => {
