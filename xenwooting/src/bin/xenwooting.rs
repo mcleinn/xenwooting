@@ -119,7 +119,8 @@ struct LiveMode {
 #[derive(Debug, Clone, Serialize)]
 struct LiveState {
     version: u8,
-    ts_ms: u128,
+    seq: u64,
+    ts_ms: u64,
     layout: LiveLayout,
     mode: LiveMode,
     pressed: HashMap<String, Vec<i32>>,
@@ -1104,8 +1105,13 @@ fn main() -> Result<()> {
 
     // Live HUD state published for /wtn/live.
     let live_state_path = PathBuf::from(LIVE_STATE_PATH);
+    let mut live_seq: u64 = 0;
+    let mut live_last_ts_ms: u64 = 0;
     let mut live_last_publish = Instant::now();
     let mut live_last_hash: u64 = 0;
+    let mut live_layout_key: String = String::new();
+    let mut live_layout_pitches: HashMap<String, Vec<Option<i32>>> = HashMap::new();
+    let mut live_layout_pitches_hash: u64 = 0;
 
     let compute_layout_pitches = |wtn: &Wtn,
                                   edo: i32,
@@ -1140,12 +1146,6 @@ fn main() -> Result<()> {
          octave_shift: i8,
          board_by_device: &HashMap<u64, xenwooting::config::BoardConfig>,
          vel_state: &HashMap<(u64, HIDCodes), VelState>| {
-            // Rate-limit: this is a HUD, not a high-rate telemetry stream.
-            if live_last_publish.elapsed() < Duration::from_millis(40) {
-                return;
-            }
-            live_last_publish = Instant::now();
-
             let layout = match layouts.get(layout_index) {
                 Some(v) => v,
                 None => return,
@@ -1153,27 +1153,45 @@ fn main() -> Result<()> {
             let edo = layout.edo_divisions;
             let pitch_offset = layout.pitch_offset;
 
+            // Recompute layout pitch list only when layout/shift changes.
+            let cur_layout_key = format!(
+                "{}:{}:{}:{}",
+                layout.id, layout.edo_divisions, layout.pitch_offset, octave_shift
+            );
+            if cur_layout_key != live_layout_key {
+                live_layout_key = cur_layout_key;
+                live_layout_pitches = compute_layout_pitches(wtn, edo, pitch_offset, octave_shift);
+                let mut hh = std::collections::hash_map::DefaultHasher::new();
+                for k in ["Board0", "Board1"] {
+                    hh.write(k.as_bytes());
+                    if let Some(v) = live_layout_pitches.get(k) {
+                        for x in v.iter() {
+                            match x {
+                                Some(n) => hh.write_i32(*n),
+                                None => hh.write_i32(i32::MIN),
+                            }
+                        }
+                    }
+                }
+                live_layout_pitches_hash = hh.finish();
+            }
+
             let mut pressed0: HashSet<i32> = HashSet::new();
             let mut pressed1: HashSet<i32> = HashSet::new();
             for ((device_id, _hid), st) in vel_state.iter() {
                 let Some(bcfg) = board_by_device.get(device_id) else {
                     continue;
                 };
-                let (out_ch, note, playing) = match st {
-                    VelState::Tracking {
-                        out_ch,
-                        note,
-                        playing,
-                        ..
-                    } => (*out_ch, *note, *playing),
+                let (out_ch, note, is_pressed) = match st {
+                    VelState::Tracking { out_ch, note, .. } => (*out_ch, *note, true),
                     VelState::Aftershock {
+                        quiet_since,
                         out_ch,
                         note,
-                        playing,
                         ..
-                    } => (*out_ch, *note, *playing),
+                    } => (*out_ch, *note, quiet_since.is_none()),
                 };
-                if !playing {
+                if !is_pressed {
                     continue;
                 }
                 let pitch = (out_ch as i32) * edo + (note as i32) + pitch_offset;
@@ -1193,15 +1211,43 @@ fn main() -> Result<()> {
             pressed.insert("Board0".to_string(), v0);
             pressed.insert("Board1".to_string(), v1);
 
-            let layout_pitches = compute_layout_pitches(wtn, edo, pitch_offset, octave_shift);
             let press_threshold = f32::from_bits(press_threshold_bits.load(Ordering::Relaxed));
+
+            // Hash only the meaningful content; ts_ms/seq should not cause spurious updates.
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(live_layout_key.as_bytes());
+            hasher.write_u64(live_layout_pitches_hash);
+            hasher.write_u32(press_threshold.to_bits());
+            hasher.write(aftertouch_mode.name().as_bytes());
+            hasher.write_i8(octave_shift);
+            for p in pressed.get("Board0").into_iter().flatten() {
+                hasher.write_i32(*p);
+            }
+            hasher.write_u8(0);
+            for p in pressed.get("Board1").into_iter().flatten() {
+                hasher.write_i32(*p);
+            }
+            let h = hasher.finish();
+            if h == live_last_hash {
+                return;
+            }
+
+            // Don't write too frequently if something is oscillating.
+            if live_last_publish.elapsed() < Duration::from_millis(15) {
+                return;
+            }
+            live_last_publish = Instant::now();
+            live_last_hash = h;
+            live_seq = live_seq.wrapping_add(1);
+            live_last_ts_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
 
             let state = LiveState {
                 version: 1,
-                ts_ms: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis(),
+                seq: live_seq,
+                ts_ms: live_last_ts_ms,
                 layout: LiveLayout {
                     id: layout.id.clone(),
                     name: layout.name.clone(),
@@ -1214,20 +1260,13 @@ fn main() -> Result<()> {
                     octave_shift,
                 },
                 pressed,
-                layout_pitches,
+                layout_pitches: live_layout_pitches.clone(),
             };
 
             let text = match serde_json::to_string(&state) {
                 Ok(t) => t,
                 Err(_) => return,
             };
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            hasher.write(text.as_bytes());
-            let h = hasher.finish();
-            if h == live_last_hash {
-                return;
-            }
-            live_last_hash = h;
             let _ = write_file_atomic(&live_state_path, &text);
         };
 

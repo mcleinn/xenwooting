@@ -4,6 +4,7 @@ import { fetchChordNames, fetchNoteNames } from './api'
 
 type LiveState = {
   version: number
+  seq: number
   ts_ms: number
   layout: { id: string; name: string; edo: number; pitch_offset: number }
   mode: { press_threshold: number; aftertouch: string; octave_shift: number }
@@ -15,7 +16,8 @@ type NoteName = { short: string; unicode: string; alts?: Array<{ short: string; 
 type ChordRootResult = { rootPc: number; rel: number[]; pattern: string; names: string[] }
 
 function apiUrl(path: string) {
-  return new URL(path.replace(/^\//, ''), window.location.href).toString()
+  // Always resolve from /wtn/ so /wtn/live and /wtn/live/ behave the same.
+  return new URL(path.replace(/^\//, ''), `${window.location.origin}/wtn/`).toString()
 }
 
 function mod(n: number, m: number) {
@@ -87,6 +89,8 @@ export default function LivePage() {
   const [chord, setChord] = useState<ChordRootResult[]>([])
   const lastLayoutKey = useRef<string>('')
   const fetchLock = useRef(false)
+  const lastSeq = useRef<number>(-1)
+  const noteCacheRef = useRef(noteCache)
 
   const mainWrapRef = useRef<HTMLDivElement | null>(null)
   const mainTextRef = useRef<HTMLDivElement | null>(null)
@@ -98,8 +102,13 @@ export default function LivePage() {
     es.addEventListener('state', (ev: MessageEvent) => {
       if (closed) return
       try {
-        const obj = JSON.parse(String(ev.data || 'null'))
-        if (obj && typeof obj === 'object') setLive(obj)
+        const obj: unknown = JSON.parse(String(ev.data || 'null'))
+        if (!obj || typeof obj !== 'object') return
+        const seqRaw = (obj as { seq?: unknown }).seq
+        const seq = typeof seqRaw === 'number' ? seqRaw : Number.NaN
+        if (Number.isFinite(seq) && seq === lastSeq.current) return
+        if (Number.isFinite(seq)) lastSeq.current = seq
+        setLive(obj as LiveState)
       } catch {
         // ignore
       }
@@ -112,6 +121,10 @@ export default function LivePage() {
       es.close()
     }
   }, [])
+
+  useEffect(() => {
+    noteCacheRef.current = noteCache
+  }, [noteCache])
 
   const edo = live?.layout?.edo || 12
   const pitchOffset = live?.layout?.pitch_offset || 0
@@ -128,20 +141,29 @@ export default function LivePage() {
   }, [pressed, edo])
 
   const pitchClassesKey = useMemo(() => pitchClasses.join(','), [pitchClasses])
+  const pressedKey = useMemo(() => pressed.join(','), [pressed])
+
+  const layoutId = live?.layout?.id || ''
+  const octaveShift = live?.mode?.octave_shift ?? 0
+  const layoutPitchesAll = useMemo(() => {
+    const lp0 = Array.isArray(live?.layout_pitches?.Board0) ? live!.layout_pitches.Board0! : []
+    const lp1 = Array.isArray(live?.layout_pitches?.Board1) ? live!.layout_pitches.Board1! : []
+    const out: number[] = []
+    for (const x of [...lp0, ...lp1]) {
+      if (typeof x === 'number' && Number.isFinite(x)) out.push(x)
+    }
+    return out
+  }, [live])
 
   // Prefetch note names for the current layout mapping (both boards), plus any currently pressed pitches.
   useEffect(() => {
-    if (!live) return
-    const key = `${live.layout?.id || ''}:${edo}:${pitchOffset}`
+    if (!layoutId) return
+    const key = `${layoutId}:${edo}:${pitchOffset}:${octaveShift}`
     const wantFull = key && key !== lastLayoutKey.current
-    const lp0 = Array.isArray(live.layout_pitches?.Board0) ? live.layout_pitches.Board0! : []
-    const lp1 = Array.isArray(live.layout_pitches?.Board1) ? live.layout_pitches.Board1! : []
     const pitches: number[] = []
 
     if (wantFull) {
-      for (const x of [...lp0, ...lp1]) {
-        if (typeof x === 'number' && Number.isFinite(x)) pitches.push(x)
-      }
+      for (const x of layoutPitchesAll) pitches.push(x)
       lastLayoutKey.current = key
     }
 
@@ -160,7 +182,7 @@ export default function LivePage() {
       try {
         for (const batch of batches) {
           // Only fetch missing keys.
-          const missing = batch.filter((p) => !noteCache.has(`${edo}:${p}`))
+          const missing = batch.filter((p) => !noteCacheRef.current.has(`${edo}:${p}`))
           if (missing.length === 0) continue
           const r = await fetchNoteNames(edo, missing)
           const results = r?.results || {}
@@ -169,6 +191,7 @@ export default function LivePage() {
             for (const p of missing) {
               const v = results[String(p)]
               if (v && typeof v.unicode === 'string' && typeof v.short === 'string') next.set(`${edo}:${p}`, v)
+              else next.set(`${edo}:${p}`, null)
             }
             return next
           })
@@ -179,19 +202,21 @@ export default function LivePage() {
     })().catch(() => {
       fetchLock.current = false
     })
-  }, [live, edo, pitchOffset, pressed, noteCache])
+  }, [layoutId, edo, pitchOffset, octaveShift, layoutPitchesAll, pressedKey, pressed])
 
   // Fetch chord names (Scala db) for the combined pitch-class set.
   useEffect(() => {
-    if (!live) return
     if (pitchClasses.length === 0) {
-      setChord([])
+      if (chord.length) setChord([])
       return
     }
-    fetchChordNames(edo, pitchClasses)
-      .then((r) => setChord(Array.isArray(r?.results) ? r.results : []))
-      .catch(() => {})
-  }, [live, edo, pitchClassesKey, pitchClasses])
+    const t = window.setTimeout(() => {
+      fetchChordNames(edo, pitchClasses)
+        .then((r) => setChord(Array.isArray(r?.results) ? r.results : []))
+        .catch(() => {})
+    }, 60)
+    return () => window.clearTimeout(t)
+  }, [edo, pitchClassesKey, pitchClasses.length, chord.length, pitchClasses])
 
   const mainText = useMemo(() => {
     if (pressed.length === 0) return ''
@@ -279,7 +304,14 @@ export default function LivePage() {
   }
 
   return (
-    <div className="liveRoot" onClick={onToggleView} onTouchStart={onToggleView}>
+    <div
+      className="liveRoot"
+      onPointerUp={(e) => {
+        // Avoid triggering twice on touch devices.
+        e.preventDefault()
+        onToggleView()
+      }}
+    >
       <div className="liveCorner liveTL">{layoutName}</div>
       <div className="liveCorner liveTR">edo {edo} off {pitchOffset}</div>
       <div className="liveCorner liveBL">thr {live?.mode?.press_threshold?.toFixed?.(2) ?? ''}</div>
