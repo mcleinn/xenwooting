@@ -36,6 +36,11 @@
   color: rgba(255, 255, 255, 0.82);
 }
 
+/* Interval lines include Unicode note names; render with Bravura. */
+.liveIntervalsLine {
+  font-family: 'Bravura', 'Bravura Text', ui-sans-serif, system-ui, sans-serif;
+}
+
 .liveIntervalsLine {
   white-space: pre-wrap;
 }
