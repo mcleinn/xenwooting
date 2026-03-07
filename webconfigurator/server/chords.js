@@ -147,7 +147,7 @@ function withErrSuffix(name, maxAbsErrCents) {
   if (!Number.isFinite(maxAbsErrCents)) return name
   if (maxAbsErrCents <= APPROX_SHOW_ERR_OVER_CENTS) return name
   const v = Math.round(maxAbsErrCents)
-  return `${name} ~${v}c`
+  return `${name}~${v}c`
 }
 
 export async function loadScalaChordNamesDb(filePath) {
@@ -192,33 +192,64 @@ export async function loadScalaChordNamesDb(filePath) {
     }
   }
 
-  const approxByEdo = new Map() // edo -> Map(pattern -> {names:string[]})
+  const approxByEdo = new Map() // edo -> Map(pattern -> string[])
+  const embed12ByEdo = new Map() // edo -> Map(pattern -> string[])
 
-  function ensureApproxForEdo(targetEdo) {
-    if (approxByEdo.has(targetEdo)) return
-    const m = new Map()
-    for (const tpl of templates) {
-      const proj = projectTemplateToEdo(tpl.cents, targetEdo)
-      if (!proj.pattern) continue
-      if (proj.maxAbsErrCents > APPROX_MAX_ERR_CENTS) continue
-      const n = withErrSuffix(tpl.name, proj.maxAbsErrCents)
-      if (!m.has(proj.pattern)) m.set(proj.pattern, [])
-      const arr = m.get(proj.pattern)
-      if (!arr.includes(n)) arr.push(n)
+  const patterns12 = byEdoExact.get(12) || new Map()
+
+  function ensureForEdo(targetEdo) {
+    if (!approxByEdo.has(targetEdo)) {
+      const m = new Map()
+      for (const tpl of templates) {
+        const proj = projectTemplateToEdo(tpl.cents, targetEdo)
+        if (!proj.pattern) continue
+        if (proj.maxAbsErrCents > APPROX_MAX_ERR_CENTS) continue
+        const n = withErrSuffix(tpl.name, proj.maxAbsErrCents)
+        if (!m.has(proj.pattern)) m.set(proj.pattern, [])
+        const arr = m.get(proj.pattern)
+        if (!arr.includes(n)) arr.push(n)
+      }
+      approxByEdo.set(targetEdo, m)
     }
-    approxByEdo.set(targetEdo, m)
+
+    if (!embed12ByEdo.has(targetEdo)) {
+      const m = new Map()
+      if (targetEdo % 12 === 0 && patterns12.size) {
+        const f = targetEdo / 12
+        for (const [pat12, names12] of patterns12.entries()) {
+          const steps12 = String(pat12)
+            .split('-')
+            .map((x) => Number.parseInt(x, 10))
+            .filter((x) => Number.isFinite(x) && x > 0)
+          if (steps12.length === 0) continue
+          const patN = steps12.map((s) => String(s * f)).join('-')
+          const names = Array.isArray(names12) ? names12 : []
+          const outNames = names
+            .filter(Boolean)
+            .map((n) => `${String(n)}-EDO12`)
+
+          if (!m.has(patN)) m.set(patN, [])
+          const arr = m.get(patN)
+          for (const nm of outNames) {
+            if (!arr.includes(nm)) arr.push(nm)
+          }
+        }
+      }
+      embed12ByEdo.set(targetEdo, m)
+    }
   }
 
-  // Precompute approx maps for all EDOs that exist in the file.
-  for (const e of byEdoExact.keys()) ensureApproxForEdo(e)
+  // Precompute for all EDOs that exist in the file.
+  for (const e of byEdoExact.keys()) ensureForEdo(e)
 
-  return { byEdoExact, approxByEdo, ensureApproxForEdo }
+  return { byEdoExact, embed12ByEdo, approxByEdo, ensureForEdo }
 }
 
 export function findChordNames(db, edo, pitchClasses) {
   if (!db || !db.byEdoExact) return []
-  db.ensureApproxForEdo?.(edo)
+  db.ensureForEdo?.(edo)
   const patternsExact = db.byEdoExact.get(edo) || new Map()
+  const patternsEmbed12 = db.embed12ByEdo?.get(edo) || new Map()
   const patternsApprox = db.approxByEdo?.get(edo) || new Map()
 
   const pcs = []
@@ -234,9 +265,13 @@ export function findChordNames(db, edo, pitchClasses) {
   for (const rootPc of uniq) {
     const { pattern, rel } = stepPatternFromPcs(edo, rootPc, uniq)
     const names0 = pattern ? patternsExact.get(pattern) || [] : []
+    const namesE = pattern ? patternsEmbed12.get(pattern) || [] : []
     const names1 = pattern ? patternsApprox.get(pattern) || [] : []
-    // Keep exact names first; fill gaps with approximations.
+    // Keep exact names first; then exact EDO12-embedded names; then approximations.
     const names = [...names0]
+    for (const n of namesE) {
+      if (!names.includes(n)) names.push(n)
+    }
     for (const n of names1) {
       if (!names.includes(n)) names.push(n)
     }

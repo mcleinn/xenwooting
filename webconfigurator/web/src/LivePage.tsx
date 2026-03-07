@@ -62,6 +62,10 @@ function nameScore(name: string) {
   const s = String(name || '')
   const lower = s.toLowerCase()
   let score = 0
+
+  // Prefer exact EDO12-embedded names when present.
+  if (lower.includes('-edo12')) score -= 800
+
   if (lower.includes('inversion')) score += 1000
   if (lower.includes('2nd inversion')) score += 30
   if (lower.includes('1st inversion')) score += 20
@@ -346,10 +350,10 @@ export default function LivePage() {
       const deltas = rel.filter((d) => d !== 0)
       const deltaText = deltas
         .map((d) => {
-          if (edo === 12) return `+${d} (${englishInterval12(d)})`
+          if (edo === 12) return `+${d}(${englishInterval12(d).replace(/\s+/g, '')})`
           return `+${d}`
         })
-        .join(' ')
+        .join('')
 
       const allNames = Array.isArray(r.names)
         ? [...r.names].filter(Boolean).sort((a, b) => nameScore(a) - nameScore(b) || a.localeCompare(b))
@@ -432,7 +436,7 @@ export default function LivePage() {
         </div>
         <div className="liveIntervals">
           {intervalLines.map((it) => {
-            const title = `${it.rootName} (${it.rootPc})`
+            const title = `${it.rootName}(${it.rootPc})`
             const best = it.bestName
             const moreCount = Math.max(0, it.allNames.length - (best ? 1 : 0))
             const showMore = view !== 'intervals' && moreCount > 0
@@ -441,7 +445,7 @@ export default function LivePage() {
               return (
                 <div key={it.rootPc} className="liveIntervalsLine liveChordBlock">
                   <div className="liveChordHeader">
-                    {title}: {it.deltaText}
+                    {title}{it.deltaText}
                   </div>
                   {it.allNames.map((n, i) => (
                     <div key={i} className="liveChordName">
@@ -454,23 +458,23 @@ export default function LivePage() {
 
             return (
               <div key={it.rootPc} className="liveIntervalsLine liveChordLine">
-                <span className="liveChordHeader">
-                  {title}: {it.deltaText}
-                </span>
-                {best ? <span className="liveChordBest"> - {best}</span> : null}
-                {showMore ? (
-                  <button
-                    className="liveMoreBtn"
-                    type="button"
-                    onPointerUp={(ev) => {
-                      ev.preventDefault()
-                      ev.stopPropagation()
-                      openPopover(`${title} alternatives`, it.allNames)
-                    }}
-                  >
-                    (+{moreCount})
-                  </button>
-                ) : null}
+                <div className="liveChordPrimary">
+                  {best || ''}
+                  {showMore ? (
+                    <button
+                      className="liveMoreBtn"
+                      type="button"
+                      onPointerUp={(ev) => {
+                        ev.preventDefault()
+                        ev.stopPropagation()
+                        openPopover(`${title} alternatives`, it.allNames)
+                      }}
+                    >
+                      (+{moreCount})
+                    </button>
+                  ) : null}
+                </div>
+                <div className="liveChordSecondary">{title}{it.deltaText}</div>
               </div>
             )
           })}

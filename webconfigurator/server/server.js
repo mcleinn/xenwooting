@@ -59,7 +59,7 @@ setInterval(async () => {
     if (!Number.isInteger(edo) || edo < 1 || edo > 999) return
     if (LIVE_LAST_EDO === edo) return
     LIVE_LAST_EDO = edo
-    SCALA_CHORD_DB.ensureApproxForEdo?.(edo)
+    SCALA_CHORD_DB.ensureForEdo?.(edo)
   } catch {
     // ignore
   }
