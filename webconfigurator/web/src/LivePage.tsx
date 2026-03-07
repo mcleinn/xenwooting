@@ -58,6 +58,45 @@ function englishInterval12(semitones: number): string {
   }
 }
 
+function nameScore(name: string) {
+  const s = String(name || '')
+  const lower = s.toLowerCase()
+  let score = 0
+  if (lower.includes('inversion')) score += 1000
+  if (lower.includes('2nd inversion')) score += 30
+  if (lower.includes('1st inversion')) score += 20
+  if (lower.includes('3rd inversion')) score += 40
+  if (lower.includes('4th inversion')) score += 50
+  // Prefer shorter, cleaner names.
+  score += Math.min(200, s.length)
+  // Penalize very "busy" names a bit.
+  score += (s.match(/[()"']/g) || []).length * 8
+  score += (s.match(/,/g) || []).length * 4
+  return score
+}
+
+function bestName(names: string[]) {
+  if (!Array.isArray(names) || names.length === 0) return ''
+  const sorted = [...names].filter(Boolean).sort((a, b) => nameScore(a) - nameScore(b) || a.localeCompare(b))
+  return sorted[0] || ''
+}
+
+function rootResultScore(r: ChordRootResult) {
+  const n = Array.isArray(r.names) ? r.names : []
+  const hasNames = n.length > 0
+  const bn = bestName(n)
+  const bnLower = bn.toLowerCase()
+  const isInversion = bnLower.includes('inversion')
+  const tones = Array.isArray(r.rel) ? r.rel.length : 0
+  // Lower is better.
+  return (
+    (hasNames ? 0 : 10_000) +
+    (isInversion ? 1_000 : 0) +
+    tones * 10 +
+    (bn ? nameScore(bn) : 0)
+  )
+}
+
 function formatNoteUnicode(v: NoteName | null | undefined) {
   if (!v?.unicode) return ''
   const alt = v.alts && v.alts.length ? v.alts[0]?.unicode : ''
@@ -255,7 +294,17 @@ export default function LivePage() {
     }
 
     const out: string[] = []
-    const roots = chord.length ? chord : pitchClasses.map((rootPc) => ({ rootPc, rel: [], pattern: '', names: [] }))
+    const rootsRaw: ChordRootResult[] = chord.length
+      ? chord
+      : pitchClasses.map((rootPc) => ({ rootPc, rel: [], pattern: '', names: [] }))
+
+    const roots = [...rootsRaw].sort((a, b) => {
+      const sa = rootResultScore(a)
+      const sb = rootResultScore(b)
+      if (sa !== sb) return sa - sb
+      return a.rootPc - b.rootPc
+    })
+
     for (const r of roots) {
       if (out.length >= maxLines) break
       const rootPitch = rootPitchByPc.get(r.rootPc)
@@ -271,7 +320,11 @@ export default function LivePage() {
         })
         .join(' ')
 
-      const names = Array.isArray(r.names) ? r.names.filter(Boolean) : []
+      const names = Array.isArray(r.names)
+        ? [...r.names]
+            .filter(Boolean)
+            .sort((a, b) => nameScore(a) - nameScore(b) || a.localeCompare(b))
+        : []
       const nameText = names.length ? ` - ${names.join(', ')}` : ''
       out.push(`${rootName} (${r.rootPc}): ${deltaText}${nameText}`.trim())
     }
