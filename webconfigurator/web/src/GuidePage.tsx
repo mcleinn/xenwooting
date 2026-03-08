@@ -289,11 +289,13 @@ function collectOpenChordKeysFromDom() {
 function TuningChordDetails({
   chordKey,
   summary,
+  summaryTooltip,
   headerRight,
   children,
 }: {
   chordKey: string
   summary: string
+  summaryTooltip: string
   headerRight: React.ReactNode
   children: React.ReactNode
 }) {
@@ -307,7 +309,7 @@ function TuningChordDetails({
       }}
     >
       <summary className="chSum">
-        <span className="chSumTitle">{summary}</span>
+        <span className="chSumTitle" title={summaryTooltip}>{summary}</span>
         <span className="chSumRight">{headerRight}</span>
       </summary>
       {open ? <div className="chBody">{children}</div> : null}
@@ -357,9 +359,10 @@ function HexExcerptSvg({
 
   const hx = 22
   const hy = 18
-  const pad = 18
-  const w = Math.max(1, (maxY - minY) * hx + pad * 2 + 30)
-  const h = Math.max(1, (maxX - minX) * hy + pad * 2 + 30)
+  // Keep margins tight so cards don't look "bottom heavy".
+  const pad = 16
+  const w = Math.max(1, (maxY - minY) * hx + pad * 2)
+  const h = Math.max(1, (maxX - minX) * hy + pad * 2)
 
   const coordsByXY = new Map<string, { cx: number; cy: number; x: number; y: number }>()
   for (const p of excerpt.values()) {
@@ -582,6 +585,7 @@ export default function GuidePage() {
   const [layouts, setLayouts] = useState<LayoutInfo[]>([])
   const [layoutId, setLayoutId] = useState<string>(initial.layout)
   const [iso, setIso] = useState<IsoInfo | null>(null)
+  const [isoStatus, setIsoStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
   const [catalogue, setCatalogue] = useState<CatalogueItem[]>([])
   const [expandAll, setExpandAll] = useState<boolean>(false)
   const [loadError, setLoadError] = useState<string>('')
@@ -649,6 +653,7 @@ export default function GuidePage() {
     let cancelled = false
     setQuery({ layout: layoutId })
     setLoadError('')
+    setIsoStatus('loading')
     fetchLayoutIsomorphic(layoutId)
       .then(async (isoInfo) => {
         if (!isoInfo || typeof isoInfo !== 'object') throw new Error('Invalid isomorphic response')
@@ -657,11 +662,13 @@ export default function GuidePage() {
           : { edo: isoInfo?.edo ?? 12, results: [] as CatalogueItem[] }
         if (cancelled) return
         setIso(isoInfo)
+        setIsoStatus('ready')
         setCatalogue(Array.isArray(cat?.results) ? cat.results : [])
       })
       .catch((e) => {
         if (cancelled) return
         setIso({ layoutId, ok: false, edo: 12, dq: null, dr: null, axis3: null, reason: 'Failed to load isomorphic info from server' })
+        setIsoStatus('error')
         setCatalogue([])
         setLoadError(e instanceof Error ? e.message : String(e))
       })
@@ -865,9 +872,15 @@ export default function GuidePage() {
         <div className="guideMeta">
           <div className="guideMetaTitle">{layoutName}</div>
           {iso?.ok ? (
-            <div className="guideMetaRow">
-              Grid steps (mod {edo}): {formatAxisSteps(edo, dq, dr, iso.axis3 ?? dr - dq)}
+            <div className="guideMetaRow axisRow">
+              {formatAxisSteps(edo, dq, dr, iso.axis3 ?? dr - dq).map((s) => (
+                <span key={s.dir} className={`axisBox axisBox--${s.dir}`}>
+                  {s.text}
+                </span>
+              ))}
             </div>
+          ) : isoStatus === 'loading' || isoStatus === 'idle' ? (
+            <div className="guideMetaRow guideLoading">Checking tuning...</div>
           ) : (
             <div className="guideMetaRow guideBad">
               Guide unavailable: layout is not shared-isomorphic{iso?.reason ? ` (${iso.reason})` : ''}.
@@ -890,7 +903,7 @@ export default function GuidePage() {
                     open={expandAll}
                   >
                     <summary className="chSum">
-                      <span className="chSumTitle">{c.item.bestName}</span>
+                      <span className="chSumTitle" title={otherNamesTooltip(c.item.bestName, c.item.allNames)}>{c.item.bestName}</span>
                       <span className="chSumRight">{headerButton(c.item.bestName, c.pcsRoot)}</span>
                     </summary>
                     <div className="chBody">
@@ -899,7 +912,6 @@ export default function GuidePage() {
                         dq={dq}
                         dr={dr}
                         title={c.item.bestName}
-                        allNames={c.item.allNames}
                         pcsRoot={c.pcsRoot}
                         lib={libs.lib3}
                         expandAll={expandAll}
@@ -922,7 +934,7 @@ export default function GuidePage() {
                     open={expandAll}
                   >
                     <summary className="chSum">
-                      <span className="chSumTitle">{c.item.bestName}</span>
+                      <span className="chSumTitle" title={otherNamesTooltip(c.item.bestName, c.item.allNames)}>{c.item.bestName}</span>
                       <span className="chSumRight">{headerButton(c.item.bestName, c.pcsRoot)}</span>
                     </summary>
                     <div className="chBody">
@@ -931,7 +943,6 @@ export default function GuidePage() {
                         dq={dq}
                         dr={dr}
                         title={c.item.bestName}
-                        allNames={c.item.allNames}
                         pcsRoot={c.pcsRoot}
                         lib={libs.lib4}
                         expandAll={expandAll}
@@ -951,6 +962,7 @@ export default function GuidePage() {
                     key={chordKey(edo, it.bestName, it.pcsRoot)}
                     chordKey={chordKey(edo, it.bestName, it.pcsRoot)}
                     summary={it.bestName}
+                    summaryTooltip={otherNamesTooltip(it.bestName, it.allNames)}
                     headerRight={headerButton(it.bestName, it.pcsRoot)}
                   >
                     <ChordBlock
@@ -958,7 +970,6 @@ export default function GuidePage() {
                       dq={dq}
                       dr={dr}
                       title={it.bestName}
-                      allNames={it.allNames}
                       pcsRoot={it.pcsRoot}
                       lib={it.pcsRoot.length === 3 ? libs.lib3 : libs.lib4}
                       expandAll={expandAll}
@@ -1016,13 +1027,30 @@ function formatAxisSteps(edo: number, dq: number, dr: number, axis3Raw: number) 
   // Include both directions for each axis.
   // The labels are purely mnemonic; the guide remains transposable.
   return [
-    `→ ${fmtStep(dq, edo)}`,
-    `← ${fmtStep(-dq, edo)}`,
-    `↘ ${fmtStep(dr, edo)}`,
-    `↖ ${fmtStep(-dr, edo)}`,
-    `↙ ${fmtStep(axis3, edo)}`,
-    `↗ ${fmtStep(-axis3, edo)}`,
-  ].join(' | ')
+    { dir: 'L', text: `← ${fmtStep(-dq, edo)}` },
+    { dir: 'LU', text: `↖ ${fmtStep(-dr, edo)}` },
+    { dir: 'LD', text: `↙ ${fmtStep(axis3, edo)}` },
+    { dir: 'RD', text: `↘ ${fmtStep(dr, edo)}` },
+    { dir: 'RU', text: `↗ ${fmtStep(-axis3, edo)}` },
+    { dir: 'R', text: `→ ${fmtStep(dq, edo)}` },
+  ] as const
+}
+
+function otherNamesTooltip(mainTitle: string, allNames: string[]) {
+  const main = String(mainTitle || '').trim().toLowerCase()
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const n of allNames || []) {
+    const s = String(n || '').trim()
+    if (!s) continue
+    if (s.toLowerCase() === main) continue
+    const k = s.toLowerCase()
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push(s)
+  }
+  if (out.length === 0) return ''
+  return out.join('\n')
 }
 
 async function copyTextToClipboard(text: string): Promise<boolean> {
@@ -1060,7 +1088,6 @@ function ChordBlock({
   dq,
   dr,
   title,
-  allNames,
   pcsRoot,
   lib,
   expandAll,
@@ -1069,45 +1096,14 @@ function ChordBlock({
   dq: number
   dr: number
   title: string
-  allNames: string[]
   pcsRoot: number[]
   lib: Map<string, Shape[]>
   expandAll: boolean
 }) {
   const invs = useMemo(() => inversions(edo, pcsRoot), [edo, pcsRoot])
 
-  const altNames = useMemo(() => {
-    const main = String(title).trim().toLowerCase()
-    const out: string[] = []
-    const seen = new Set<string>()
-    for (const n of allNames || []) {
-      const s = String(n || '').trim()
-      if (!s) continue
-      if (s.toLowerCase() === main) continue
-      const key = s.toLowerCase()
-      if (seen.has(key)) continue
-      seen.add(key)
-      out.push(s)
-    }
-    return out
-  }, [allNames, title])
-
   return (
     <div className="chordBlock">
-      <div className="chordSub">Pitch classes {pcsRoot.join('-')}</div>
-      {altNames.length > 0 ? (
-        <details className="namesAcc" open={false}>
-          <summary className="namesSum">(+{altNames.length}) other names</summary>
-          <div className="namesBody">
-            {altNames.map((n, i) => (
-              <div key={i} className="nameRow">
-                {n}
-              </div>
-            ))}
-          </div>
-        </details>
-      ) : null}
-
       <div className="invWrap">
         {invs.map((inv, i) => {
           const pcsKey = inv.pcsInv.join(',')
@@ -1115,7 +1111,7 @@ function ChordBlock({
           const shapes: Shape[] = lib.get(`${pcsKey}::${absSigKey}`) || []
           const label =
             i === 0
-              ? 'Root position'
+              ? 'Root'
               : i === 1
                 ? '1st inversion'
                 : i === 2
@@ -1126,9 +1122,7 @@ function ChordBlock({
 
           return (
             <details key={pcsKey} className="invAcc" open={expandAll}>
-              <summary className="invSum">
-                {label} (bass +{inv.bass}) pitch classes {inv.pcsInv.join('-')}
-              </summary>
+              <summary className="invSum">{label}</summary>
               <div className="invBody">
                 <InversionPatterns
                   edo={edo}

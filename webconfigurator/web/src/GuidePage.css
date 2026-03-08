@@ -8,6 +8,15 @@
   color-scheme: dark;
 }
 
+:root {
+  --g-stroke: rgba(255, 255, 255, 0.10);
+  --g-stroke2: rgba(255, 255, 255, 0.07);
+  --g-surface: rgba(255, 255, 255, 0.035);
+  --g-surface2: rgba(0, 0, 0, 0.18);
+  --g-text2: rgba(255, 255, 255, 0.74);
+  --g-radius: 14px;
+}
+
 .guideTop {
   position: sticky;
   top: 0;
@@ -32,6 +41,49 @@
   gap: 10px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+@media (max-width: 560px) {
+  .guideTop {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 12px 12px;
+  }
+
+  .guideTitle {
+    display: none;
+  }
+
+  .guideControls {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    align-items: stretch;
+  }
+
+  .gField {
+    grid-column: 1 / -1;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+
+  .gLabel {
+    display: none;
+  }
+
+  .gSelect {
+    width: 100%;
+  }
+
+  .gBtn,
+  .gBtnSecondary {
+    width: 100%;
+    justify-content: center;
+  }
 }
 
 .gField {
@@ -87,8 +139,8 @@
 }
 
 .guideMeta {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--g-stroke2);
+  background: var(--g-surface);
   border-radius: 14px;
   padding: 14px 14px;
   margin-bottom: 14px;
@@ -96,16 +148,83 @@
 
 .guideMetaTitle {
   font-weight: 700;
+  font-size: 26px;
+  letter-spacing: 0.02em;
 }
 
 .guideMetaRow {
   margin-top: 6px;
-  font-size: 13px;
+  font-size: 26px;
   color: rgba(255, 255, 255, 0.78);
+}
+
+.axisRow {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 40px;
+  row-gap: 10px;
+  align-items: center;
+}
+
+.axisBox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--g-stroke2);
+  background: rgba(0, 0, 0, 0.16);
+  letter-spacing: 0.01em;
+}
+
+@media (max-width: 560px) {
+  .axisRow {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-rows: auto auto auto;
+    gap: 10px;
+    column-gap: 14px;
+    align-items: center;
+    justify-items: center;
+    /* Keep the middle empty, like a D-pad. */
+    grid-template-areas:
+      "lu . ru"
+      "l  . r"
+      "ld . rd";
+  }
+
+  .axisBox {
+    font-size: 18px;
+    padding: 8px 10px;
+    border-radius: 14px;
+  }
+
+  .axisBox--LU {
+    grid-area: lu;
+  }
+  .axisBox--RU {
+    grid-area: ru;
+  }
+  .axisBox--L {
+    grid-area: l;
+  }
+  .axisBox--R {
+    grid-area: r;
+  }
+  .axisBox--LD {
+    grid-area: ld;
+  }
+  .axisBox--RD {
+    grid-area: rd;
+  }
 }
 
 .guideBad {
   color: rgba(248, 113, 113, 0.92);
+}
+
+.guideLoading {
+  color: rgba(255, 255, 255, 0.55);
 }
 
 .guideSections {
@@ -187,16 +306,20 @@
 
 
 .acc {
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.03);
-  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
 }
 
 .accSum {
   cursor: pointer;
-  padding: 12px 14px;
-  font-weight: 700;
+  padding: 10px 2px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.82);
   list-style: none;
 }
 
@@ -205,33 +328,64 @@
 }
 
 .accBody {
-  padding: 12px 12px 14px;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 8px 0 16px;
+  border-top: 1px solid var(--g-stroke2);
 }
 
 .chAcc {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
-  background: rgba(0, 0, 0, 0.18);
-  overflow: hidden;
-  margin-bottom: 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  overflow: visible;
+  margin: 0;
   break-inside: avoid;
 }
 
 .chSum {
   cursor: pointer;
   list-style: none;
-  padding: 12px 12px;
+  padding: 12px 6px;
   font-weight: 750;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  border-bottom: 1px solid var(--g-stroke2);
+  background: transparent;
+}
+
+.chSum:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.chSum::after {
+  content: '';
+  width: 8px;
+  height: 8px;
+  margin-left: 6px;
+  border-right: 2px solid rgba(255, 255, 255, 0.35);
+  border-bottom: 2px solid rgba(255, 255, 255, 0.35);
+  transform: rotate(45deg);
+  opacity: 0.9;
+}
+
+details.chAcc[open] > .chSum::after {
+  transform: rotate(-135deg);
 }
 
 .chSumTitle {
   flex: 1;
   min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.chSumTitle::before {
+  content: '●';
+  font-size: 16px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.95);
 }
 
 .chSumRight {
@@ -251,7 +405,10 @@
 }
 
 .chBody {
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--g-stroke2);
+  border-radius: var(--g-radius);
+  background: var(--g-surface2);
+  margin: 8px 0 14px;
   padding: 12px;
 }
 
@@ -277,15 +434,15 @@
 
 .namesAcc {
   margin-top: 8px;
-  border: 1px dashed rgba(255, 255, 255, 0.14);
-  border-radius: 12px;
-  padding: 8px 10px;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
 }
 
 .namesSum {
   cursor: pointer;
   font-size: 12px;
-  color: rgba(255, 255, 255, 0.8);
+  color: rgba(255, 255, 255, 0.72);
   list-style: none;
 }
 
@@ -311,19 +468,24 @@
 }
 
 .invAcc {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 12px;
-  overflow: hidden;
-  background: rgba(255, 255, 255, 0.02);
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+  background: transparent;
   break-inside: avoid;
 }
 
 .invSum {
   cursor: pointer;
   list-style: none;
-  padding: 10px 10px;
+  padding: 10px 8px;
   font-size: 12px;
-  color: rgba(255, 255, 255, 0.84);
+  color: rgba(255, 255, 255, 0.82);
+  border-left: 2px solid rgba(255, 255, 255, 0.10);
+}
+
+details.invAcc[open] > .invSum {
+  border-left-color: rgba(96, 165, 250, 0.55);
 }
 
 .invSum::-webkit-details-marker {
@@ -331,8 +493,11 @@
 }
 
 .invBody {
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--g-stroke2);
+  border-radius: 12px;
   padding: 10px;
+  margin: 6px 0 10px;
+  background: rgba(0, 0, 0, 0.14);
 }
 
 .patRow {
@@ -345,7 +510,7 @@
 .patCard {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
-  padding: 8px;
+  padding: 6px;
   background: rgba(0, 0, 0, 0.18);
   break-inside: avoid;
   cursor: pointer;

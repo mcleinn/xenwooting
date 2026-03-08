@@ -72,6 +72,10 @@ function nameScore(name: string) {
   if (lower.includes('overtone')) score += 500
   if (lower.includes('undertone')) score += 500
 
+  // Prefer neutral-triad naming in 24-EDO contexts.
+  if (lower.startsWith('neutral triad')) score -= 2200
+  else if (lower.includes('neutral triad')) score -= 1600
+
   // Prefer exact / unqualified names over approximations with cents error.
   if (lower.match(/~\d+c\b/)) score += 220
 
@@ -95,10 +99,14 @@ function nameScore(name: string) {
   if (lower.includes('neo-medieval')) score += 100
 
   // Prefer shorter, cleaner names.
-  score += Math.min(200, s.length)
-  // Penalize very "busy" names a bit.
-  score += (s.match(/[()"']/g) || []).length * 8
-  score += (s.match(/,/g) || []).length * 4
+  score += Math.min(500, s.length * 2)
+  if (s.length > 22) score += Math.min(800, (s.length - 22) * 6)
+
+  // Penalize very "busy" names.
+  score += (s.match(/[()"']/g) || []).length * 10
+  const commaCount = (s.match(/,/g) || []).length
+  score += commaCount * 40
+  if (commaCount >= 2) score += 120
   return score
 }
 
