@@ -32,6 +32,23 @@ pub struct Config {
     #[serde(default = "default_aftertouch_delta")]
     pub aftertouch_delta: f32,
 
+    /// In speed-mapped aftertouch mode, this is the normalization reference for d(analog)/dt.
+    /// Larger values make the same physical speed produce smaller aftertouch values.
+    #[serde(default = "default_aftertouch_speed_max")]
+    pub aftertouch_speed_max: f32,
+
+    /// Step used by control-bar buttons when adjusting aftertouch_speed_max.
+    #[serde(default = "default_aftertouch_speed_step")]
+    pub aftertouch_speed_step: f32,
+
+    /// Attack time (ms) for speed-mapped aftertouch envelope.
+    #[serde(default = "default_aftertouch_speed_attack_ms")]
+    pub aftertouch_speed_attack_ms: u32,
+
+    /// Decay time (ms) for speed-mapped aftertouch envelope.
+    #[serde(default = "default_aftertouch_speed_decay_ms")]
+    pub aftertouch_speed_decay_ms: u32,
+
     #[serde(default)]
     pub boards: Vec<BoardConfig>,
 
@@ -140,6 +157,22 @@ fn default_velocity_max_swing() -> f32 {
 
 fn default_aftertouch_delta() -> f32 {
     0.01
+}
+
+fn default_aftertouch_speed_max() -> f32 {
+    74.0
+}
+
+fn default_aftertouch_speed_step() -> f32 {
+    2.0
+}
+
+fn default_aftertouch_speed_attack_ms() -> u32 {
+    12
+}
+
+fn default_aftertouch_speed_decay_ms() -> u32 {
+    250
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

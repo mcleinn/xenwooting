@@ -114,6 +114,7 @@ struct LiveLayout {
 struct LiveMode {
     press_threshold: f32,
     aftertouch: String,
+    aftertouch_speed_max: f32,
     octave_shift: i8,
     screensaver_active: bool,
     preview_enabled: bool,
@@ -269,6 +270,12 @@ enum VelState {
     Tracking {
         started: Instant,
         peak: f32,
+        // Speed tracking for speed-mapped aftertouch.
+        last_analog: f32,
+        last_analog_ts: Instant,
+        peak_speed: f32,
+        at_level: f32,
+        at_last_ts: Instant,
         out_ch: u8,
         note: u8,
         playing: bool,
@@ -277,6 +284,8 @@ enum VelState {
     },
     Aftershock {
         quiet_since: Option<Instant>,
+        at_level: f32,
+        at_last_ts: Instant,
         out_ch: u8,
         note: u8,
         playing: bool,
@@ -287,6 +296,7 @@ enum VelState {
 
 #[derive(Debug, Clone)]
 enum AftertouchMode {
+    SpeedMapped,
     PeakMapped,
     Off,
 }
@@ -294,6 +304,7 @@ enum AftertouchMode {
 impl AftertouchMode {
     fn name(&self) -> &'static str {
         match self {
+            AftertouchMode::SpeedMapped => "speed-mapped",
             AftertouchMode::PeakMapped => "peak-mapped",
             AftertouchMode::Off => "off",
         }
@@ -412,6 +423,10 @@ fn write_default_config(path: &Path) -> Result<()> {
         aftershock_ms: 35,
         velocity_max_swing: 1.0,
         aftertouch_delta: 0.01,
+        aftertouch_speed_max: 74.0,
+        aftertouch_speed_step: 2.0,
+        aftertouch_speed_attack_ms: 12,
+        aftertouch_speed_decay_ms: 250,
         boards: vec![
             xenwooting::config::BoardConfig {
                 device_id: None,
@@ -891,8 +906,15 @@ fn main() -> Result<()> {
     let mut aftertouch_mode = if no_aftertouch {
         AftertouchMode::Off
     } else {
-        AftertouchMode::PeakMapped
+        AftertouchMode::SpeedMapped
     };
+
+    // When aftertouch is enabled, use a fixed low note-on threshold so expressive control works
+    // even with very light presses.
+    const AFTERTOUCH_PRESS_THRESHOLD: f32 = 0.02;
+    let mut manual_press_threshold: f32 = cfg.press_threshold;
+
+    let mut aftertouch_speed_max: f32 = cfg.aftertouch_speed_max.clamp(1.0, 200.0);
 
     // Global run-flag is controlled by signal handler.
     RUNNING.store(true, Ordering::SeqCst);
@@ -903,9 +925,13 @@ fn main() -> Result<()> {
     // In practice this is more reliable than polling the SDK concurrently.
     let (tx, rx) = mpsc::channel::<KeyEdge>();
     // We'll refresh connected device IDs dynamically to support hotplug.
-    let press_threshold_bits = Arc::new(std::sync::atomic::AtomicU32::new(
-        cfg.press_threshold.to_bits(),
-    ));
+    let threshold_init = if matches!(aftertouch_mode, AftertouchMode::Off) {
+        manual_press_threshold
+    } else {
+        AFTERTOUCH_PRESS_THRESHOLD
+    };
+    let press_threshold_bits =
+        Arc::new(std::sync::atomic::AtomicU32::new(threshold_init.to_bits()));
     let update_delta = cfg.aftertouch_delta.clamp(0.001, 0.2);
     let verbose = dump_hid || log_edges || log_midi || log_poll;
     let press_threshold_bits_poll = Arc::clone(&press_threshold_bits);
@@ -1417,6 +1443,7 @@ fn main() -> Result<()> {
          layout_index: usize,
          press_threshold_bits: &AtomicU32,
          aftertouch_mode: &AftertouchMode,
+         aftertouch_speed_max: f32,
          octave_shift: i8,
          screensaver_active: bool,
          preview_enabled: bool,
@@ -1498,6 +1525,7 @@ fn main() -> Result<()> {
             hasher.write_u64(live_layout_pitches_hash);
             hasher.write_u32(press_threshold.to_bits());
             hasher.write(aftertouch_mode.name().as_bytes());
+            hasher.write_u32(aftertouch_speed_max.to_bits());
             hasher.write_i8(octave_shift);
             hasher.write_u8(if screensaver_active { 1 } else { 0 });
             hasher.write_u8(if preview_enabled { 1 } else { 0 });
@@ -1547,6 +1575,7 @@ fn main() -> Result<()> {
                 mode: LiveMode {
                     press_threshold,
                     aftertouch: aftertouch_mode.name().to_string(),
+                    aftertouch_speed_max,
                     octave_shift,
                     screensaver_active,
                     preview_enabled,
@@ -1668,6 +1697,7 @@ fn main() -> Result<()> {
         layout_index,
         press_threshold_bits.as_ref(),
         &aftertouch_mode,
+        aftertouch_speed_max,
         octave_shift,
         screensaver_active,
         preview_enabled,
@@ -1685,6 +1715,7 @@ fn main() -> Result<()> {
             layout_index,
             press_threshold_bits.as_ref(),
             &aftertouch_mode,
+            aftertouch_speed_max,
             octave_shift,
             screensaver_active,
             preview_enabled,
@@ -2300,6 +2331,11 @@ fn main() -> Result<()> {
                     VelState::Tracking {
                         started,
                         peak,
+                        last_analog: _,
+                        last_analog_ts: _,
+                        peak_speed,
+                        mut at_level,
+                        mut at_last_ts,
                         out_ch,
                         note,
                         playing,
@@ -2307,13 +2343,53 @@ fn main() -> Result<()> {
                         led,
                     } => {
                         if started.elapsed() >= peak_track {
-                            let denom = (max_swing - threshold).max(0.001);
-                            let n = ((peak - threshold) / denom).clamp(0.0, 1.0);
+                            let n = match aftertouch_mode {
+                                AftertouchMode::SpeedMapped => {
+                                    (peak_speed / aftertouch_speed_max.max(0.001)).clamp(0.0, 1.0)
+                                }
+                                _ => {
+                                    let denom = (max_swing - threshold).max(0.001);
+                                    ((peak - threshold) / denom).clamp(0.0, 1.0)
+                                }
+                            };
+
                             let n2 = velocity_profiles[velocity_profile_idx].apply(n);
                             let vel = (n2 * 126.0).round().clamp(0.0, 126.0) as u8 + 1;
 
+                            let mut pressure: u8 = vel;
+                            if matches!(aftertouch_mode, AftertouchMode::SpeedMapped) {
+                                let now = Instant::now();
+                                let dt = (now - at_last_ts).as_secs_f32().max(0.0);
+                                if n2 >= at_level {
+                                    // Fast attack: reflect the newest speed immediately.
+                                    at_level = n2;
+                                } else {
+                                    // Slow decay: hang when movement stops.
+                                    let decay_s =
+                                        (cfg.aftertouch_speed_decay_ms.max(1) as f32) / 1000.0;
+                                    let alpha = if decay_s <= 0.0 {
+                                        1.0
+                                    } else {
+                                        (1.0 - (-dt / decay_s).exp()).clamp(0.0, 1.0)
+                                    };
+                                    at_level = at_level + (n2 - at_level) * alpha;
+                                }
+                                at_level = at_level.clamp(0.0, 1.0);
+                                at_last_ts = now;
+                                pressure = (at_level * 127.0).round().clamp(0.0, 127.0) as u8;
+                            }
+
                             if !playing {
                                 let _ = midi_out.send_note(true, out_ch, note, vel);
+
+                                // If the synth maps aftertouch->loudness, emit an initial aftertouch
+                                // value as soon as the note starts.
+                                if matches!(aftertouch_mode, AftertouchMode::SpeedMapped)
+                                    && !no_aftertouch
+                                {
+                                    let _ = midi_out.send_polytouch(out_ch, note, pressure);
+                                }
+
                                 // After firing, go to Aftershock state (like the Teensy state
                                 // machine). While the key is still held, the next Update will
                                 // return it to Tracking again, and repeated windows will emit
@@ -2322,6 +2398,8 @@ fn main() -> Result<()> {
                                     key,
                                     VelState::Aftershock {
                                         quiet_since: None,
+                                        at_level,
+                                        at_last_ts,
                                         out_ch,
                                         note,
                                         playing: true,
@@ -2330,15 +2408,23 @@ fn main() -> Result<()> {
                                     },
                                 );
                             } else {
-                                if matches!(aftertouch_mode, AftertouchMode::PeakMapped)
-                                    && !no_aftertouch
-                                {
-                                    let _ = midi_out.send_polytouch(out_ch, note, vel);
+                                if !no_aftertouch {
+                                    match aftertouch_mode {
+                                        AftertouchMode::PeakMapped => {
+                                            let _ = midi_out.send_polytouch(out_ch, note, vel);
+                                        }
+                                        AftertouchMode::SpeedMapped => {
+                                            let _ = midi_out.send_polytouch(out_ch, note, pressure);
+                                        }
+                                        AftertouchMode::Off => {}
+                                    }
                                 }
                                 vel_state.insert(
                                     key,
                                     VelState::Aftershock {
                                         quiet_since: None,
+                                        at_level,
+                                        at_last_ts,
                                         out_ch,
                                         note,
                                         playing,
@@ -2351,6 +2437,8 @@ fn main() -> Result<()> {
                     }
                     VelState::Aftershock {
                         quiet_since,
+                        at_level: _,
+                        at_last_ts: _,
                         out_ch,
                         note,
                         playing,
@@ -2428,6 +2516,7 @@ fn main() -> Result<()> {
                 layout_index,
                 press_threshold_bits.as_ref(),
                 &aftertouch_mode,
+                aftertouch_speed_max,
                 octave_shift,
                 screensaver_active,
                 preview_enabled,
@@ -2515,17 +2604,31 @@ fn main() -> Result<()> {
         if kind == "down" {
             match hid {
                 HIDCodes::LeftCtrl => {
-                    let mut t = f32::from_bits(press_threshold_bits.load(Ordering::Relaxed));
-                    t = (t - cfg.press_threshold_step).clamp(0.02, 0.98);
-                    press_threshold_bits.store(t.to_bits(), Ordering::Relaxed);
-                    info!("press_threshold now {:.3}", t);
+                    if matches!(aftertouch_mode, AftertouchMode::Off) {
+                        manual_press_threshold =
+                            (manual_press_threshold - cfg.press_threshold_step).clamp(0.02, 0.98);
+                        press_threshold_bits
+                            .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
+                        info!("press_threshold now {:.3}", manual_press_threshold);
+                    } else {
+                        aftertouch_speed_max =
+                            (aftertouch_speed_max - cfg.aftertouch_speed_step).clamp(1.0, 200.0);
+                        info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
+                    }
                     continue;
                 }
                 HIDCodes::RightCtrl => {
-                    let mut t = f32::from_bits(press_threshold_bits.load(Ordering::Relaxed));
-                    t = (t + cfg.press_threshold_step).clamp(0.02, 0.98);
-                    press_threshold_bits.store(t.to_bits(), Ordering::Relaxed);
-                    info!("press_threshold now {:.3}", t);
+                    if matches!(aftertouch_mode, AftertouchMode::Off) {
+                        manual_press_threshold =
+                            (manual_press_threshold + cfg.press_threshold_step).clamp(0.02, 0.98);
+                        press_threshold_bits
+                            .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
+                        info!("press_threshold now {:.3}", manual_press_threshold);
+                    } else {
+                        aftertouch_speed_max =
+                            (aftertouch_speed_max + cfg.aftertouch_speed_step).clamp(1.0, 200.0);
+                        info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
+                    }
                     continue;
                 }
                 HIDCodes::LeftAlt => {
@@ -2538,10 +2641,22 @@ fn main() -> Result<()> {
                 }
                 HIDCodes::RightAlt => {
                     aftertouch_mode = match aftertouch_mode {
-                        AftertouchMode::PeakMapped => AftertouchMode::Off,
+                        AftertouchMode::PeakMapped => AftertouchMode::SpeedMapped,
+                        AftertouchMode::SpeedMapped => AftertouchMode::Off,
                         AftertouchMode::Off => AftertouchMode::PeakMapped,
                     };
-                    info!("aftertouch_mode now {}", aftertouch_mode.name());
+                    if matches!(aftertouch_mode, AftertouchMode::Off) {
+                        press_threshold_bits
+                            .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
+                    } else {
+                        press_threshold_bits
+                            .store(AFTERTOUCH_PRESS_THRESHOLD.to_bits(), Ordering::Relaxed);
+                    }
+                    info!(
+                        "aftertouch_mode now {} (thr {:.2})",
+                        aftertouch_mode.name(),
+                        f32::from_bits(press_threshold_bits.load(Ordering::Relaxed))
+                    );
                     continue;
                 }
                 HIDCodes::Space => {
@@ -2926,6 +3041,11 @@ fn main() -> Result<()> {
                         VelState::Tracking {
                             started: ts,
                             peak: analog,
+                            last_analog: analog,
+                            last_analog_ts: ts,
+                            peak_speed: 0.0,
+                            at_level: 0.0,
+                            at_last_ts: ts,
                             out_ch,
                             note,
                             playing: already_playing,
@@ -2936,12 +3056,30 @@ fn main() -> Result<()> {
                 } else if kind == "update" {
                     if let Some(st) = vel_state.get_mut(&key_id) {
                         match st {
-                            VelState::Tracking { peak, .. } => {
+                            VelState::Tracking {
+                                peak,
+                                last_analog,
+                                last_analog_ts,
+                                peak_speed,
+                                ..
+                            } => {
                                 if analog > *peak {
                                     *peak = analog;
                                 }
+                                // Speed tracking for speed-mapped aftertouch.
+                                let dt = (ts - *last_analog_ts).as_secs_f32();
+                                if dt > 0.0 {
+                                    let s = (analog - *last_analog) / dt;
+                                    if s.is_finite() && s > *peak_speed {
+                                        *peak_speed = s.max(0.0);
+                                    }
+                                }
+                                *last_analog = analog;
+                                *last_analog_ts = ts;
                             }
                             VelState::Aftershock {
+                                at_level,
+                                at_last_ts,
                                 out_ch,
                                 note,
                                 playing,
@@ -2956,9 +3094,16 @@ fn main() -> Result<()> {
                                     let note = *note;
                                     let last_val = *last_val;
                                     let led = led.clone();
+                                    let at_level = *at_level;
+                                    let at_last_ts = *at_last_ts;
                                     *st = VelState::Tracking {
                                         started: ts,
                                         peak: analog,
+                                        last_analog: analog,
+                                        last_analog_ts: ts,
+                                        peak_speed: 0.0,
+                                        at_level,
+                                        at_last_ts,
                                         out_ch,
                                         note,
                                         playing: already_playing,
@@ -2976,6 +3121,8 @@ fn main() -> Result<()> {
                             note,
                             playing,
                             last_val,
+                            at_level,
+                            at_last_ts,
                             led,
                             ..
                         }) => {
@@ -2984,6 +3131,8 @@ fn main() -> Result<()> {
                                     key_id,
                                     VelState::Aftershock {
                                         quiet_since: Some(ts),
+                                        at_level,
+                                        at_last_ts,
                                         out_ch,
                                         note,
                                         playing,
@@ -3008,6 +3157,8 @@ fn main() -> Result<()> {
                         }
                         Some(VelState::Aftershock {
                             quiet_since: _,
+                            at_level,
+                            at_last_ts,
                             out_ch,
                             note,
                             playing,
@@ -3019,6 +3170,8 @@ fn main() -> Result<()> {
                                 key_id,
                                 VelState::Aftershock {
                                     quiet_since: Some(ts),
+                                    at_level,
+                                    at_last_ts,
                                     out_ch,
                                     note,
                                     playing,

@@ -7,7 +7,7 @@ type LiveState = {
   seq: number
   ts_ms: number
   layout: { id: string; name: string; edo: number; pitch_offset: number }
-  mode: { press_threshold: number; aftertouch: string; octave_shift: number }
+  mode: { press_threshold: number; aftertouch: string; aftertouch_speed_max?: number; octave_shift: number }
   pressed: { Board0?: number[]; Board1?: number[] }
   layout_pitches: { Board0?: Array<number | null>; Board1?: Array<number | null> }
 }
@@ -444,7 +444,11 @@ export default function LivePage() {
       <div className="liveCorner liveTR">edo {edo} off {pitchOffset}</div>
       <div className="liveCorner liveBL">thr {live?.mode?.press_threshold?.toFixed?.(2) ?? ''}</div>
       <div className="liveCorner liveBR">
-        at {live?.mode?.aftertouch || ''} oct {live?.mode?.octave_shift ?? 0}
+        at {live?.mode?.aftertouch || ''}
+        {live?.mode?.aftertouch && live?.mode?.aftertouch !== 'off' ? (
+          <> sp {Number(live?.mode?.aftertouch_speed_max ?? 0).toFixed(1)}</>
+        ) : null}
+        {' '}oct {live?.mode?.octave_shift ?? 0}
       </div>
 
       <div className="liveMain" ref={mainWrapRef}>
