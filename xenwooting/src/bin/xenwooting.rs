@@ -1,9 +1,9 @@
-use alsa::seq::{EvNote, Event, EventType, PortCap, PortType, Seq};
+use alsa::seq::{EvCtrl, EvNote, Event, EventType, PortCap, PortType, Seq};
 use alsa::Direction;
 use anyhow::{Context, Result};
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fs;
 use std::hash::Hash;
@@ -45,6 +45,7 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
         }
         out
     }
+
     let ap = split_parts(a);
     let bp = split_parts(b);
     let n = ap.len().max(bp.len());
@@ -275,23 +276,76 @@ enum VelState {
         last_analog_ts: Instant,
         peak_speed: f32,
         at_level: f32,
-        at_last_ts: Instant,
         out_ch: u8,
         note: u8,
         playing: bool,
-        last_val: u8,
         led: Option<LedState>,
     },
-    Aftershock {
-        quiet_since: Option<Instant>,
-        at_level: f32,
-        at_last_ts: Instant,
-        out_ch: u8,
-        note: u8,
-        playing: bool,
-        last_val: u8,
-        led: Option<LedState>,
-    },
+}
+
+#[derive(Debug, Clone)]
+struct DebugEvent {
+    t_ms: u64,
+    msg: String,
+}
+
+fn dbg_push(dbg_ring: &mut VecDeque<DebugEvent>, start_ts: &Instant, msg: impl Into<String>) {
+    if dbg_ring.len() >= 200 {
+        dbg_ring.pop_front();
+    }
+    dbg_ring.push_back(DebugEvent {
+        t_ms: start_ts.elapsed().as_millis() as u64,
+        msg: msg.into(),
+    });
+}
+
+fn dbg_dump(
+    dbg_ring: &VecDeque<DebugEvent>,
+    reason: &str,
+    dumps: &mut u64,
+    rgb_drop_critical: u64,
+) {
+    *dumps = dumps.saturating_add(1);
+    warn!(
+        "DBG_RING_BEGIN reason={} len={} dumps={} rgb_drop_critical={}",
+        reason,
+        dbg_ring.len(),
+        *dumps,
+        rgb_drop_critical
+    );
+    for e in dbg_ring.iter() {
+        warn!("DBG {:>7}ms {}", e.t_ms, e.msg);
+    }
+    warn!("DBG_RING_END");
+}
+
+fn rgb_send_critical(
+    rgb_tx: &crossbeam_channel::Sender<RgbCmd>,
+    dbg_ring: &mut VecDeque<DebugEvent>,
+    start_ts: &Instant,
+    dbg_dumps: &mut u64,
+    rgb_drop_critical: &mut u64,
+    cmd: RgbCmd,
+    what: String,
+) {
+    match rgb_tx.try_send(cmd) {
+        Ok(()) => {
+            dbg_push(dbg_ring, start_ts, format!("RGB ok {}", what));
+        }
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            *rgb_drop_critical = rgb_drop_critical.saturating_add(1);
+            warn!(
+                "RGB critical queue full; dropped {} (drops={})",
+                what, *rgb_drop_critical
+            );
+            dbg_push(dbg_ring, start_ts, format!("RGB DROP {}", what));
+            dbg_dump(dbg_ring, "rgb_drop_critical", dbg_dumps, *rgb_drop_critical);
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            warn!("RGB channel disconnected; dropped {}", what);
+            dbg_push(dbg_ring, start_ts, format!("RGB DISCONNECTED {}", what));
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +429,33 @@ impl AlsaMidiOut {
             .event_output_direct(&mut e)
             .context("Failed to output ALSA event")?;
         Ok(())
+    }
+
+    fn send_cc(&mut self, ch: u8, cc: u32, value: u8) -> Result<()> {
+        let ev = EvCtrl {
+            channel: ch,
+            param: cc,
+            value: value as i32,
+        };
+        let mut e = Event::new(EventType::Controller, &ev);
+        e.set_source(self.port);
+        e.set_subs();
+        e.set_direct();
+        self.seq
+            .event_output_direct(&mut e)
+            .context("Failed to output ALSA CC event")?;
+        Ok(())
+    }
+
+    fn panic_all(&mut self) {
+        for ch in 0..16u8 {
+            // Sustain off
+            let _ = self.send_cc(ch, 64, 0);
+            // All sound off
+            let _ = self.send_cc(ch, 120, 0);
+            // All notes off
+            let _ = self.send_cc(ch, 123, 0);
+        }
     }
 }
 
@@ -829,11 +910,19 @@ fn main() -> Result<()> {
     let mut midi_out = AlsaMidiOut::new(&cfg.midi_out_name)?;
     info!("ALSA MIDI out ready: {}", cfg.midi_out_name);
 
+    let start_ts = Instant::now();
+    let mut dbg_ring: VecDeque<DebugEvent> = VecDeque::with_capacity(200);
+    let mut dbg_dumps: u64 = 0;
+    let mut rgb_drop_critical: u64 = 0;
+    let (dbg_tx, dbg_rx) = crossbeam_channel::bounded::<String>(4096);
+
     let rgb_enabled = cfg.rgb.enabled && !no_rgb;
     let (rgb_tx, rgb_rx) = crossbeam_channel::bounded::<RgbCmd>(1024);
     if rgb_enabled {
         spawn_rgb_worker(rgb_rx);
     }
+
+    // rgb_send_critical is implemented as a function (see above) to avoid borrow issues.
 
     // Device -> board config selection
     let devices = loop {
@@ -911,7 +1000,7 @@ fn main() -> Result<()> {
 
     // When aftertouch is enabled, use a fixed low note-on threshold so expressive control works
     // even with very light presses.
-    const AFTERTOUCH_PRESS_THRESHOLD: f32 = 0.02;
+    const AFTERTOUCH_PRESS_THRESHOLD: f32 = 0.10;
     let mut manual_press_threshold: f32 = cfg.press_threshold;
 
     let mut aftertouch_speed_max: f32 = cfg.aftertouch_speed_max.clamp(1.0, 200.0);
@@ -936,9 +1025,30 @@ fn main() -> Result<()> {
     let verbose = dump_hid || log_edges || log_midi || log_poll;
     let press_threshold_bits_poll = Arc::clone(&press_threshold_bits);
     let configured_device_ids_poll = configured_device_ids.clone();
+    let dbg_tx_poll = dbg_tx.clone();
     std::thread::spawn(move || {
         let mut down_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut last_analog_by_device: HashMap<u64, HashMap<HIDCodes, f32>> = HashMap::new();
+        let mut active_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
+        let mut last_seen_by_device: HashMap<u64, HashMap<HIDCodes, Instant>> = HashMap::new();
+        let mut startup_suppressed_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
+        let mut did_init_device: HashSet<u64> = HashSet::new();
+        let mut poll_err_since: HashMap<u64, Option<Instant>> = HashMap::new();
+
+        // Edge detection is noisy near the threshold; use hysteresis.
+        const RELEASE_HYSTERESIS: f32 = 0.01;
+        // Some SDK/plugins may only report a release as "missing from buffer" (or as a one-shot 0.0).
+        // Treat a key that's missing for this long as released.
+        const MISSING_RELEASE_MS: u64 = 50;
+        // If the SDK read errors for this long, fail-safe release all active keys.
+        const POLL_ERR_FAILSAFE_MS: u64 = 250;
+
+        // Rate-limited anomaly counters.
+        let mut missing_release_count: u64 = 0;
+        let mut poll_err_release_count: u64 = 0;
+        let mut startup_suppressed_count: u64 = 0;
+        let mut last_stats = Instant::now();
+
         let mut poll_ids: Vec<u64> = Vec::new();
         let mut last_dev_refresh = std::time::Instant::now() - Duration::from_secs(999);
         let mut last_report = std::time::Instant::now() - Duration::from_secs(999);
@@ -968,10 +1078,21 @@ fn main() -> Result<()> {
                                 last_analog_by_device
                                     .entry(*id)
                                     .or_insert_with(HashMap::new);
+                                active_by_device.entry(*id).or_insert_with(HashSet::new);
+                                last_seen_by_device.entry(*id).or_insert_with(HashMap::new);
+                                startup_suppressed_by_device
+                                    .entry(*id)
+                                    .or_insert_with(HashSet::new);
+                                poll_err_since.entry(*id).or_insert(None);
                             }
                             // Drop removed device maps.
                             down_by_device.retain(|id, _| new_ids.contains(id));
                             last_analog_by_device.retain(|id, _| new_ids.contains(id));
+                            active_by_device.retain(|id, _| new_ids.contains(id));
+                            last_seen_by_device.retain(|id, _| new_ids.contains(id));
+                            startup_suppressed_by_device.retain(|id, _| new_ids.contains(id));
+                            poll_err_since.retain(|id, _| new_ids.contains(id));
+                            did_init_device.retain(|id| new_ids.contains(id));
                             poll_ids = new_ids;
                         }
                     }
@@ -984,10 +1105,47 @@ fn main() -> Result<()> {
             }
 
             for device_id in &poll_ids {
+                let now = Instant::now();
                 let data = match sdk::read_full_buffer_device(256, *device_id).0 {
                     Ok(v) => v,
                     Err(e) => {
                         err_count += 1;
+                        let since = poll_err_since
+                            .get_mut(device_id)
+                            .expect("poll_err_since missing device")
+                            .get_or_insert(now);
+                        if since.elapsed() >= Duration::from_millis(POLL_ERR_FAILSAFE_MS) {
+                            let down = down_by_device.get_mut(device_id).unwrap();
+                            let active = active_by_device.get_mut(device_id).unwrap();
+                            let last_analog = last_analog_by_device.get_mut(device_id).unwrap();
+                            let last_seen = last_seen_by_device.get_mut(device_id).unwrap();
+                            let startup_suppressed =
+                                startup_suppressed_by_device.get_mut(device_id).unwrap();
+
+                            // Fail-safe release all active keys.
+                            let keys: Vec<HIDCodes> = active.iter().cloned().collect();
+                            for hid in keys.iter().cloned() {
+                                active.remove(&hid);
+                                down.remove(&hid);
+                                last_analog.remove(&hid);
+                                last_seen.remove(&hid);
+                                startup_suppressed.remove(&hid);
+                                let _ = tx.send(KeyEdge::Up {
+                                    device_id: *device_id,
+                                    hid,
+                                    analog: 0.0,
+                                    ts: Instant::now(),
+                                });
+                            }
+                            poll_err_release_count = poll_err_release_count.saturating_add(1);
+                            let _ = dbg_tx_poll.try_send(format!(
+                                "poll_err_failsafe_release device_id={} releasing_keys={}",
+                                device_id,
+                                keys.len()
+                            ));
+                            // Reset timer so we don't spam releases.
+                            *since = now;
+                        }
                         if verbose && last_report.elapsed() > Duration::from_secs(1) {
                             eprintln!(
                                 "poll device_id={} error={:?} err_count={} ",
@@ -998,6 +1156,11 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
+
+                // Successful poll clears error timer.
+                if let Some(s) = poll_err_since.get_mut(device_id) {
+                    *s = None;
+                }
 
                 if log_poll && last_report.elapsed() > Duration::from_secs(1) {
                     let mut items: Vec<(u16, f32)> = data.iter().map(|(k, v)| (*k, *v)).collect();
@@ -1019,6 +1182,29 @@ fn main() -> Result<()> {
 
                 let down = down_by_device.get_mut(device_id).unwrap();
                 let last_analog = last_analog_by_device.get_mut(device_id).unwrap();
+                let active = active_by_device.get_mut(device_id).unwrap();
+                let last_seen = last_seen_by_device.get_mut(device_id).unwrap();
+                let startup_suppressed = startup_suppressed_by_device.get_mut(device_id).unwrap();
+
+                // On first successful poll for this device, suppress keys already held so we don't
+                // start notes/LEDs mid-press.
+                if !did_init_device.contains(device_id) {
+                    did_init_device.insert(*device_id);
+                    startup_suppressed.clear();
+                    for (code_u16, analog) in data.iter() {
+                        if *code_u16 > 255 {
+                            continue;
+                        }
+                        let Some(hid) = HIDCodes::from_u8(*code_u16 as u8) else {
+                            continue;
+                        };
+                        if *analog > 0.001 {
+                            startup_suppressed.insert(hid);
+                        }
+                    }
+                }
+
+                let mut seen: HashSet<HIDCodes> = HashSet::new();
                 for (code_u16, analog) in data.iter() {
                     if *code_u16 > 255 {
                         continue;
@@ -1026,20 +1212,46 @@ fn main() -> Result<()> {
                     let Some(hid) = HIDCodes::from_u8(*code_u16 as u8) else {
                         continue;
                     };
+
+                    seen.insert(hid.clone());
+                    last_seen.insert(hid.clone(), now);
+
                     let press_threshold = f32::from_bits(
                         press_threshold_bits_poll.load(std::sync::atomic::Ordering::Relaxed),
                     )
                     .clamp(0.0, 0.99);
 
-                    let is_down_now = *analog > press_threshold;
+                    // Hysteresis prevents noisy releases from missing the Up edge.
+                    let thr_down = press_threshold;
+                    let thr_up = (press_threshold - RELEASE_HYSTERESIS).clamp(0.0, 0.99);
+
                     let was_down = down.contains(&hid);
+
+                    let is_down_now = if was_down {
+                        *analog > thr_up
+                    } else {
+                        *analog > thr_down
+                    };
+
                     if is_down_now && !was_down {
                         down.insert(hid.clone());
                         last_analog.insert(hid.clone(), *analog);
+
+                        if startup_suppressed.contains(&hid) {
+                            // Don't emit a Down edge until the key has been released once.
+                            startup_suppressed_count = startup_suppressed_count.saturating_add(1);
+                            let _ = dbg_tx_poll.try_send(format!(
+                                "startup_suppressed_down device_id={} hid={:?} analog={:.3}",
+                                device_id, hid, analog
+                            ));
+                            continue;
+                        }
+
+                        active.insert(hid.clone());
                         if verbose {
                             eprintln!(
-                                "send DOWN device_id={} hid={:?} analog={:.3}",
-                                device_id, hid, analog
+                                "send DOWN device_id={} hid={:?} analog={:.3} thr={:.3}",
+                                device_id, hid, analog, press_threshold
                             );
                         }
                         if tx
@@ -1057,42 +1269,107 @@ fn main() -> Result<()> {
                     } else if !is_down_now && was_down {
                         down.remove(&hid);
                         last_analog.remove(&hid);
-                        if verbose {
-                            eprintln!(
-                                "send UP   device_id={} hid={:?} analog={:.3}",
-                                device_id, hid, analog
-                            );
+                        last_seen.remove(&hid);
+                        startup_suppressed.remove(&hid);
+
+                        // Only emit Up if we previously emitted Down.
+                        if active.remove(&hid) {
+                            if verbose {
+                                eprintln!(
+                                    "send UP   device_id={} hid={:?} analog={:.3}",
+                                    device_id, hid, analog
+                                );
+                            }
+                            if tx
+                                .send(KeyEdge::Up {
+                                    device_id: *device_id,
+                                    hid,
+                                    analog: *analog,
+                                    ts: Instant::now(),
+                                })
+                                .is_err()
+                            {
+                                eprintln!("poll thread: channel closed");
+                                return;
+                            }
                         }
-                        if tx
-                            .send(KeyEdge::Up {
+                    } else if is_down_now && was_down {
+                        if active.contains(&hid) {
+                            let prev = last_analog.get(&hid).copied().unwrap_or(0.0);
+                            // Send updates while a key is held so peak tracking and aftertouch
+                            // keep working even when the analog value doesn't change much.
+                            //
+                            // To keep bandwidth reasonable, only update the stored prev value
+                            // when a meaningful analog delta occurred.
+                            if (*analog - prev).abs() >= update_delta {
+                                last_analog.insert(hid.clone(), *analog);
+                            }
+                            let _ = tx.send(KeyEdge::Update {
                                 device_id: *device_id,
                                 hid,
                                 analog: *analog,
                                 ts: Instant::now(),
-                            })
-                            .is_err()
-                        {
-                            eprintln!("poll thread: channel closed");
-                            return;
+                            });
                         }
-                    } else if is_down_now && was_down {
-                        let prev = last_analog.get(&hid).copied().unwrap_or(0.0);
-                        // Send updates while a key is held so peak tracking and aftertouch
-                        // keep working even when the analog value doesn't change much.
-                        //
-                        // To keep bandwidth reasonable, only update the stored prev value
-                        // when a meaningful analog delta occurred.
-                        if (*analog - prev).abs() >= update_delta {
-                            last_analog.insert(hid.clone(), *analog);
-                        }
-                        let _ = tx.send(KeyEdge::Update {
+                    }
+                }
+
+                // Keys can "vanish" from the buffer without a 0.0 report on release.
+                // If a key was down and hasn't been seen for a short time, synthesize an Up.
+                let missing_timeout = Duration::from_millis(MISSING_RELEASE_MS);
+                let down_list: Vec<HIDCodes> = down.iter().cloned().collect();
+                for hid in down_list {
+                    if seen.contains(&hid) {
+                        continue;
+                    }
+                    let Some(last_ts) = last_seen.get(&hid).copied() else {
+                        // No last_seen: treat as missing from now.
+                        last_seen.insert(hid.clone(), now);
+                        continue;
+                    };
+                    if now.duration_since(last_ts) < missing_timeout {
+                        continue;
+                    }
+
+                    down.remove(&hid);
+                    last_analog.remove(&hid);
+                    last_seen.remove(&hid);
+                    startup_suppressed.remove(&hid);
+
+                    if active.remove(&hid) {
+                        missing_release_count = missing_release_count.saturating_add(1);
+                        let _ = dbg_tx_poll.try_send(format!(
+                            "synthetic_up_missing device_id={} hid={:?} missing_ms={}",
+                            device_id,
+                            hid,
+                            now.duration_since(last_ts).as_millis()
+                        ));
+                        let _ = tx.send(KeyEdge::Up {
                             device_id: *device_id,
                             hid,
-                            analog: *analog,
+                            analog: 0.0,
                             ts: Instant::now(),
                         });
                     }
                 }
+            }
+
+            if last_stats.elapsed() >= Duration::from_secs(5) {
+                if missing_release_count > 0
+                    || poll_err_release_count > 0
+                    || startup_suppressed_count > 0
+                {
+                    log::warn!(
+                        "poll anomalies: missing_release={} poll_err_releases={} startup_suppressed={}",
+                        missing_release_count,
+                        poll_err_release_count,
+                        startup_suppressed_count
+                    );
+                }
+                missing_release_count = 0;
+                poll_err_release_count = 0;
+                startup_suppressed_count = 0;
+                last_stats = Instant::now();
             }
             std::thread::sleep(poll_period);
         }
@@ -1403,6 +1680,10 @@ fn main() -> Result<()> {
     // Peak-tracked velocity state per key (device_id + HID).
     let mut vel_state: HashMap<(u64, HIDCodes), VelState> = HashMap::new();
 
+    // Robust note tracking so NoteOff does not depend on vel_state being present.
+    let mut note_by_key: HashMap<(u64, HIDCodes), (u8, u8)> = HashMap::new();
+    let mut note_on_count: HashMap<(u8, u8), u32> = HashMap::new();
+
     // Live HUD state published for /wtn/live.
     let live_state_path = PathBuf::from(LIVE_STATE_PATH);
     let mut live_seq: u64 = 0;
@@ -1488,18 +1769,9 @@ fn main() -> Result<()> {
                 let Some(bcfg) = board_by_device.get(device_id) else {
                     continue;
                 };
-                let (out_ch, note, is_pressed) = match st {
-                    VelState::Tracking { out_ch, note, .. } => (*out_ch, *note, true),
-                    VelState::Aftershock {
-                        quiet_since,
-                        out_ch,
-                        note,
-                        ..
-                    } => (*out_ch, *note, quiet_since.is_none()),
+                let (out_ch, note) = match st {
+                    VelState::Tracking { out_ch, note, .. } => (*out_ch, *note),
                 };
-                if !is_pressed {
-                    continue;
-                }
                 let pitch = (out_ch as i32) * edo + (note as i32) + pitch_offset;
                 if bcfg.wtn_board == 0 {
                     pressed0.insert(pitch);
@@ -1605,6 +1877,9 @@ fn main() -> Result<()> {
     let mut pressed_keys: HashSet<(u64, HIDCodes)> = HashSet::new();
     let mut suppressed_keys: HashSet<(u64, HIDCodes)> = HashSet::new();
 
+    let mut last_leftctrl_down: Option<Instant> = None;
+    let mut last_rightctrl_down: Option<Instant> = None;
+
     let paint_off = |rgb_map: &HashMap<u64, u8>| {
         if !rgb_enabled {
             return;
@@ -1684,7 +1959,6 @@ fn main() -> Result<()> {
 
             match st {
                 VelState::Tracking { led: Some(led), .. } => led.base_rgb = idle,
-                VelState::Aftershock { led: Some(led), .. } => led.base_rgb = idle,
                 _ => {}
             }
         }
@@ -2314,10 +2588,820 @@ fn main() -> Result<()> {
             }
         }
 
-        // Timer tick: fire delayed NoteOn / NoteOff.
+        // Receive all pending edges first, then run the timer tick.
+        // This prevents firing delayed NoteOn after an Up edge is already queued.
+        let mut edges: Vec<KeyEdge> = Vec::new();
+        match rx.recv_timeout(Duration::from_millis(1)) {
+            Ok(e) => edges.push(e),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+        while let Ok(e) = rx.try_recv() {
+            edges.push(e);
+        }
+
+        while let Ok(msg) = dbg_rx.try_recv() {
+            dbg_push(&mut dbg_ring, &start_ts, format!("POLL {}", msg));
+        }
+
+        for edge in edges {
+            let (device_id, hid, analog, kind, ts) = match edge {
+                KeyEdge::Down {
+                    device_id,
+                    hid,
+                    analog,
+                    ts,
+                } => (device_id, hid, analog, "down", ts),
+                KeyEdge::Update {
+                    device_id,
+                    hid,
+                    analog,
+                    ts,
+                } => (device_id, hid, analog, "update", ts),
+                KeyEdge::Up {
+                    device_id,
+                    hid,
+                    analog,
+                    ts,
+                } => (device_id, hid, analog, "up", ts),
+            };
+
+            let key_id = (device_id, hid.clone());
+
+            // Count only down/up as inactivity-resetting activity.
+            // Update edges can be noisy due to analog jitter and should not prevent blanking.
+            if kind != "update" {
+                last_activity = Instant::now();
+            }
+
+            // Maintain pressed-key tracking even when suppressed.
+            if kind == "down" {
+                pressed_keys.insert(key_id.clone());
+            } else if kind == "up" {
+                pressed_keys.remove(&key_id);
+            }
+
+            // Wake behavior: first key-down after blanking wakes the LEDs but is ignored.
+            if screensaver_active && kind == "down" {
+                // Restore base LEDs immediately.
+                info!("RGB screensaver: wake");
+                paint_base(
+                    &wtn,
+                    true,
+                    &rgb_index_by_device_id,
+                    trainer_mode,
+                    &octave_hold_by_device,
+                );
+                screensaver_active = false;
+                suppressed_keys.insert(key_id.clone());
+                continue;
+            }
+
+            // Manual debug dump: press LeftCtrl and RightCtrl within 400ms.
+            if kind == "down" && hid == HIDCodes::LeftCtrl {
+                let now = Instant::now();
+                last_leftctrl_down = Some(now);
+                if let Some(t) = last_rightctrl_down {
+                    if now.duration_since(t) <= Duration::from_millis(400) {
+                        dbg_push(&mut dbg_ring, &start_ts, "MANUAL_DUMP ctrl_chord");
+                        dbg_dump(
+                            &dbg_ring,
+                            "manual_ctrl_chord",
+                            &mut dbg_dumps,
+                            rgb_drop_critical,
+                        );
+                    }
+                }
+            }
+            if kind == "down" && hid == HIDCodes::RightCtrl {
+                let now = Instant::now();
+                last_rightctrl_down = Some(now);
+                if let Some(t) = last_leftctrl_down {
+                    if now.duration_since(t) <= Duration::from_millis(400) {
+                        dbg_push(&mut dbg_ring, &start_ts, "MANUAL_DUMP ctrl_chord");
+                        dbg_dump(
+                            &dbg_ring,
+                            "manual_ctrl_chord",
+                            &mut dbg_dumps,
+                            rgb_drop_critical,
+                        );
+                    }
+                }
+            }
+
+            // Suppressed keys do nothing until released.
+            if suppressed_keys.contains(&key_id) {
+                if kind == "up" {
+                    suppressed_keys.remove(&key_id);
+                }
+                continue;
+            }
+
+            let Some(bcfg) = board_by_device.get(&device_id) else {
+                continue;
+            };
+            let wtn_board = bcfg.wtn_board;
+            let rotation = bcfg.rotation_deg;
+
+            let is_control_bar = control_bar_cols_by_hid.contains_key(&hid);
+
+            // Runtime press threshold can be adjusted with control-bar keys.
+            // These keys never generate notes.
+            if kind == "down" {
+                match hid {
+                    HIDCodes::LeftCtrl => {
+                        if matches!(aftertouch_mode, AftertouchMode::Off) {
+                            manual_press_threshold = (manual_press_threshold
+                                - cfg.press_threshold_step)
+                                .clamp(0.02, 0.98);
+                            press_threshold_bits
+                                .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
+                            info!("press_threshold now {:.3}", manual_press_threshold);
+                        } else {
+                            aftertouch_speed_max = (aftertouch_speed_max
+                                - cfg.aftertouch_speed_step)
+                                .clamp(1.0, 200.0);
+                            info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
+                        }
+                        continue;
+                    }
+                    HIDCodes::RightCtrl => {
+                        if matches!(aftertouch_mode, AftertouchMode::Off) {
+                            manual_press_threshold = (manual_press_threshold
+                                + cfg.press_threshold_step)
+                                .clamp(0.02, 0.98);
+                            press_threshold_bits
+                                .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
+                            info!("press_threshold now {:.3}", manual_press_threshold);
+                        } else {
+                            aftertouch_speed_max = (aftertouch_speed_max
+                                + cfg.aftertouch_speed_step)
+                                .clamp(1.0, 200.0);
+                            info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
+                        }
+                        continue;
+                    }
+                    HIDCodes::LeftAlt => {
+                        velocity_profile_idx = (velocity_profile_idx + 1) % velocity_profiles.len();
+                        info!(
+                            "velocity_profile now {}",
+                            velocity_profiles[velocity_profile_idx].name()
+                        );
+                        continue;
+                    }
+                    HIDCodes::RightAlt => {
+                        aftertouch_mode = match aftertouch_mode {
+                            AftertouchMode::PeakMapped => AftertouchMode::SpeedMapped,
+                            AftertouchMode::SpeedMapped => AftertouchMode::Off,
+                            AftertouchMode::Off => AftertouchMode::PeakMapped,
+                        };
+                        if matches!(aftertouch_mode, AftertouchMode::Off) {
+                            press_threshold_bits
+                                .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
+                        } else {
+                            press_threshold_bits
+                                .store(AFTERTOUCH_PRESS_THRESHOLD.to_bits(), Ordering::Relaxed);
+                        }
+                        info!(
+                            "aftertouch_mode now {} (thr {:.2})",
+                            aftertouch_mode.name(),
+                            f32::from_bits(press_threshold_bits.load(Ordering::Relaxed))
+                        );
+                        continue;
+                    }
+                    HIDCodes::Space => {
+                        if octave_hold_by_device.contains(&device_id) {
+                            octave_hold_by_device.remove(&device_id);
+                            info!("octave_hold toggled off (device_id={})", device_id);
+                        } else {
+                            octave_hold_by_device.insert(device_id);
+                            info!("octave_hold toggled on (device_id={})", device_id);
+                        }
+                        paint_spacebar_indicator(
+                            device_id,
+                            &rgb_index_by_device_id,
+                            control_bar_rgb_for_tm(trainer_mode),
+                            octave_hold_by_device.contains(&device_id),
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Compute debug LED coordinates (either from control bar mapping or hid_map).
+            let dev_idx_dbg = rgb_index_by_device_id
+                .get(&device_id)
+                .copied()
+                .unwrap_or(255);
+            let mut lrow_dbg: Option<u8> = None;
+            let mut lcol_dbg: Option<String> = None;
+            if is_control_bar {
+                if let Some(cs) = control_bar_cols_by_hid.get(&hid) {
+                    lrow_dbg = Some(control_bar_row);
+                    lcol_dbg = Some(
+                        cs.iter()
+                            .map(|c| c.to_string())
+                            .collect::<Vec<String>>()
+                            .join(","),
+                    );
+                }
+            } else if let Some(loc0) = hid_map.loc_for(hid.clone()) {
+                if let Ok(loc) =
+                    rotate_4x14(loc0, rotation).and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
+                {
+                    lrow_dbg = Some(loc.led_row);
+                    lcol_dbg = Some(loc.led_col.to_string());
+                }
+            }
+
+            if dump_hid || log_edges {
+                let (lr_s, lc_s) = match (lrow_dbg, lcol_dbg.as_deref()) {
+                    (Some(lr), Some(lc)) => (lr.to_string(), lc.to_string()),
+                    _ => ("<none>".to_string(), "<none>".to_string()),
+                };
+                if kind == "down" {
+                    println!(
+                        "DOWN device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
+                        device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
+                    );
+                } else if kind == "up" {
+                    println!(
+                        "UP   device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
+                        device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
+                    );
+                } else if log_edges {
+                    // keep updates quiet unless explicitly requested
+                    println!(
+                        "UPD  device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
+                        device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
+                    );
+                }
+                if dump_hid {
+                    continue;
+                }
+            }
+
+            // Control bar LED feedback (independent of whether a key is bound to an action).
+            if rgb_enabled && is_control_bar {
+                let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) else {
+                    continue;
+                };
+                if let Some(cols) = control_bar_cols_by_hid.get(&hid) {
+                    if kind == "down" {
+                        for &lc in cols {
+                            try_send_drop(
+                                &rgb_tx,
+                                RgbCmd::SetKey(RgbKey {
+                                    device_index: dev_idx,
+                                    row: control_bar_row,
+                                    col: lc,
+                                    rgb: highlight_rgb,
+                                }),
+                            );
+                        }
+                    } else if kind == "up" {
+                        // Restore the control bar to the current mode colors.
+                        // Space's indicator overrides to white when octave-hold is enabled.
+                        let base_rgb = control_bar_rgb_for_tm(trainer_mode);
+                        if hid == HIDCodes::Space {
+                            paint_spacebar_indicator(
+                                device_id,
+                                &rgb_index_by_device_id,
+                                base_rgb,
+                                octave_hold_by_device.contains(&device_id),
+                            );
+                        } else {
+                            for &lc in cols {
+                                try_send_drop(
+                                    &rgb_tx,
+                                    RgbCmd::SetKey(RgbKey {
+                                        device_index: dev_idx,
+                                        row: control_bar_row,
+                                        col: lc,
+                                        rgb: base_rgb,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            if kind == "down" {
+                if let Some(action) = actions_by_hid.get(&hid) {
+                    match action.as_str() {
+                        "layout_next" => {
+                            if preview_enabled {
+                                let _ = fs::remove_file(&preview_enabled_path);
+                                let _ = fs::remove_file(&preview_wtn_path);
+                                let _ = fs::remove_file(&trainer_mode_path);
+                                preview_enabled = false;
+                                preview_layout_id = None;
+                                preview_wtn_mtime = None;
+                                info!("preview: disabled due to layout change");
+                            }
+                            if guide_mode != GuideMode::Off {
+                                let _ = fs::remove_file(&guide_path);
+                                guide_mode = GuideMode::Off;
+                                trainer_mode = TrainerMode::Off;
+                                guide_layout_id = None;
+                                guide_chord_key = None;
+                                guide_pcs_root.clear();
+                                guide_root_pc = None;
+                                info!("guide: disabled due to layout change");
+                                // Layout switching does not repaint the control bar; restore it explicitly.
+                                paint_control_bar(&rgb_index_by_device_id, (255, 0, 0));
+                                // Consume the first layout keypress to exit guide mode only.
+                                continue;
+                            }
+                            layout_index = (layout_index + 1) % layouts.len();
+                            eprintln!("layout_next -> {}", layouts[layout_index].id);
+                            set_mts_table(&master, &layouts[layout_index])?;
+                            wtn_path = resolve_path(&layouts[layout_index].wtn_path);
+                            eprintln!("loading wtn: {}", wtn_path.display());
+                            base_wtn = Wtn::load(&wtn_path)
+                                .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
+                            base_wtn_mtime =
+                                fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                            wtn_mtime = base_wtn_mtime;
+                            if !preview_enabled {
+                                wtn = base_wtn.clone();
+                                let edo = layouts[layout_index].edo_divisions;
+                                let pitch_offset = layouts[layout_index].pitch_offset;
+                                refresh_vel_led_bases(
+                                    &wtn,
+                                    &mut vel_state,
+                                    edo,
+                                    pitch_offset,
+                                    guide_mode,
+                                    &guide_pcs_abs,
+                                    guide_dim,
+                                );
+                                paint_base(
+                                    &wtn,
+                                    false,
+                                    &rgb_index_by_device_id,
+                                    trainer_mode,
+                                    &octave_hold_by_device,
+                                );
+                            }
+                        }
+                        "layout_prev" => {
+                            if preview_enabled {
+                                let _ = fs::remove_file(&preview_enabled_path);
+                                let _ = fs::remove_file(&preview_wtn_path);
+                                let _ = fs::remove_file(&trainer_mode_path);
+                                preview_enabled = false;
+                                preview_layout_id = None;
+                                preview_wtn_mtime = None;
+                                info!("preview: disabled due to layout change");
+                            }
+                            if guide_mode != GuideMode::Off {
+                                let _ = fs::remove_file(&guide_path);
+                                guide_mode = GuideMode::Off;
+                                trainer_mode = TrainerMode::Off;
+                                guide_layout_id = None;
+                                guide_chord_key = None;
+                                guide_pcs_root.clear();
+                                guide_root_pc = None;
+                                info!("guide: disabled due to layout change");
+                                // Layout switching does not repaint the control bar; restore it explicitly.
+                                paint_control_bar(&rgb_index_by_device_id, (255, 0, 0));
+                                // Consume the first layout keypress to exit guide mode only.
+                                continue;
+                            }
+                            if layout_index == 0 {
+                                layout_index = layouts.len() - 1;
+                            } else {
+                                layout_index -= 1;
+                            }
+                            eprintln!("layout_prev -> {}", layouts[layout_index].id);
+                            set_mts_table(&master, &layouts[layout_index])?;
+                            wtn_path = resolve_path(&layouts[layout_index].wtn_path);
+                            eprintln!("loading wtn: {}", wtn_path.display());
+                            base_wtn = Wtn::load(&wtn_path)
+                                .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
+                            base_wtn_mtime =
+                                fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                            wtn_mtime = base_wtn_mtime;
+                            if !preview_enabled {
+                                wtn = base_wtn.clone();
+                                let edo = layouts[layout_index].edo_divisions;
+                                let pitch_offset = layouts[layout_index].pitch_offset;
+                                refresh_vel_led_bases(
+                                    &wtn,
+                                    &mut vel_state,
+                                    edo,
+                                    pitch_offset,
+                                    guide_mode,
+                                    &guide_pcs_abs,
+                                    guide_dim,
+                                );
+                                paint_base(
+                                    &wtn,
+                                    false,
+                                    &rgb_index_by_device_id,
+                                    trainer_mode,
+                                    &octave_hold_by_device,
+                                );
+                            }
+                        }
+                        "octave_up" => {
+                            octave_shift = (octave_shift + 1).min(15);
+                            info!("octave_shift now {}", octave_shift);
+                        }
+                        "octave_down" => {
+                            octave_shift = (octave_shift - 1).max(-15);
+                            info!("octave_shift now {}", octave_shift);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+            }
+
+            // Control bar keys never produce MIDI notes.
+            if is_control_bar {
+                continue;
+            }
+
+            if let Some(loc) = hid_map.loc_for(hid.clone()) {
+                let loc = mirror_cols_4x14(rotate_4x14(loc, rotation)?, bcfg.mirror_cols)?;
+                let compact_min_col = compact_min_col_by_device
+                    .get(&device_id)
+                    .unwrap_or(&[0u8, 0u8, 0u8, 0u8]);
+                let Some(idx) = wtn_index_for_loc(loc, compact_min_col) else {
+                    continue;
+                };
+                if let Some(cell) = wtn.cell(wtn_board, idx) {
+                    let base_ch = cell.chan_1based.saturating_sub(1);
+                    let hold = if octave_hold_by_device.contains(&device_id) {
+                        1i16
+                    } else {
+                        0i16
+                    };
+                    let shifted = (base_ch as i16) + (octave_shift as i16) + hold;
+                    let out_ch: u8 = shifted.clamp(0, 15) as u8;
+                    let note = cell.key;
+                    let edo = layouts
+                        .get(layout_index)
+                        .map(|l| l.edo_divisions)
+                        .unwrap_or(12);
+                    let pitch_offset = layouts
+                        .get(layout_index)
+                        .map(|l| l.pitch_offset)
+                        .unwrap_or(0);
+
+                    // Guide: first non-control-bar key-down selects the root pitch class.
+                    // This does not suppress MIDI; it only affects LED painting.
+                    if kind == "down" && guide_mode == GuideMode::WaitRoot {
+                        let mut pc = (note as i32) + pitch_offset;
+                        pc %= edo;
+                        if pc < 0 {
+                            pc += edo;
+                        }
+                        guide_root_pc = Some(pc);
+                        guide_mode = GuideMode::Active;
+                        trainer_mode = TrainerMode::Active;
+                        guide_pcs_abs.clear();
+                        for rel in guide_pcs_root.iter() {
+                            let mut x = (rel + pc) % edo;
+                            if x < 0 {
+                                x += edo;
+                            }
+                            guide_pcs_abs.insert(x);
+                        }
+                        last_activity = Instant::now();
+                        info!(
+                            "guide: root selected pc={} chord_key={:?}",
+                            pc, guide_chord_key
+                        );
+                        paint_guide(
+                            &wtn,
+                            &rgb_index_by_device_id,
+                            edo,
+                            pitch_offset,
+                            guide_mode,
+                            &guide_pcs_root,
+                            guide_root_pc,
+                            guide_dim,
+                            &octave_hold_by_device,
+                        );
+
+                        // Ensure any currently-held keys restore to the correct (dimmed) guide idle colors.
+                        refresh_vel_led_bases(
+                            &wtn,
+                            &mut vel_state,
+                            edo,
+                            pitch_offset,
+                            guide_mode,
+                            &guide_pcs_abs,
+                            guide_dim,
+                        );
+                    }
+
+                    // Maintain per-key velocity state.
+                    if kind == "down" {
+                        dbg_push(
+                            &mut dbg_ring,
+                            &start_ts,
+                            format!(
+                                "EDGE down dev={} hid={:?} analog={:.3}",
+                                device_id, hid, analog
+                            ),
+                        );
+                        let already_playing = note_by_key.contains_key(&key_id);
+
+                        let led = if rgb_enabled {
+                            if let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) {
+                                rgb_send_critical(
+                                    &rgb_tx,
+                                    &mut dbg_ring,
+                                    &start_ts,
+                                    &mut dbg_dumps,
+                                    &mut rgb_drop_critical,
+                                    RgbCmd::SetKey(RgbKey {
+                                        device_index: dev_idx,
+                                        row: loc.led_row,
+                                        col: loc.led_col,
+                                        rgb: highlight_rgb,
+                                    }),
+                                    format!(
+                                        "highlight dev={} hid={:?} r{}c{}",
+                                        device_id, hid, loc.led_row, loc.led_col
+                                    ),
+                                );
+                                Some(LedState {
+                                    dev_idx,
+                                    row: loc.led_row,
+                                    col: loc.led_col,
+                                    base_rgb: guide_idle_rgb(
+                                        cell.col_rgb,
+                                        cell.key,
+                                        edo,
+                                        pitch_offset,
+                                        guide_mode,
+                                        &guide_pcs_abs,
+                                        guide_dim,
+                                    ),
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        vel_state.insert(
+                            key_id,
+                            VelState::Tracking {
+                                started: ts,
+                                peak: analog,
+                                last_analog: analog,
+                                last_analog_ts: ts,
+                                peak_speed: 0.0,
+                                at_level: 0.0,
+                                out_ch,
+                                note,
+                                playing: already_playing,
+                                led,
+                            },
+                        );
+                    } else if kind == "update" {
+                        if log_edges {
+                            dbg_push(
+                                &mut dbg_ring,
+                                &start_ts,
+                                format!(
+                                    "EDGE update dev={} hid={:?} analog={:.3}",
+                                    device_id, hid, analog
+                                ),
+                            );
+                        }
+                        if let Some(st) = vel_state.get_mut(&key_id) {
+                            match st {
+                                VelState::Tracking {
+                                    peak,
+                                    last_analog,
+                                    last_analog_ts,
+                                    peak_speed,
+                                    ..
+                                } => {
+                                    if analog > *peak {
+                                        *peak = analog;
+                                    }
+                                    // Speed tracking for speed-mapped aftertouch.
+                                    let dt = (ts - *last_analog_ts).as_secs_f32();
+                                    if dt > 0.0 {
+                                        let s = (analog - *last_analog) / dt;
+                                        if s.is_finite() && s > *peak_speed {
+                                            *peak_speed = s.max(0.0);
+                                        }
+                                    }
+                                    *last_analog = analog;
+                                    *last_analog_ts = ts;
+                                }
+                            }
+                        }
+                    } else if kind == "up" {
+                        dbg_push(
+                            &mut dbg_ring,
+                            &start_ts,
+                            format!(
+                                "EDGE up   dev={} hid={:?} analog={:.3}",
+                                device_id, hid, analog
+                            ),
+                        );
+                        let removed = vel_state.remove(&key_id);
+
+                        // Restore LED immediately.
+                        if let Some(VelState::Tracking { led: Some(led), .. }) = &removed {
+                            rgb_send_critical(
+                                &rgb_tx,
+                                &mut dbg_ring,
+                                &start_ts,
+                                &mut dbg_dumps,
+                                &mut rgb_drop_critical,
+                                RgbCmd::SetKey(RgbKey {
+                                    device_index: led.dev_idx,
+                                    row: led.row,
+                                    col: led.col,
+                                    rgb: led.base_rgb,
+                                }),
+                                format!(
+                                    "restore dev={} hid={:?} r{}c{}",
+                                    device_id, hid, led.row, led.col
+                                ),
+                            );
+                        } else if rgb_enabled {
+                            if let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) {
+                                let _ = try_send_drop(
+                                    &rgb_tx,
+                                    RgbCmd::SetKey(RgbKey {
+                                        device_index: dev_idx,
+                                        row: loc.led_row,
+                                        col: loc.led_col,
+                                        rgb: guide_idle_rgb(
+                                            cell.col_rgb,
+                                            cell.key,
+                                            edo,
+                                            pitch_offset,
+                                            guide_mode,
+                                            &guide_pcs_abs,
+                                            guide_dim,
+                                        ),
+                                    }),
+                                );
+                            }
+                        }
+
+                        // NoteOff: prefer the robust mapping; fall back to vel_state if needed.
+                        let mut sent = false;
+                        if let Some((ch, note0)) = note_by_key.remove(&key_id) {
+                            let cnt = note_on_count.entry((ch, note0)).or_insert(1);
+                            if *cnt > 1 {
+                                dbg_push(
+                                &mut dbg_ring,
+                                &start_ts,
+                                format!(
+                                    "MIDI noteoff skip (refcount) dev={} hid={:?} ch={} note={} cnt={}",
+                                    device_id, hid, ch, note0, *cnt
+                                ),
+                            );
+                                *cnt -= 1;
+                            } else {
+                                note_on_count.remove(&(ch, note0));
+                                match midi_out.send_note(false, ch, note0, 0) {
+                                    Ok(()) => {
+                                        dbg_push(
+                                            &mut dbg_ring,
+                                            &start_ts,
+                                            format!(
+                                                "MIDI noteoff ok dev={} hid={:?} ch={} note={}",
+                                                device_id, hid, ch, note0
+                                            ),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "MIDI noteoff failed ch={} note={} err={:?}",
+                                            ch, note0, e
+                                        );
+                                        warn!(
+                                            "PANIC: sending CC64=0 CC120=0 CC123=0 (noteoff error)"
+                                        );
+                                        dbg_push(
+                                            &mut dbg_ring,
+                                            &start_ts,
+                                            format!("PANIC noteoff_error ch={} note={}", ch, note0),
+                                        );
+                                        dbg_dump(
+                                            &dbg_ring,
+                                            "noteoff_error",
+                                            &mut dbg_dumps,
+                                            rgb_drop_critical,
+                                        );
+                                        midi_out.panic_all();
+                                        note_by_key.clear();
+                                        note_on_count.clear();
+                                    }
+                                }
+                            }
+                            sent = true;
+                        } else if let Some(VelState::Tracking {
+                            out_ch,
+                            note: note0,
+                            playing,
+                            ..
+                        }) = removed
+                        {
+                            if playing {
+                                match midi_out.send_note(false, out_ch, note0, 0) {
+                                    Ok(()) => {
+                                        dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!(
+                                            "MIDI noteoff ok (fallback) dev={} hid={:?} ch={} note={}",
+                                            device_id, hid, out_ch, note0
+                                        ),
+                                    );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "MIDI noteoff failed (fallback) ch={} note={} err={:?}",
+                                            out_ch, note0, e
+                                        );
+                                        warn!(
+                                            "PANIC: sending CC64=0 CC120=0 CC123=0 (noteoff error)"
+                                        );
+                                        dbg_push(
+                                            &mut dbg_ring,
+                                            &start_ts,
+                                            format!(
+                                                "PANIC noteoff_error_fallback ch={} note={}",
+                                                out_ch, note0
+                                            ),
+                                        );
+                                        dbg_dump(
+                                            &dbg_ring,
+                                            "noteoff_error_fallback",
+                                            &mut dbg_dumps,
+                                            rgb_drop_critical,
+                                        );
+                                        midi_out.panic_all();
+                                        note_by_key.clear();
+                                        note_on_count.clear();
+                                    }
+                                }
+                                sent = true;
+                            }
+                        }
+
+                        if !sent {
+                            warn!(
+                            "Up without note mapping: device_id={} hid={:?}; sending CC123/CC120 panic",
+                            device_id, hid
+                        );
+                            dbg_push(
+                                &mut dbg_ring,
+                                &start_ts,
+                                format!(
+                                    "PANIC Up without note mapping dev={} hid={:?}",
+                                    device_id, hid
+                                ),
+                            );
+                            dbg_dump(
+                                &dbg_ring,
+                                "up_without_note_mapping",
+                                &mut dbg_dumps,
+                                rgb_drop_critical,
+                            );
+                            midi_out.panic_all();
+                            note_by_key.clear();
+                            note_on_count.clear();
+                        }
+                    }
+                } else if log_midi {
+                    println!(
+                        "NO_CELL  dev={} wtn_board={} hid={:?} idx={} (wtn missing?)",
+                        device_id, wtn_board, hid, idx
+                    );
+                }
+            } else if log_midi {
+                println!(
+                    "UNMAPPED dev={} wtn_board={} hid={:?}",
+                    device_id, wtn_board, hid
+                );
+            }
+
+            // End per-edge processing.
+        }
+
+        // Timer tick: fire peak-tracked NoteOn and periodic aftertouch.
         {
             let peak_track = Duration::from_millis(cfg.velocity_peak_track_ms.max(1) as u64);
-            let aftershock = Duration::from_millis(cfg.aftershock_ms.max(1) as u64);
             let threshold =
                 f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
             let max_swing = cfg.velocity_max_swing.clamp(0.05, 1.0);
@@ -2331,54 +3415,123 @@ fn main() -> Result<()> {
                     VelState::Tracking {
                         started,
                         peak,
-                        last_analog: _,
-                        last_analog_ts: _,
+                        last_analog,
+                        last_analog_ts,
                         peak_speed,
                         mut at_level,
-                        mut at_last_ts,
                         out_ch,
                         note,
                         playing,
-                        last_val: _,
                         led,
                     } => {
-                        if started.elapsed() >= peak_track {
-                            let n = match aftertouch_mode {
-                                AftertouchMode::SpeedMapped => {
-                                    (peak_speed / aftertouch_speed_max.max(0.001)).clamp(0.0, 1.0)
-                                }
-                                _ => {
-                                    let denom = (max_swing - threshold).max(0.001);
-                                    ((peak - threshold) / denom).clamp(0.0, 1.0)
-                                }
-                            };
+                        if started.elapsed() < peak_track {
+                            continue;
+                        }
 
-                            let n2 = velocity_profiles[velocity_profile_idx].apply(n);
-                            let vel = (n2 * 126.0).round().clamp(0.0, 126.0) as u8 + 1;
+                        // Guard against firing delayed NoteOn after the key has been released.
+                        if !playing && !pressed_keys.contains(&key) {
+                            dbg_push(
+                                &mut dbg_ring,
+                                &start_ts,
+                                format!(
+                                    "LATE_NOTEON_SKIP dev={} hid={:?} age_ms={} peak={:.3} last={:.3}",
+                                    key.0,
+                                    key.1,
+                                    started.elapsed().as_millis(),
+                                    peak,
+                                    last_analog
+                                ),
+                            );
+                            dbg_dump(
+                                &dbg_ring,
+                                "late_noteon_skip",
+                                &mut dbg_dumps,
+                                rgb_drop_critical,
+                            );
+                            vel_state.remove(&key);
+                            continue;
+                        }
 
-                            // Aftertouch should be monotonic while held: it never decreases.
-                            // This makes "press and hold" preserve the last loudness level.
-                            if n2 > at_level {
-                                at_level = n2;
+                        dbg_push(
+                            &mut dbg_ring,
+                            &start_ts,
+                            format!(
+                                "NOTEON_TICK dev={} hid={:?} age_ms={} playing={} pressed={} peak={:.3} last={:.3} peak_speed={:.3}",
+                                key.0,
+                                key.1,
+                                started.elapsed().as_millis(),
+                                playing,
+                                pressed_keys.contains(&key),
+                                peak,
+                                last_analog,
+                                peak_speed
+                            ),
+                        );
+
+                        let n = match aftertouch_mode {
+                            AftertouchMode::SpeedMapped => {
+                                (peak_speed / aftertouch_speed_max.max(0.001)).clamp(0.0, 1.0)
                             }
-                            at_level = at_level.clamp(0.0, 1.0);
-                            at_last_ts = Instant::now();
+                            _ => {
+                                let denom = (max_swing - threshold).max(0.001);
+                                ((peak - threshold) / denom).clamp(0.0, 1.0)
+                            }
+                        };
 
-                            let pressure: u8 = match aftertouch_mode {
-                                AftertouchMode::SpeedMapped => {
-                                    (at_level * 127.0).round().clamp(0.0, 127.0) as u8
+                        let n2 = velocity_profiles[velocity_profile_idx].apply(n);
+                        let vel = (n2 * 126.0).round().clamp(0.0, 126.0) as u8 + 1;
+
+                        // Aftertouch should be monotonic while held: it never decreases.
+                        if n2 > at_level {
+                            at_level = n2;
+                        }
+                        at_level = at_level.clamp(0.0, 1.0);
+
+                        let pressure: u8 = match aftertouch_mode {
+                            AftertouchMode::SpeedMapped | AftertouchMode::PeakMapped => {
+                                (at_level * 127.0).round().clamp(0.0, 127.0) as u8
+                            }
+                            AftertouchMode::Off => 0,
+                        };
+
+                        if !playing {
+                            let noteon_ok = match midi_out.send_note(true, out_ch, note, vel) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    warn!(
+                                        "MIDI noteon failed ch={} note={} vel={} err={:?}",
+                                        out_ch, note, vel, e
+                                    );
+                                    dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!(
+                                            "MIDI noteon failed ch={} note={} vel={}",
+                                            out_ch, note, vel
+                                        ),
+                                    );
+                                    dbg_dump(
+                                        &dbg_ring,
+                                        "noteon_failed",
+                                        &mut dbg_dumps,
+                                        rgb_drop_critical,
+                                    );
+                                    false
                                 }
-                                AftertouchMode::PeakMapped => {
-                                    (at_level * 126.0).round().clamp(0.0, 126.0) as u8 + 1
-                                }
-                                AftertouchMode::Off => 0,
                             };
 
-                            if !playing {
-                                let _ = midi_out.send_note(true, out_ch, note, vel);
+                            if noteon_ok {
+                                dbg_push(
+                                    &mut dbg_ring,
+                                    &start_ts,
+                                    format!(
+                                        "MIDI noteon ok dev={} hid={:?} ch={} note={} vel={}",
+                                        key.0, key.1, out_ch, note, vel
+                                    ),
+                                );
+                                note_by_key.insert(key.clone(), (out_ch, note));
+                                *note_on_count.entry((out_ch, note)).or_insert(0) += 1;
 
-                                // Emit an initial aftertouch value as soon as the note starts.
-                                // This helps setups where aftertouch is mapped to loudness.
                                 if !no_aftertouch {
                                     match aftertouch_mode {
                                         AftertouchMode::PeakMapped
@@ -2388,834 +3541,80 @@ fn main() -> Result<()> {
                                         AftertouchMode::Off => {}
                                     }
                                 }
-
-                                // After firing, go to Aftershock state (like the Teensy state
-                                // machine). While the key is still held, the next Update will
-                                // return it to Tracking again, and repeated windows will emit
-                                // aftertouch values.
-                                vel_state.insert(
-                                    key,
-                                    VelState::Aftershock {
-                                        quiet_since: None,
-                                        at_level,
-                                        at_last_ts,
-                                        out_ch,
-                                        note,
-                                        playing: true,
-                                        last_val: vel,
-                                        led,
-                                    },
-                                );
-                            } else {
-                                if !no_aftertouch {
-                                    match aftertouch_mode {
-                                        AftertouchMode::PeakMapped => {
-                                            let _ = midi_out.send_polytouch(out_ch, note, pressure);
-                                        }
-                                        AftertouchMode::SpeedMapped => {
-                                            let _ = midi_out.send_polytouch(out_ch, note, pressure);
-                                        }
-                                        AftertouchMode::Off => {}
-                                    }
-                                }
-                                vel_state.insert(
-                                    key,
-                                    VelState::Aftershock {
-                                        quiet_since: None,
-                                        at_level,
-                                        at_last_ts,
-                                        out_ch,
-                                        note,
-                                        playing,
-                                        last_val: vel,
-                                        led,
-                                    },
-                                );
                             }
-                        }
-                    }
-                    VelState::Aftershock {
-                        quiet_since,
-                        at_level: _,
-                        at_last_ts: _,
-                        out_ch,
-                        note,
-                        playing,
-                        last_val,
-                        led,
-                    } => {
-                        let Some(qs) = quiet_since else {
-                            continue;
-                        };
-                        if qs.elapsed() >= aftershock {
-                            if playing {
-                                // Use the last computed peak-mapped value as release velocity.
-                                // This is simple, works well with Pianoteq, and mirrors the
-                                // Teensy behavior where aftertouch uses the same mapped value.
-                                let _ = midi_out.send_note(false, out_ch, note, last_val);
-                            }
-                            if let Some(led) = led {
-                                let _ = try_send_drop(
-                                    &rgb_tx,
-                                    RgbCmd::SetKey(RgbKey {
-                                        device_index: led.dev_idx,
-                                        row: led.row,
-                                        col: led.col,
-                                        rgb: led.base_rgb,
-                                    }),
-                                );
-                            }
-                            vel_state.remove(&key);
-                        }
-                    }
-                }
-            }
-        }
 
-        let edge = match rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(e) => Some(e),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(_) => break,
-        };
-
-        if edge.is_none() {
-            // Idle tick: possibly activate screensaver.
-            if rgb_enabled
-                && !screensaver_active
-                && pressed_keys.is_empty()
-                && cfg.rgb.screensaver_timeout_sec > 0
-                && last_activity.elapsed()
-                    >= Duration::from_secs(cfg.rgb.screensaver_timeout_sec as u64)
-            {
-                info!(
-                    "RGB screensaver: blank after {}s idle",
-                    cfg.rgb.screensaver_timeout_sec
-                );
-                // If a web-driven preview (e.g. chord trainer) is active, disable it so it can't
-                // keep re-applying colors after wake.
-                let _ = fs::remove_file(&preview_enabled_path);
-                let _ = fs::remove_file(&preview_wtn_path);
-                let _ = fs::remove_file(&trainer_mode_path);
-                let _ = fs::remove_file(&guide_path);
-                preview_enabled = false;
-                preview_layout_id = None;
-                guide_mode = GuideMode::Off;
-                trainer_mode = TrainerMode::Off;
-                guide_layout_id = None;
-                guide_chord_key = None;
-                guide_pcs_root.clear();
-                guide_root_pc = None;
-                paint_off(&rgb_index_by_device_id);
-                screensaver_active = true;
-            }
-
-            publish_live(
-                &wtn,
-                &layouts,
-                layout_index,
-                press_threshold_bits.as_ref(),
-                &aftertouch_mode,
-                aftertouch_speed_max,
-                octave_shift,
-                screensaver_active,
-                preview_enabled,
-                guide_mode,
-                &guide_chord_key,
-                guide_root_pc,
-                &board_by_device,
-                &vel_state,
-            );
-            continue;
-        }
-
-        let edge = edge.unwrap();
-
-        let (device_id, hid, analog, kind, ts) = match edge {
-            KeyEdge::Down {
-                device_id,
-                hid,
-                analog,
-                ts,
-            } => (device_id, hid, analog, "down", ts),
-            KeyEdge::Update {
-                device_id,
-                hid,
-                analog,
-                ts,
-            } => (device_id, hid, analog, "update", ts),
-            KeyEdge::Up {
-                device_id,
-                hid,
-                analog,
-                ts,
-            } => (device_id, hid, analog, "up", ts),
-        };
-
-        let key_id = (device_id, hid.clone());
-
-        // Count only down/up as inactivity-resetting activity.
-        // Update edges can be noisy due to analog jitter and should not prevent blanking.
-        if kind != "update" {
-            last_activity = Instant::now();
-        }
-
-        // Maintain pressed-key tracking even when suppressed.
-        if kind == "down" {
-            pressed_keys.insert(key_id.clone());
-        } else if kind == "up" {
-            pressed_keys.remove(&key_id);
-        }
-
-        // Wake behavior: first key-down after blanking wakes the LEDs but is ignored.
-        if screensaver_active && kind == "down" {
-            // Restore base LEDs immediately.
-            info!("RGB screensaver: wake");
-            paint_base(
-                &wtn,
-                true,
-                &rgb_index_by_device_id,
-                trainer_mode,
-                &octave_hold_by_device,
-            );
-            screensaver_active = false;
-            suppressed_keys.insert(key_id.clone());
-            continue;
-        }
-
-        // Suppressed keys do nothing until released.
-        if suppressed_keys.contains(&key_id) {
-            if kind == "up" {
-                suppressed_keys.remove(&key_id);
-            }
-            continue;
-        }
-
-        let Some(bcfg) = board_by_device.get(&device_id) else {
-            continue;
-        };
-        let wtn_board = bcfg.wtn_board;
-        let rotation = bcfg.rotation_deg;
-
-        let is_control_bar = control_bar_cols_by_hid.contains_key(&hid);
-
-        // Runtime press threshold can be adjusted with control-bar keys.
-        // These keys never generate notes.
-        if kind == "down" {
-            match hid {
-                HIDCodes::LeftCtrl => {
-                    if matches!(aftertouch_mode, AftertouchMode::Off) {
-                        manual_press_threshold =
-                            (manual_press_threshold - cfg.press_threshold_step).clamp(0.02, 0.98);
-                        press_threshold_bits
-                            .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
-                        info!("press_threshold now {:.3}", manual_press_threshold);
-                    } else {
-                        aftertouch_speed_max =
-                            (aftertouch_speed_max - cfg.aftertouch_speed_step).clamp(1.0, 200.0);
-                        info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
-                    }
-                    continue;
-                }
-                HIDCodes::RightCtrl => {
-                    if matches!(aftertouch_mode, AftertouchMode::Off) {
-                        manual_press_threshold =
-                            (manual_press_threshold + cfg.press_threshold_step).clamp(0.02, 0.98);
-                        press_threshold_bits
-                            .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
-                        info!("press_threshold now {:.3}", manual_press_threshold);
-                    } else {
-                        aftertouch_speed_max =
-                            (aftertouch_speed_max + cfg.aftertouch_speed_step).clamp(1.0, 200.0);
-                        info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
-                    }
-                    continue;
-                }
-                HIDCodes::LeftAlt => {
-                    velocity_profile_idx = (velocity_profile_idx + 1) % velocity_profiles.len();
-                    info!(
-                        "velocity_profile now {}",
-                        velocity_profiles[velocity_profile_idx].name()
-                    );
-                    continue;
-                }
-                HIDCodes::RightAlt => {
-                    aftertouch_mode = match aftertouch_mode {
-                        AftertouchMode::PeakMapped => AftertouchMode::SpeedMapped,
-                        AftertouchMode::SpeedMapped => AftertouchMode::Off,
-                        AftertouchMode::Off => AftertouchMode::PeakMapped,
-                    };
-                    if matches!(aftertouch_mode, AftertouchMode::Off) {
-                        press_threshold_bits
-                            .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
-                    } else {
-                        press_threshold_bits
-                            .store(AFTERTOUCH_PRESS_THRESHOLD.to_bits(), Ordering::Relaxed);
-                    }
-                    info!(
-                        "aftertouch_mode now {} (thr {:.2})",
-                        aftertouch_mode.name(),
-                        f32::from_bits(press_threshold_bits.load(Ordering::Relaxed))
-                    );
-                    continue;
-                }
-                HIDCodes::Space => {
-                    if octave_hold_by_device.contains(&device_id) {
-                        octave_hold_by_device.remove(&device_id);
-                        info!("octave_hold toggled off (device_id={})", device_id);
-                    } else {
-                        octave_hold_by_device.insert(device_id);
-                        info!("octave_hold toggled on (device_id={})", device_id);
-                    }
-                    paint_spacebar_indicator(
-                        device_id,
-                        &rgb_index_by_device_id,
-                        control_bar_rgb_for_tm(trainer_mode),
-                        octave_hold_by_device.contains(&device_id),
-                    );
-                    continue;
-                }
-                _ => {}
-            }
-        }
-
-        // Compute debug LED coordinates (either from control bar mapping or hid_map).
-        let dev_idx_dbg = rgb_index_by_device_id
-            .get(&device_id)
-            .copied()
-            .unwrap_or(255);
-        let mut lrow_dbg: Option<u8> = None;
-        let mut lcol_dbg: Option<String> = None;
-        if is_control_bar {
-            if let Some(cs) = control_bar_cols_by_hid.get(&hid) {
-                lrow_dbg = Some(control_bar_row);
-                lcol_dbg = Some(
-                    cs.iter()
-                        .map(|c| c.to_string())
-                        .collect::<Vec<String>>()
-                        .join(","),
-                );
-            }
-        } else if let Some(loc0) = hid_map.loc_for(hid.clone()) {
-            if let Ok(loc) =
-                rotate_4x14(loc0, rotation).and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
-            {
-                lrow_dbg = Some(loc.led_row);
-                lcol_dbg = Some(loc.led_col.to_string());
-            }
-        }
-
-        if dump_hid || log_edges {
-            let (lr_s, lc_s) = match (lrow_dbg, lcol_dbg.as_deref()) {
-                (Some(lr), Some(lc)) => (lr.to_string(), lc.to_string()),
-                _ => ("<none>".to_string(), "<none>".to_string()),
-            };
-            if kind == "down" {
-                println!(
-                    "DOWN device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
-                    device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
-                );
-            } else if kind == "up" {
-                println!(
-                    "UP   device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
-                    device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
-                );
-            } else if log_edges {
-                // keep updates quiet unless explicitly requested
-                println!(
-                    "UPD  device_id={} hid={:?} analog={:.3} lRow={} lCol={} dev_idx={}",
-                    device_id, hid, analog, lr_s, lc_s, dev_idx_dbg
-                );
-            }
-            if dump_hid {
-                continue;
-            }
-        }
-
-        // Control bar LED feedback (independent of whether a key is bound to an action).
-        if rgb_enabled && is_control_bar {
-            let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) else {
-                continue;
-            };
-            if let Some(cols) = control_bar_cols_by_hid.get(&hid) {
-                if kind == "down" {
-                    for &lc in cols {
-                        try_send_drop(
-                            &rgb_tx,
-                            RgbCmd::SetKey(RgbKey {
-                                device_index: dev_idx,
-                                row: control_bar_row,
-                                col: lc,
-                                rgb: highlight_rgb,
-                            }),
-                        );
-                    }
-                } else if kind == "up" {
-                    // Restore the control bar to the current mode colors.
-                    // Space's indicator overrides to white when octave-hold is enabled.
-                    let base_rgb = control_bar_rgb_for_tm(trainer_mode);
-                    if hid == HIDCodes::Space {
-                        paint_spacebar_indicator(
-                            device_id,
-                            &rgb_index_by_device_id,
-                            base_rgb,
-                            octave_hold_by_device.contains(&device_id),
-                        );
-                    } else {
-                        for &lc in cols {
-                            try_send_drop(
-                                &rgb_tx,
-                                RgbCmd::SetKey(RgbKey {
-                                    device_index: dev_idx,
-                                    row: control_bar_row,
-                                    col: lc,
-                                    rgb: base_rgb,
-                                }),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        if kind == "down" {
-            if let Some(action) = actions_by_hid.get(&hid) {
-                match action.as_str() {
-                    "layout_next" => {
-                        if preview_enabled {
-                            let _ = fs::remove_file(&preview_enabled_path);
-                            let _ = fs::remove_file(&preview_wtn_path);
-                            let _ = fs::remove_file(&trainer_mode_path);
-                            preview_enabled = false;
-                            preview_layout_id = None;
-                            preview_wtn_mtime = None;
-                            info!("preview: disabled due to layout change");
-                        }
-                        if guide_mode != GuideMode::Off {
-                            let _ = fs::remove_file(&guide_path);
-                            guide_mode = GuideMode::Off;
-                            trainer_mode = TrainerMode::Off;
-                            guide_layout_id = None;
-                            guide_chord_key = None;
-                            guide_pcs_root.clear();
-                            guide_root_pc = None;
-                            info!("guide: disabled due to layout change");
-                            // Layout switching does not repaint the control bar; restore it explicitly.
-                            paint_control_bar(&rgb_index_by_device_id, (255, 0, 0));
-                            // Consume the first layout keypress to exit guide mode only.
-                            continue;
-                        }
-                        layout_index = (layout_index + 1) % layouts.len();
-                        eprintln!("layout_next -> {}", layouts[layout_index].id);
-                        set_mts_table(&master, &layouts[layout_index])?;
-                        wtn_path = resolve_path(&layouts[layout_index].wtn_path);
-                        eprintln!("loading wtn: {}", wtn_path.display());
-                        base_wtn = Wtn::load(&wtn_path)
-                            .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
-                        base_wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
-                        wtn_mtime = base_wtn_mtime;
-                        if !preview_enabled {
-                            wtn = base_wtn.clone();
-                            let edo = layouts[layout_index].edo_divisions;
-                            let pitch_offset = layouts[layout_index].pitch_offset;
-                            refresh_vel_led_bases(
-                                &wtn,
-                                &mut vel_state,
-                                edo,
-                                pitch_offset,
-                                guide_mode,
-                                &guide_pcs_abs,
-                                guide_dim,
-                            );
-                            paint_base(
-                                &wtn,
-                                false,
-                                &rgb_index_by_device_id,
-                                trainer_mode,
-                                &octave_hold_by_device,
-                            );
-                        }
-                    }
-                    "layout_prev" => {
-                        if preview_enabled {
-                            let _ = fs::remove_file(&preview_enabled_path);
-                            let _ = fs::remove_file(&preview_wtn_path);
-                            let _ = fs::remove_file(&trainer_mode_path);
-                            preview_enabled = false;
-                            preview_layout_id = None;
-                            preview_wtn_mtime = None;
-                            info!("preview: disabled due to layout change");
-                        }
-                        if guide_mode != GuideMode::Off {
-                            let _ = fs::remove_file(&guide_path);
-                            guide_mode = GuideMode::Off;
-                            trainer_mode = TrainerMode::Off;
-                            guide_layout_id = None;
-                            guide_chord_key = None;
-                            guide_pcs_root.clear();
-                            guide_root_pc = None;
-                            info!("guide: disabled due to layout change");
-                            // Layout switching does not repaint the control bar; restore it explicitly.
-                            paint_control_bar(&rgb_index_by_device_id, (255, 0, 0));
-                            // Consume the first layout keypress to exit guide mode only.
-                            continue;
-                        }
-                        if layout_index == 0 {
-                            layout_index = layouts.len() - 1;
-                        } else {
-                            layout_index -= 1;
-                        }
-                        eprintln!("layout_prev -> {}", layouts[layout_index].id);
-                        set_mts_table(&master, &layouts[layout_index])?;
-                        wtn_path = resolve_path(&layouts[layout_index].wtn_path);
-                        eprintln!("loading wtn: {}", wtn_path.display());
-                        base_wtn = Wtn::load(&wtn_path)
-                            .with_context(|| format!("Load wtn {}", wtn_path.display()))?;
-                        base_wtn_mtime = fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
-                        wtn_mtime = base_wtn_mtime;
-                        if !preview_enabled {
-                            wtn = base_wtn.clone();
-                            let edo = layouts[layout_index].edo_divisions;
-                            let pitch_offset = layouts[layout_index].pitch_offset;
-                            refresh_vel_led_bases(
-                                &wtn,
-                                &mut vel_state,
-                                edo,
-                                pitch_offset,
-                                guide_mode,
-                                &guide_pcs_abs,
-                                guide_dim,
-                            );
-                            paint_base(
-                                &wtn,
-                                false,
-                                &rgb_index_by_device_id,
-                                trainer_mode,
-                                &octave_hold_by_device,
-                            );
-                        }
-                    }
-                    "octave_up" => {
-                        octave_shift = (octave_shift + 1).min(15);
-                        info!("octave_shift now {}", octave_shift);
-                    }
-                    "octave_down" => {
-                        octave_shift = (octave_shift - 1).max(-15);
-                        info!("octave_shift now {}", octave_shift);
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-        }
-
-        // Control bar keys never produce MIDI notes.
-        if is_control_bar {
-            continue;
-        }
-
-        if let Some(loc) = hid_map.loc_for(hid.clone()) {
-            let loc = mirror_cols_4x14(rotate_4x14(loc, rotation)?, bcfg.mirror_cols)?;
-            let compact_min_col = compact_min_col_by_device
-                .get(&device_id)
-                .unwrap_or(&[0u8, 0u8, 0u8, 0u8]);
-            let Some(idx) = wtn_index_for_loc(loc, compact_min_col) else {
-                continue;
-            };
-            if let Some(cell) = wtn.cell(wtn_board, idx) {
-                let base_ch = cell.chan_1based.saturating_sub(1);
-                let hold = if octave_hold_by_device.contains(&device_id) {
-                    1i16
-                } else {
-                    0i16
-                };
-                let shifted = (base_ch as i16) + (octave_shift as i16) + hold;
-                let out_ch: u8 = shifted.clamp(0, 15) as u8;
-                let note = cell.key;
-                let edo = layouts
-                    .get(layout_index)
-                    .map(|l| l.edo_divisions)
-                    .unwrap_or(12);
-                let pitch_offset = layouts
-                    .get(layout_index)
-                    .map(|l| l.pitch_offset)
-                    .unwrap_or(0);
-
-                // Guide: first non-control-bar key-down selects the root pitch class.
-                // This does not suppress MIDI; it only affects LED painting.
-                if kind == "down" && guide_mode == GuideMode::WaitRoot {
-                    let mut pc = (note as i32) + pitch_offset;
-                    pc %= edo;
-                    if pc < 0 {
-                        pc += edo;
-                    }
-                    guide_root_pc = Some(pc);
-                    guide_mode = GuideMode::Active;
-                    trainer_mode = TrainerMode::Active;
-                    guide_pcs_abs.clear();
-                    for rel in guide_pcs_root.iter() {
-                        let mut x = (rel + pc) % edo;
-                        if x < 0 {
-                            x += edo;
-                        }
-                        guide_pcs_abs.insert(x);
-                    }
-                    last_activity = Instant::now();
-                    info!(
-                        "guide: root selected pc={} chord_key={:?}",
-                        pc, guide_chord_key
-                    );
-                    paint_guide(
-                        &wtn,
-                        &rgb_index_by_device_id,
-                        edo,
-                        pitch_offset,
-                        guide_mode,
-                        &guide_pcs_root,
-                        guide_root_pc,
-                        guide_dim,
-                        &octave_hold_by_device,
-                    );
-
-                    // Ensure any currently-held keys restore to the correct (dimmed) guide idle colors.
-                    refresh_vel_led_bases(
-                        &wtn,
-                        &mut vel_state,
-                        edo,
-                        pitch_offset,
-                        guide_mode,
-                        &guide_pcs_abs,
-                        guide_dim,
-                    );
-                }
-
-                let press_threshold =
-                    f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
-
-                // Maintain per-key velocity state.
-                if kind == "down" {
-                    let (already_playing, prev_last_val) = match vel_state.get(&key_id) {
-                        Some(VelState::Tracking {
-                            playing, last_val, ..
-                        }) => (*playing, *last_val),
-                        Some(VelState::Aftershock {
-                            playing, last_val, ..
-                        }) => (*playing, *last_val),
-                        None => (false, 0),
-                    };
-
-                    let led = if rgb_enabled {
-                        if let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) {
-                            let _ = try_send_drop(
-                                &rgb_tx,
-                                RgbCmd::SetKey(RgbKey {
-                                    device_index: dev_idx,
-                                    row: loc.led_row,
-                                    col: loc.led_col,
-                                    rgb: highlight_rgb,
-                                }),
-                            );
-                            Some(LedState {
-                                dev_idx,
-                                row: loc.led_row,
-                                col: loc.led_col,
-                                base_rgb: guide_idle_rgb(
-                                    cell.col_rgb,
-                                    cell.key,
-                                    edo,
-                                    pitch_offset,
-                                    guide_mode,
-                                    &guide_pcs_abs,
-                                    guide_dim,
-                                ),
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    vel_state.insert(
-                        key_id,
-                        VelState::Tracking {
-                            started: ts,
-                            peak: analog,
-                            last_analog: analog,
-                            last_analog_ts: ts,
-                            peak_speed: 0.0,
-                            at_level: 0.0,
-                            at_last_ts: ts,
-                            out_ch,
-                            note,
-                            playing: already_playing,
-                            last_val: prev_last_val,
-                            led,
-                        },
-                    );
-                } else if kind == "update" {
-                    if let Some(st) = vel_state.get_mut(&key_id) {
-                        match st {
-                            VelState::Tracking {
-                                peak,
-                                last_analog,
-                                last_analog_ts,
-                                peak_speed,
-                                ..
-                            } => {
-                                if analog > *peak {
-                                    *peak = analog;
-                                }
-                                // Speed tracking for speed-mapped aftertouch.
-                                let dt = (ts - *last_analog_ts).as_secs_f32();
-                                if dt > 0.0 {
-                                    let s = (analog - *last_analog) / dt;
-                                    if s.is_finite() && s > *peak_speed {
-                                        *peak_speed = s.max(0.0);
-                                    }
-                                }
-                                *last_analog = analog;
-                                *last_analog_ts = ts;
-                            }
-                            VelState::Aftershock {
-                                at_level,
-                                at_last_ts,
-                                out_ch,
-                                note,
-                                playing,
-                                last_val,
-                                led,
-                                ..
-                            } => {
-                                // If still held, transition back to Tracking (Teensy state 2 -> 1).
-                                if analog > press_threshold {
-                                    let already_playing = *playing;
-                                    let out_ch = *out_ch;
-                                    let note = *note;
-                                    let last_val = *last_val;
-                                    let led = led.clone();
-                                    let at_level = *at_level;
-                                    let at_last_ts = *at_last_ts;
-                                    *st = VelState::Tracking {
-                                        started: ts,
-                                        peak: analog,
-                                        last_analog: analog,
-                                        last_analog_ts: ts,
-                                        peak_speed: 0.0,
-                                        at_level,
-                                        at_last_ts,
-                                        out_ch,
-                                        note,
-                                        playing: already_playing,
-                                        last_val,
-                                        led,
-                                    };
-                                }
-                            }
-                        }
-                    }
-                } else if kind == "up" {
-                    match vel_state.remove(&key_id) {
-                        Some(VelState::Tracking {
-                            out_ch,
-                            note,
-                            playing,
-                            last_val,
-                            at_level,
-                            at_last_ts,
-                            led,
-                            ..
-                        }) => {
-                            if playing {
-                                vel_state.insert(
-                                    key_id,
-                                    VelState::Aftershock {
-                                        quiet_since: Some(ts),
-                                        at_level,
-                                        at_last_ts,
-                                        out_ch,
-                                        note,
-                                        playing,
-                                        last_val,
-                                        led,
-                                    },
-                                );
-                            } else {
-                                // Released before NoteOn; restore LED immediately.
-                                if let Some(led) = led {
-                                    let _ = try_send_drop(
-                                        &rgb_tx,
-                                        RgbCmd::SetKey(RgbKey {
-                                            device_index: led.dev_idx,
-                                            row: led.row,
-                                            col: led.col,
-                                            rgb: led.base_rgb,
-                                        }),
-                                    );
-                                }
-                            }
-                        }
-                        Some(VelState::Aftershock {
-                            quiet_since: _,
-                            at_level,
-                            at_last_ts,
-                            out_ch,
-                            note,
-                            playing,
-                            last_val,
-                            led,
-                        }) => {
-                            // Release: start (or restart) the aftershock timer.
                             vel_state.insert(
-                                key_id,
-                                VelState::Aftershock {
-                                    quiet_since: Some(ts),
+                                key,
+                                VelState::Tracking {
+                                    started: Instant::now(),
+                                    peak: last_analog,
+                                    last_analog,
+                                    last_analog_ts,
+                                    peak_speed: 0.0,
                                     at_level,
-                                    at_last_ts,
+                                    out_ch,
+                                    note,
+                                    playing: noteon_ok,
+                                    led,
+                                },
+                            );
+                        } else {
+                            if !no_aftertouch {
+                                match aftertouch_mode {
+                                    AftertouchMode::PeakMapped | AftertouchMode::SpeedMapped => {
+                                        let _ = midi_out.send_polytouch(out_ch, note, pressure);
+                                    }
+                                    AftertouchMode::Off => {}
+                                }
+                            }
+
+                            vel_state.insert(
+                                key,
+                                VelState::Tracking {
+                                    started: Instant::now(),
+                                    peak: last_analog,
+                                    last_analog,
+                                    last_analog_ts,
+                                    peak_speed: 0.0,
+                                    at_level,
                                     out_ch,
                                     note,
                                     playing,
-                                    last_val,
                                     led,
                                 },
                             );
                         }
-                        None => {
-                            // Not tracked.
-                            if rgb_enabled {
-                                if let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) {
-                                    let _ = try_send_drop(
-                                        &rgb_tx,
-                                        RgbCmd::SetKey(RgbKey {
-                                            device_index: dev_idx,
-                                            row: loc.led_row,
-                                            col: loc.led_col,
-                                            rgb: guide_idle_rgb(
-                                                cell.col_rgb,
-                                                cell.key,
-                                                edo,
-                                                pitch_offset,
-                                                guide_mode,
-                                                &guide_pcs_abs,
-                                                guide_dim,
-                                            ),
-                                        }),
-                                    );
-                                }
-                            }
-                        }
                     }
                 }
-            } else if log_midi {
-                println!(
-                    "NO_CELL  dev={} wtn_board={} hid={:?} idx={} (wtn missing?)",
-                    device_id, wtn_board, hid, idx
-                );
             }
-        } else if log_midi {
-            println!(
-                "UNMAPPED dev={} wtn_board={} hid={:?}",
-                device_id, wtn_board, hid
+        }
+
+        // Idle tick: possibly activate screensaver.
+        if rgb_enabled
+            && !screensaver_active
+            && pressed_keys.is_empty()
+            && cfg.rgb.screensaver_timeout_sec > 0
+            && last_activity.elapsed()
+                >= Duration::from_secs(cfg.rgb.screensaver_timeout_sec as u64)
+        {
+            info!(
+                "RGB screensaver: blank after {}s idle",
+                cfg.rgb.screensaver_timeout_sec
             );
+            let _ = fs::remove_file(&preview_enabled_path);
+            let _ = fs::remove_file(&preview_wtn_path);
+            let _ = fs::remove_file(&trainer_mode_path);
+            let _ = fs::remove_file(&guide_path);
+            preview_enabled = false;
+            preview_layout_id = None;
+            guide_mode = GuideMode::Off;
+            trainer_mode = TrainerMode::Off;
+            guide_layout_id = None;
+            guide_chord_key = None;
+            guide_pcs_root.clear();
+            guide_root_pc = None;
+            paint_off(&rgb_index_by_device_id);
+            screensaver_active = true;
         }
     }
 

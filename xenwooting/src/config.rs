@@ -131,7 +131,7 @@ fn default_midi_out_name() -> String {
 }
 
 fn default_refresh_hz() -> f32 {
-    250.0
+    1000.0
 }
 
 fn default_press_threshold() -> f32 {
@@ -144,7 +144,7 @@ fn default_press_threshold_step() -> f32 {
 }
 
 fn default_velocity_peak_track_ms() -> u32 {
-    12
+    6
 }
 
 fn default_aftershock_ms() -> u32 {
@@ -287,7 +287,7 @@ fn default_true() -> bool {
 }
 
 fn default_screensaver_timeout_sec() -> u32 {
-    60
+    300
 }
 
 fn default_highlight_hex() -> String {
