@@ -284,9 +284,51 @@ enum VelState {
 }
 
 #[derive(Debug, Clone)]
+struct PendingNoteOff {
+    due: Instant,
+    ch: u8,
+    note: u8,
+}
+
+fn schedule_midi_ping(
+    midi_out: &mut AlsaMidiOut,
+    note_on_count: &mut HashMap<(u8, u8), u32>,
+    pending_noteoffs: &mut VecDeque<PendingNoteOff>,
+) {
+    // Quiet, short confirmation that a debug dump was triggered.
+    // Use a short triad on channel 0.
+    let ch = 0u8;
+    let vel = 24u8;
+    let dur = Duration::from_millis(60);
+    for note in [72u8, 76u8, 79u8] {
+        if midi_out.send_note(true, ch, note, vel).is_ok() {
+            *note_on_count.entry((ch, note)).or_insert(0) += 1;
+            pending_noteoffs.push_back(PendingNoteOff {
+                due: Instant::now() + dur,
+                ch,
+                note,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct DebugEvent {
     t_ms: u64,
     msg: String,
+}
+
+fn cpu_rusage_ms() -> Option<(u64, u64)> {
+    // Cheap per-process CPU accounting (kernel-provided).
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru as *mut libc::rusage) != 0 {
+            return None;
+        }
+        let u_ms = (ru.ru_utime.tv_sec as u64) * 1000u64 + (ru.ru_utime.tv_usec as u64) / 1000u64;
+        let s_ms = (ru.ru_stime.tv_sec as u64) * 1000u64 + (ru.ru_stime.tv_usec as u64) / 1000u64;
+        Some((u_ms, s_ms))
+    }
 }
 
 fn dbg_push(dbg_ring: &mut VecDeque<DebugEvent>, start_ts: &Instant, msg: impl Into<String>) {
@@ -306,12 +348,15 @@ fn dbg_dump(
     rgb_drop_critical: u64,
 ) {
     *dumps = dumps.saturating_add(1);
+    let (u_ms, s_ms) = cpu_rusage_ms().unwrap_or((0, 0));
     warn!(
-        "DBG_RING_BEGIN reason={} len={} dumps={} rgb_drop_critical={}",
+        "DBG_RING_BEGIN reason={} len={} dumps={} rgb_drop_critical={} cpu_u_ms={} cpu_s_ms={} ",
         reason,
         dbg_ring.len(),
         *dumps,
-        rgb_drop_critical
+        rgb_drop_critical,
+        u_ms,
+        s_ms
     );
     for e in dbg_ring.iter() {
         warn!("DBG {:>7}ms {}", e.t_ms, e.msg);
@@ -497,13 +542,14 @@ fn write_default_config(path: &Path) -> Result<()> {
 
     let mut cfg = Config {
         midi_out_name: "XenWTN".to_string(),
-        refresh_hz: 250.0,
+        refresh_hz: 1000.0,
         press_threshold: 0.10,
-        press_threshold_step: 0.01,
-        velocity_peak_track_ms: 12,
+        press_threshold_step: 0.05,
+        velocity_peak_track_ms: 6,
         aftershock_ms: 35,
         velocity_max_swing: 1.0,
         aftertouch_delta: 0.01,
+        release_delta: 0.12,
         aftertouch_speed_max: 74.0,
         aftertouch_speed_step: 2.0,
         aftertouch_speed_attack_ms: 12,
@@ -1009,6 +1055,10 @@ fn main() -> Result<()> {
     RUNNING.store(true, Ordering::SeqCst);
 
     let poll_period = Duration::from_secs_f32(1.0 / cfg.refresh_hz.max(1.0));
+    // Movement-based release (rapid-trigger). Set release_delta very high to effectively disable.
+    // Recommended disable value: >= 1.0.
+    let release_delta = cfg.release_delta.clamp(0.0, 10.0);
+    let rapid_release_enabled = release_delta > 0.0 && release_delta < 0.95;
 
     // Poll the SDK from a single thread.
     // In practice this is more reliable than polling the SDK concurrently.
@@ -1031,6 +1081,7 @@ fn main() -> Result<()> {
         let mut last_analog_by_device: HashMap<u64, HashMap<HIDCodes, f32>> = HashMap::new();
         let mut active_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut last_seen_by_device: HashMap<u64, HashMap<HIDCodes, Instant>> = HashMap::new();
+        let mut peak_by_device: HashMap<u64, HashMap<HIDCodes, f32>> = HashMap::new();
         let mut startup_suppressed_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut did_init_device: HashSet<u64> = HashSet::new();
         let mut poll_err_since: HashMap<u64, Option<Instant>> = HashMap::new();
@@ -1080,6 +1131,7 @@ fn main() -> Result<()> {
                                     .or_insert_with(HashMap::new);
                                 active_by_device.entry(*id).or_insert_with(HashSet::new);
                                 last_seen_by_device.entry(*id).or_insert_with(HashMap::new);
+                                peak_by_device.entry(*id).or_insert_with(HashMap::new);
                                 startup_suppressed_by_device
                                     .entry(*id)
                                     .or_insert_with(HashSet::new);
@@ -1090,6 +1142,7 @@ fn main() -> Result<()> {
                             last_analog_by_device.retain(|id, _| new_ids.contains(id));
                             active_by_device.retain(|id, _| new_ids.contains(id));
                             last_seen_by_device.retain(|id, _| new_ids.contains(id));
+                            peak_by_device.retain(|id, _| new_ids.contains(id));
                             startup_suppressed_by_device.retain(|id, _| new_ids.contains(id));
                             poll_err_since.retain(|id, _| new_ids.contains(id));
                             did_init_device.retain(|id| new_ids.contains(id));
@@ -1119,6 +1172,7 @@ fn main() -> Result<()> {
                             let active = active_by_device.get_mut(device_id).unwrap();
                             let last_analog = last_analog_by_device.get_mut(device_id).unwrap();
                             let last_seen = last_seen_by_device.get_mut(device_id).unwrap();
+                            let peak = peak_by_device.get_mut(device_id).unwrap();
                             let startup_suppressed =
                                 startup_suppressed_by_device.get_mut(device_id).unwrap();
 
@@ -1129,6 +1183,7 @@ fn main() -> Result<()> {
                                 down.remove(&hid);
                                 last_analog.remove(&hid);
                                 last_seen.remove(&hid);
+                                peak.remove(&hid);
                                 startup_suppressed.remove(&hid);
                                 let _ = tx.send(KeyEdge::Up {
                                     device_id: *device_id,
@@ -1184,6 +1239,7 @@ fn main() -> Result<()> {
                 let last_analog = last_analog_by_device.get_mut(device_id).unwrap();
                 let active = active_by_device.get_mut(device_id).unwrap();
                 let last_seen = last_seen_by_device.get_mut(device_id).unwrap();
+                let peak = peak_by_device.get_mut(device_id).unwrap();
                 let startup_suppressed = startup_suppressed_by_device.get_mut(device_id).unwrap();
 
                 // On first successful poll for this device, suppress keys already held so we don't
@@ -1227,15 +1283,43 @@ fn main() -> Result<()> {
 
                     let was_down = down.contains(&hid);
 
-                    let is_down_now = if was_down {
+                    // Track per-press peak for movement-based release (rapid trigger).
+                    if was_down {
+                        let p = peak.entry(hid.clone()).or_insert(*analog);
+                        if *analog > *p {
+                            *p = *analog;
+                        }
+                    }
+
+                    let mut is_down_now = if was_down {
                         *analog > thr_up
                     } else {
                         *analog > thr_down
                     };
 
+                    // Movement-based release: if a pressed key falls by at least release_delta from
+                    // its peak since press, treat it as released even if still above thr_up.
+                    if was_down && is_down_now {
+                        if let Some(&p) = peak.get(&hid) {
+                            let delta = (p - *analog).max(0.0);
+                            // Avoid triggering for extremely shallow touches.
+                            if rapid_release_enabled
+                                && p >= (thr_down + 0.02)
+                                && delta >= release_delta
+                            {
+                                is_down_now = false;
+                                let _ = dbg_tx_poll.try_send(format!(
+                                    "rapid_release device_id={} hid={:?} peak={:.3} analog={:.3} delta={:.3} thr_down={:.3} thr_up={:.3}",
+                                    device_id, hid, p, analog, delta, thr_down, thr_up
+                                ));
+                            }
+                        }
+                    }
+
                     if is_down_now && !was_down {
                         down.insert(hid.clone());
                         last_analog.insert(hid.clone(), *analog);
+                        peak.insert(hid.clone(), *analog);
 
                         if startup_suppressed.contains(&hid) {
                             // Don't emit a Down edge until the key has been released once.
@@ -1270,6 +1354,7 @@ fn main() -> Result<()> {
                         down.remove(&hid);
                         last_analog.remove(&hid);
                         last_seen.remove(&hid);
+                        peak.remove(&hid);
                         startup_suppressed.remove(&hid);
 
                         // Only emit Up if we previously emitted Down.
@@ -1334,6 +1419,7 @@ fn main() -> Result<()> {
                     down.remove(&hid);
                     last_analog.remove(&hid);
                     last_seen.remove(&hid);
+                    peak.remove(&hid);
                     startup_suppressed.remove(&hid);
 
                     if active.remove(&hid) {
@@ -1683,6 +1769,7 @@ fn main() -> Result<()> {
     // Robust note tracking so NoteOff does not depend on vel_state being present.
     let mut note_by_key: HashMap<(u64, HIDCodes), (u8, u8)> = HashMap::new();
     let mut note_on_count: HashMap<(u8, u8), u32> = HashMap::new();
+    let mut pending_noteoffs: VecDeque<PendingNoteOff> = VecDeque::new();
 
     // Live HUD state published for /wtn/live.
     let live_state_path = PathBuf::from(LIVE_STATE_PATH);
@@ -2654,6 +2741,14 @@ fn main() -> Result<()> {
                 );
                 screensaver_active = false;
                 suppressed_keys.insert(key_id.clone());
+                dbg_push(
+                    &mut dbg_ring,
+                    &start_ts,
+                    format!(
+                        "SUPPRESS add (screensaver_wake) dev={} hid={:?}",
+                        device_id, hid
+                    ),
+                );
                 continue;
             }
 
@@ -2670,6 +2765,11 @@ fn main() -> Result<()> {
                             &mut dbg_dumps,
                             rgb_drop_critical,
                         );
+                        schedule_midi_ping(
+                            &mut midi_out,
+                            &mut note_on_count,
+                            &mut pending_noteoffs,
+                        );
                     }
                 }
             }
@@ -2685,14 +2785,29 @@ fn main() -> Result<()> {
                             &mut dbg_dumps,
                             rgb_drop_critical,
                         );
+                        schedule_midi_ping(
+                            &mut midi_out,
+                            &mut note_on_count,
+                            &mut pending_noteoffs,
+                        );
                     }
                 }
             }
 
             // Suppressed keys do nothing until released.
             if suppressed_keys.contains(&key_id) {
+                dbg_push(
+                    &mut dbg_ring,
+                    &start_ts,
+                    format!("SUPPRESS hit dev={} hid={:?} kind={}", device_id, hid, kind),
+                );
                 if kind == "up" {
                     suppressed_keys.remove(&key_id);
+                    dbg_push(
+                        &mut dbg_ring,
+                        &start_ts,
+                        format!("SUPPRESS remove dev={} hid={:?}", device_id, hid),
+                    );
                 }
                 continue;
             }
@@ -3360,27 +3475,124 @@ fn main() -> Result<()> {
                         }
 
                         if !sent {
-                            warn!(
-                            "Up without note mapping: device_id={} hid={:?}; sending CC123/CC120 panic",
-                            device_id, hid
-                        );
-                            dbg_push(
-                                &mut dbg_ring,
-                                &start_ts,
-                                format!(
-                                    "PANIC Up without note mapping dev={} hid={:?}",
-                                    device_id, hid
-                                ),
-                            );
-                            dbg_dump(
-                                &dbg_ring,
-                                "up_without_note_mapping",
-                                &mut dbg_dumps,
-                                rgb_drop_critical,
-                            );
-                            midi_out.panic_all();
-                            note_by_key.clear();
-                            note_on_count.clear();
+                            // This is often a normal case for very fast taps: key released before the
+                            // delayed NoteOn (peak tracking) ever fired, so there is no mapping.
+                            // Only treat it as an error if we *believe* a NoteOn was sent.
+                            match &removed {
+                                Some(VelState::Tracking {
+                                    started,
+                                    peak,
+                                    peak_speed,
+                                    out_ch,
+                                    note,
+                                    playing: false,
+                                    ..
+                                }) => {
+                                    // Option B: if the key is released before the delayed NoteOn tick,
+                                    // emit a short tap note using the peak collected so far.
+                                    const TAP_NOTE_OFF_MS: u64 = 20;
+                                    let threshold = f32::from_bits(
+                                        press_threshold_bits.load(Ordering::Relaxed),
+                                    )
+                                    .clamp(0.0, 0.99);
+                                    let max_swing = cfg.velocity_max_swing.clamp(0.05, 1.0);
+                                    let denom = (max_swing - threshold).max(0.001);
+
+                                    let n = match aftertouch_mode {
+                                        AftertouchMode::SpeedMapped => (peak_speed
+                                            / aftertouch_speed_max.max(0.001))
+                                        .clamp(0.0, 1.0),
+                                        _ => ((peak - threshold) / denom).clamp(0.0, 1.0),
+                                    };
+                                    let n2 = velocity_profiles[velocity_profile_idx].apply(n);
+                                    let vel = (n2 * 126.0).round().clamp(0.0, 126.0) as u8 + 1;
+
+                                    dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!(
+                                            "TAP_NOTE dev={} hid={:?} ch={} note={} vel={} age_ms={} peak={:.3} peak_speed={:.3}",
+                                            device_id,
+                                            hid,
+                                            out_ch,
+                                            note,
+                                            vel,
+                                            started.elapsed().as_millis(),
+                                            peak,
+                                            peak_speed
+                                        ),
+                                    );
+
+                                    match midi_out.send_note(true, *out_ch, *note, vel) {
+                                        Ok(()) => {
+                                            dbg_push(
+                                                &mut dbg_ring,
+                                                &start_ts,
+                                                format!(
+                                                    "MIDI noteon ok (tap) dev={} hid={:?} ch={} note={} vel={}",
+                                                    device_id, hid, out_ch, note, vel
+                                                ),
+                                            );
+                                            *note_on_count.entry((*out_ch, *note)).or_insert(0) +=
+                                                1;
+                                            pending_noteoffs.push_back(PendingNoteOff {
+                                                due: Instant::now()
+                                                    + Duration::from_millis(TAP_NOTE_OFF_MS),
+                                                ch: *out_ch,
+                                                note: *note,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "MIDI noteon failed (tap) ch={} note={} vel={} err={:?}",
+                                                out_ch, note, vel, e
+                                            );
+                                            dbg_dump(
+                                                &dbg_ring,
+                                                "tap_noteon_failed",
+                                                &mut dbg_dumps,
+                                                rgb_drop_critical,
+                                            );
+                                        }
+                                    }
+                                    sent = true;
+                                }
+                                None => {
+                                    dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!(
+                                            "UP without mapping (untracked) dev={} hid={:?}",
+                                            device_id, hid
+                                        ),
+                                    );
+                                    sent = true;
+                                }
+                                Some(VelState::Tracking { playing: true, .. }) => {
+                                    warn!(
+                                        "Up without note mapping (playing): device_id={} hid={:?}; sending CC64/CC120/CC123 panic",
+                                        device_id, hid
+                                    );
+                                    dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!(
+                                            "PANIC Up without note mapping (playing) dev={} hid={:?}",
+                                            device_id, hid
+                                        ),
+                                    );
+                                    dbg_dump(
+                                        &dbg_ring,
+                                        "up_without_note_mapping_playing",
+                                        &mut dbg_dumps,
+                                        rgb_drop_critical,
+                                    );
+                                    midi_out.panic_all();
+                                    note_by_key.clear();
+                                    note_on_count.clear();
+                                    sent = true;
+                                }
+                            }
                         }
                     }
                 } else if log_midi {
@@ -3615,6 +3827,66 @@ fn main() -> Result<()> {
             guide_root_pc = None;
             paint_off(&rgb_index_by_device_id);
             screensaver_active = true;
+        }
+
+        // Scheduled NoteOffs for tap notes.
+        {
+            let now = Instant::now();
+            while let Some(p) = pending_noteoffs.front() {
+                if p.due > now {
+                    break;
+                }
+                let p = pending_noteoffs.pop_front().unwrap();
+                let k = (p.ch, p.note);
+                let Some(cnt) = note_on_count.get_mut(&k) else {
+                    // Already released.
+                    continue;
+                };
+                if *cnt > 1 {
+                    *cnt -= 1;
+                    dbg_push(
+                        &mut dbg_ring,
+                        &start_ts,
+                        format!(
+                            "MIDI noteoff skip (refcount) ch={} note={} cnt={}",
+                            p.ch, p.note, *cnt
+                        ),
+                    );
+                    continue;
+                }
+                note_on_count.remove(&k);
+                match midi_out.send_note(false, p.ch, p.note, 0) {
+                    Ok(()) => {
+                        dbg_push(
+                            &mut dbg_ring,
+                            &start_ts,
+                            format!("MIDI noteoff ok (scheduled) ch={} note={}", p.ch, p.note),
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "MIDI noteoff failed (scheduled) ch={} note={} err={:?}",
+                            p.ch, p.note, e
+                        );
+                        warn!("PANIC: sending CC64=0 CC120=0 CC123=0 (scheduled noteoff error)");
+                        dbg_push(
+                            &mut dbg_ring,
+                            &start_ts,
+                            format!("PANIC scheduled_noteoff_error ch={} note={}", p.ch, p.note),
+                        );
+                        dbg_dump(
+                            &dbg_ring,
+                            "scheduled_noteoff_error",
+                            &mut dbg_dumps,
+                            rgb_drop_critical,
+                        );
+                        midi_out.panic_all();
+                        note_by_key.clear();
+                        note_on_count.clear();
+                        pending_noteoffs.clear();
+                    }
+                }
+            }
         }
     }
 

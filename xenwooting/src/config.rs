@@ -32,6 +32,11 @@ pub struct Config {
     #[serde(default = "default_aftertouch_delta")]
     pub aftertouch_delta: f32,
 
+    /// Movement-based release threshold (0..1). If a pressed key's analog value falls by at least
+    /// this amount from its peak since press, it is treated as released (rapid-trigger style).
+    #[serde(default = "default_release_delta")]
+    pub release_delta: f32,
+
     /// In speed-mapped aftertouch mode, this is the normalization reference for d(analog)/dt.
     /// Larger values make the same physical speed produce smaller aftertouch values.
     #[serde(default = "default_aftertouch_speed_max")]
@@ -157,6 +162,10 @@ fn default_velocity_max_swing() -> f32 {
 
 fn default_aftertouch_delta() -> f32 {
     0.01
+}
+
+fn default_release_delta() -> f32 {
+    0.12
 }
 
 fn default_aftertouch_speed_max() -> f32 {
