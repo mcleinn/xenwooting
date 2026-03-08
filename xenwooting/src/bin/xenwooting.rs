@@ -2356,38 +2356,37 @@ fn main() -> Result<()> {
                             let n2 = velocity_profiles[velocity_profile_idx].apply(n);
                             let vel = (n2 * 126.0).round().clamp(0.0, 126.0) as u8 + 1;
 
-                            let mut pressure: u8 = vel;
-                            if matches!(aftertouch_mode, AftertouchMode::SpeedMapped) {
-                                let now = Instant::now();
-                                let dt = (now - at_last_ts).as_secs_f32().max(0.0);
-                                if n2 >= at_level {
-                                    // Fast attack: reflect the newest speed immediately.
-                                    at_level = n2;
-                                } else {
-                                    // Slow decay: hang when movement stops.
-                                    let decay_s =
-                                        (cfg.aftertouch_speed_decay_ms.max(1) as f32) / 1000.0;
-                                    let alpha = if decay_s <= 0.0 {
-                                        1.0
-                                    } else {
-                                        (1.0 - (-dt / decay_s).exp()).clamp(0.0, 1.0)
-                                    };
-                                    at_level = at_level + (n2 - at_level) * alpha;
-                                }
-                                at_level = at_level.clamp(0.0, 1.0);
-                                at_last_ts = now;
-                                pressure = (at_level * 127.0).round().clamp(0.0, 127.0) as u8;
+                            // Aftertouch should be monotonic while held: it never decreases.
+                            // This makes "press and hold" preserve the last loudness level.
+                            if n2 > at_level {
+                                at_level = n2;
                             }
+                            at_level = at_level.clamp(0.0, 1.0);
+                            at_last_ts = Instant::now();
+
+                            let pressure: u8 = match aftertouch_mode {
+                                AftertouchMode::SpeedMapped => {
+                                    (at_level * 127.0).round().clamp(0.0, 127.0) as u8
+                                }
+                                AftertouchMode::PeakMapped => {
+                                    (at_level * 126.0).round().clamp(0.0, 126.0) as u8 + 1
+                                }
+                                AftertouchMode::Off => 0,
+                            };
 
                             if !playing {
                                 let _ = midi_out.send_note(true, out_ch, note, vel);
 
-                                // If the synth maps aftertouch->loudness, emit an initial aftertouch
-                                // value as soon as the note starts.
-                                if matches!(aftertouch_mode, AftertouchMode::SpeedMapped)
-                                    && !no_aftertouch
-                                {
-                                    let _ = midi_out.send_polytouch(out_ch, note, pressure);
+                                // Emit an initial aftertouch value as soon as the note starts.
+                                // This helps setups where aftertouch is mapped to loudness.
+                                if !no_aftertouch {
+                                    match aftertouch_mode {
+                                        AftertouchMode::PeakMapped
+                                        | AftertouchMode::SpeedMapped => {
+                                            let _ = midi_out.send_polytouch(out_ch, note, pressure);
+                                        }
+                                        AftertouchMode::Off => {}
+                                    }
                                 }
 
                                 // After firing, go to Aftershock state (like the Teensy state
@@ -2411,7 +2410,7 @@ fn main() -> Result<()> {
                                 if !no_aftertouch {
                                     match aftertouch_mode {
                                         AftertouchMode::PeakMapped => {
-                                            let _ = midi_out.send_polytouch(out_ch, note, vel);
+                                            let _ = midi_out.send_polytouch(out_ch, note, pressure);
                                         }
                                         AftertouchMode::SpeedMapped => {
                                             let _ = midi_out.send_polytouch(out_ch, note, pressure);
