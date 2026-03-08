@@ -114,6 +114,78 @@
   gap: 12px;
 }
 
+.printRoot {
+  display: none;
+}
+
+.printChordPage {
+  padding: 0;
+  margin: 0 0 10px 0;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.printChordTitle {
+  font-weight: 800;
+  font-size: 18px;
+  margin: 16px 0 8px 0;
+}
+
+.printTuningSup {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.printInvGrid {
+  display: grid;
+  gap: 8px;
+  align-items: start;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.printInvCol {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 6px;
+  background: rgba(0, 0, 0, 0.16);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.printInvHead {
+  font-size: 12px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, 0.82);
+  padding: 2px 2px 0;
+}
+
+
+.printSlot {
+  height: 170px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.printSlot .hexSvg {
+  width: auto;
+  height: 160px;
+  max-width: 100%;
+  display: block;
+}
+
+.printEmpty {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+
+
 .acc {
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 14px;
@@ -151,6 +223,27 @@
   list-style: none;
   padding: 12px 12px;
   font-weight: 750;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.chSumTitle {
+  flex: 1;
+  min-width: 0;
+}
+
+.chSumRight {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.chHdrBtnWrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .chSum::-webkit-details-marker {
@@ -164,6 +257,11 @@
 
 .chordBlock {
   padding: 0;
+}
+
+.kbdHint {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.75);
 }
 
 .chordTitle {
@@ -250,13 +348,15 @@
   padding: 8px;
   background: rgba(0, 0, 0, 0.18);
   break-inside: avoid;
+  cursor: pointer;
 }
 
-.patActions {
-  margin-top: 8px;
-  display: flex;
-  justify-content: flex-end;
+.patCard:focus {
+  outline: 2px solid rgba(96, 165, 250, 0.55);
+  outline-offset: 2px;
 }
+
+
 
 .invMore {
   margin-top: 10px;
@@ -278,6 +378,8 @@
 
 .hexDot {
   stroke-width: 2;
+  fill: var(--dot-fill, rgba(255, 255, 255, 0.06));
+  stroke: var(--dot-stroke, rgba(255, 255, 255, 0.16));
 }
 
 .hexRing {
@@ -293,47 +395,86 @@
 }
 
 @media print {
+  @page {
+    margin: 12mm;
+  }
+
   .guideTop {
     position: static;
     background: transparent;
     border-bottom: 0;
     backdrop-filter: none;
   }
-  .gBtn,
-  .gBtnSecondary,
-  .gSelect {
+
+  .guideTop,
+  .guideMeta,
+  .guideSections {
     display: none;
   }
-  .acc,
-  .chordBlock,
-  .invAcc,
-  .patCard {
-    break-inside: avoid;
+
+  .printRoot {
+    display: block;
   }
+
   .guideRoot {
     background: #ffffff;
     color: #000000;
+    min-height: auto;
   }
-  .guideMeta {
+
+  html,
+  body {
+    height: auto;
+    min-height: auto;
+  }
+
+  .guideMain {
+    max-width: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .printChordPage {
+    /* Avoid Chromium's occasional trailing blank page with break-inside on section. */
+    break-inside: auto;
+    page-break-inside: auto;
+    break-after: auto;
+    page-break-after: auto;
+  }
+
+  .printChordPage:last-child {
+    margin-bottom: 0;
+    break-after: auto;
+    page-break-after: auto;
+  }
+
+  .printInvHead {
+    color: rgba(0, 0, 0, 0.8);
+  }
+
+  .printInvCol {
     background: transparent;
-    border-color: rgba(0, 0, 0, 0.16);
+    border-color: rgba(0, 0, 0, 0.18);
   }
-  .acc {
-    background: transparent;
-    border-color: rgba(0, 0, 0, 0.14);
-  }
-  .chordBlock {
-    background: transparent;
-    border-color: rgba(0, 0, 0, 0.14);
-  }
-  .invAcc {
-    background: transparent;
-    border-color: rgba(0, 0, 0, 0.14);
-  }
+
   .hexEdge {
     stroke: rgba(0, 0, 0, 0.22);
   }
   .hexRing {
     stroke: rgba(0, 0, 0, 0.65);
+  }
+
+  /* Make in-between (unpressed) dots visible on white paper. */
+  .hexDot {
+    fill: var(--dot-fill, rgba(0, 0, 0, 0.06));
+    stroke: var(--dot-stroke, rgba(0, 0, 0, 0.28));
+  }
+
+  /* Ensure print slots override the global .hexSvg width rule. */
+  .printSlot svg.hexSvg {
+    width: auto !important;
+    height: 160px !important;
+    max-width: 100% !important;
+    margin: 0 auto;
   }
 }

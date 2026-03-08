@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import './GuidePage.css'
-import { fetchChordCatalogue, fetchLayoutIsomorphic, fetchLayouts } from './api'
+import { fetchChordCatalogue, fetchLayoutIsomorphic, fetchLayouts, guideStart, guideStop } from './api'
 
 type LayoutInfo = { id: string; name: string; wtnPath: string }
 
@@ -16,6 +16,13 @@ type IsoInfo = {
 
 type CatalogueItem = { pcsRoot: number[]; pattern: string; bestName: string; allNames: string[] }
 
+type LiveState = {
+  seq?: number
+  layout?: { id?: string }
+  mode?: { guide_mode?: string; guide_chord_key?: string | null; guide_root_pc?: number | null; screensaver_active?: boolean }
+  pressed?: { Board0?: number[]; Board1?: number[] }
+}
+
 type Axial = { q: number; r: number }
 type Shape = {
   pts: Axial[]
@@ -29,6 +36,8 @@ function mod(n: number, m: number) {
   const x = n % m
   return x < 0 ? x + m : x
 }
+
+
 
 function ptKey(p: Axial) {
   return `${p.q},${p.r}`
@@ -114,13 +123,6 @@ function pcAt(p: Axial, edo: number, dq: number, dr: number) {
   return mod(p.q * dq + p.r * dr, edo)
 }
 
-function absSigKeyForPts(pts: Axial[], dq: number, dr: number) {
-  const abs = pts.map((p) => p.q * dq + p.r * dr)
-  const min = Math.min(...abs)
-  const sig = abs.map((x) => x - min).sort((a, b) => a - b)
-  return sig.join(',')
-}
-
 function buildLibrary(edo: number, dq: number, dr: number, tones: 3 | 4, R: number, K: number): ShapeLibrary {
   const pts = pointsInRadius(R)
   const originIdx = pts.findIndex((p) => p.q === 0 && p.r === 0)
@@ -130,19 +132,50 @@ function buildLibrary(edo: number, dq: number, dr: number, tones: 3 | 4, R: numb
   const bestByKey: ShapeLibrary = new Map()
 
   const consider = (shapePts: Axial[]) => {
-    const pcsRaw = shapePts.map((p) => pcAt(p, edo, dq, dr))
-    const pcs = uniqSorted(pcsRaw)
-    if (pcs.length !== shapePts.length) return
+    // Canonicalize so the lowest absolute pitch is at the origin.
+    const abs = shapePts.map((p) => p.q * dq + p.r * dr)
+    let minAbs = Infinity
+    let minIdx = -1
+    for (let i = 0; i < abs.length; i++) {
+      const v = abs[i]!
+      if (v < minAbs) {
+        minAbs = v
+        minIdx = i
+      }
+    }
+    if (minIdx < 0) return
+
+    const bass = shapePts[minIdx]!
+    const normPts = shapePts.map((p) => ({ q: p.q - bass.q, r: p.r - bass.r }))
+    // Canonical ordering so equivalent patterns don't appear as duplicates.
+    normPts.sort((a, b) => {
+      const ao = a.q === 0 && a.r === 0
+      const bo = b.q === 0 && b.r === 0
+      if (ao && !bo) return -1
+      if (!ao && bo) return 1
+      if (a.q !== b.q) return a.q - b.q
+      return a.r - b.r
+    })
+    const absNorm = abs.map((x) => x - minAbs)
+
+    // Option-B voicing constraint: all chord tones are within one octave above the bass.
+    const maxAbs = Math.max(...absNorm)
+    if (!Number.isFinite(maxAbs) || maxAbs >= edo) return
+    if (absNorm.some((x) => x < 0)) return
+
+    const pcs = uniqSorted(absNorm.map((x) => mod(x, edo)))
+    if (pcs.length !== normPts.length) return
     if (pcs[0] !== 0) return
+
     const pcsKey = pcs.join(',')
-    const absSigKey = absSigKeyForPts(shapePts, dq, dr)
+    const absSigKey = [...absNorm].sort((a, b) => a - b).join(',')
     const key = `${pcsKey}::${absSigKey}`
 
     let maxDist = 0
     let sumDist = 0
-    for (let i = 0; i < shapePts.length; i++) {
-      for (let j = i + 1; j < shapePts.length; j++) {
-        const d = hexDist(shapePts[i]!, shapePts[j]!)
+    for (let i = 0; i < normPts.length; i++) {
+      for (let j = i + 1; j < normPts.length; j++) {
+        const d = hexDist(normPts[i]!, normPts[j]!)
         maxDist = Math.max(maxDist, d)
         sumDist += d
       }
@@ -152,7 +185,7 @@ function buildLibrary(edo: number, dq: number, dr: number, tones: 3 | 4, R: numb
     let maxX = -Infinity
     let minY = Infinity
     let maxY = -Infinity
-    for (const p of shapePts) {
+    for (const p of normPts) {
       const d = axialToDoubled(p)
       minX = Math.min(minX, d.x)
       maxX = Math.max(maxX, d.x)
@@ -162,11 +195,13 @@ function buildLibrary(edo: number, dq: number, dr: number, tones: 3 | 4, R: numb
     const area = (maxX - minX) * (maxY - minY)
 
     const pcByPt = new Map<string, number>()
-    for (const p of shapePts) pcByPt.set(ptKey(p), pcAt(p, edo, dq, dr))
+    for (const p of normPts) pcByPt.set(ptKey(p), pcAt(p, edo, dq, dr))
 
-    const shape: Shape = { pts: shapePts, pcByPt, score: { maxDist, sumDist, area } }
+    const shape: Shape = { pts: normPts, pcByPt, score: { maxDist, sumDist, area } }
 
     const arr = bestByKey.get(key) || []
+    const ptsKey = normPts.map((p) => ptKey(p)).join('|')
+    if (arr.some((s) => s.pts.map((p) => ptKey(p)).join('|') === ptsKey)) return
     arr.push(shape)
     arr.sort((a, b) => {
       if (a.score.maxDist !== b.score.maxDist) return a.score.maxDist - b.score.maxDist
@@ -224,22 +259,60 @@ function inversions(edo: number, pcsRoot: number[]) {
 function parseQuery() {
   const q = new URLSearchParams(window.location.search)
   const layout = String(q.get('layout') || '')
-  const print = q.get('print') === '1'
-  return { layout, print }
+  return { layout }
 }
 
-function setQuery(next: { layout?: string; print?: boolean }) {
+function setQuery(next: { layout?: string }) {
   const q = new URLSearchParams(window.location.search)
   if (typeof next.layout === 'string') {
     if (next.layout) q.set('layout', next.layout)
     else q.delete('layout')
   }
-  if (typeof next.print === 'boolean') {
-    if (next.print) q.set('print', '1')
-    else q.delete('print')
-  }
   const url = `${window.location.pathname}?${q.toString()}`.replace(/\?$/, '')
   window.history.replaceState({}, '', url)
+}
+
+function chordKey(edo: number, title: string, pcsRoot: number[]) {
+  return `${edo}|${String(title || '').trim()}|${(pcsRoot || []).join(',')}`
+}
+
+function collectOpenChordKeysFromDom() {
+  const els = Array.from(document.querySelectorAll('details.chAcc[open]')) as Array<HTMLElement>
+  const keys: string[] = []
+  for (const el of els) {
+    const k = el.dataset?.chordKey
+    if (typeof k === 'string' && k) keys.push(k)
+  }
+  return keys
+}
+
+function TuningChordDetails({
+  chordKey,
+  summary,
+  headerRight,
+  children,
+}: {
+  chordKey: string
+  summary: string
+  headerRight: React.ReactNode
+  children: React.ReactNode
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <details
+      className="chAcc"
+      data-chord-key={chordKey}
+      onToggle={(e) => {
+        setOpen((e.currentTarget as HTMLDetailsElement).open)
+      }}
+    >
+      <summary className="chSum">
+        <span className="chSumTitle">{summary}</span>
+        <span className="chSumRight">{headerRight}</span>
+      </summary>
+      {open ? <div className="chBody">{children}</div> : null}
+    </details>
+  )
 }
 
 function HexExcerptSvg({
@@ -327,8 +400,8 @@ function HexExcerptSvg({
       {Array.from(coordsByXY.entries()).map(([xy, c]) => {
         const pressedInfo = pressedByXY.get(xy)
         const isPressed = pressedInfo !== undefined
-        let fill = 'rgba(255,255,255,0.06)'
-        let stroke = 'rgba(255,255,255,0.16)'
+        let fill = ''
+        let stroke = ''
         if (isPressed) {
           const pc = pressedInfo!.pc
           const deg = degreeByPc.get(pc) ?? 0
@@ -339,7 +412,20 @@ function HexExcerptSvg({
         const isBass = xy === bassXY
         return (
           <g key={xy} transform={`translate(${c.cx},${c.cy})`}>
-            <circle className="hexDot" r={9} style={{ fill, stroke, opacity: isPressed ? 0.9 : 1 }} />
+            <circle
+              className={isPressed ? 'hexDot hexDotPressed' : 'hexDot'}
+              r={9}
+              style={
+                isPressed
+                  ? ({
+                      opacity: 0.92,
+                      // Use CSS variables so print styles can override defaults.
+                      '--dot-fill': fill,
+                      '--dot-stroke': stroke,
+                    } as unknown as React.CSSProperties)
+                  : undefined
+              }
+            />
             {isBass && pressedXY.has(xy) ? <circle className="hexRing" r={12.5} /> : null}
           </g>
         )
@@ -379,48 +465,50 @@ function InversionPatterns({
     <>
       <div className="patRow">
         {shown.map((s, k) => (
-          <div key={k} className="patCard">
+          <div
+            key={k}
+            className="patCard"
+            role="button"
+            tabIndex={0}
+            title="Copy fingering JSON to clipboard"
+            onClick={(e) => {
+              e.preventDefault()
+              e.stopPropagation()
+              const payload = {
+                edo,
+                dq,
+                dr,
+                chordTitle: title,
+                pcsRoot,
+                inversionIndex,
+                pcsInv: inv.pcsInv,
+                fingering: {
+                  axial: s.pts.map((p) => ({ q: p.q, r: p.r })),
+                  doubled: s.pts.map((p) => {
+                    const d = axialToDoubled(p)
+                    return { x: d.x, y: d.y }
+                  }),
+                  pcsAtPts: s.pts.map((p) => {
+                    const pc = s.pcByPt.get(ptKey(p)) ?? 0
+                    const degree = inv.degreeByPc.get(pc) ?? 0
+                    return { q: p.q, r: p.r, pc, degree }
+                  }),
+                  absSteps: s.pts.map((p) => p.q * dq + p.r * dr),
+                },
+              }
+              const text = JSON.stringify(payload)
+              void copyTextToClipboard(text).then((ok) => {
+                if (ok) return
+                window.prompt('Copy fingering JSON:', text)
+              })
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter' && e.key !== ' ') return
+              e.preventDefault()
+              ;(e.currentTarget as HTMLDivElement).click()
+            }}
+          >
             <HexExcerptSvg degreeByPc={inv.degreeByPc} shape={s} />
-            <div className="patActions">
-              <button
-                className="gBtn"
-                type="button"
-                title="Copy fingering JSON to clipboard"
-                onClick={(e) => {
-                  e.preventDefault()
-                  e.stopPropagation()
-                  const payload = {
-                    edo,
-                    dq,
-                    dr,
-                    chordTitle: title,
-                    pcsRoot,
-                    inversionIndex,
-                    pcsInv: inv.pcsInv,
-                    fingering: {
-                      axial: s.pts.map((p) => ({ q: p.q, r: p.r })),
-                      doubled: s.pts.map((p) => {
-                        const d = axialToDoubled(p)
-                        return { x: d.x, y: d.y }
-                      }),
-                      pcsAtPts: s.pts.map((p) => {
-                        const pc = s.pcByPt.get(ptKey(p)) ?? 0
-                        const degree = inv.degreeByPc.get(pc) ?? 0
-                        return { q: p.q, r: p.r, pc, degree }
-                      }),
-                      absSteps: s.pts.map((p) => p.q * dq + p.r * dr),
-                    },
-                  }
-                  const text = JSON.stringify(payload)
-                  void copyTextToClipboard(text).then((ok) => {
-                    if (ok) return
-                    window.prompt('Copy fingering JSON:', text)
-                  })
-                }}
-              >
-                Copy JSON
-              </button>
-            </div>
           </div>
         ))}
         {shapes.length === 0 ? (
@@ -439,6 +527,52 @@ function InversionPatterns({
   )
 }
 
+function PrintChordPage({
+  edo,
+  title,
+  pcsRoot,
+  lib,
+}: {
+  edo: number
+  title: string
+  pcsRoot: number[]
+  lib: ShapeLibrary
+}) {
+  const invs = inversions(edo, pcsRoot)
+  const invLabels = invs.map((_, i) => (i === 0 ? 'Root' : i === 1 ? '1st' : i === 2 ? '2nd' : i === 3 ? '3rd' : `${i}th`))
+
+  const shapesByInv = invs.map((inv) => {
+    const pcsKey = inv.pcsInv.join(',')
+    const absSigKey = inv.pcsInv.join(',')
+    const shapes = lib.get(`${pcsKey}::${absSigKey}`) || []
+    return shapes.slice(0, 2)
+  })
+
+  return (
+    <section className="printChordPage">
+      <div className="printChordTitle">
+        {title}
+        <sup className="printTuningSup">{edo}-EDO</sup>
+      </div>
+
+      <div className="printInvGrid" style={{ gridTemplateColumns: `repeat(${invs.length}, 1fr)` }}>
+        {invs.map((inv, invIdx) => (
+          <div key={`col:${invIdx}`} className="printInvCol">
+            <div className="printInvHead">{invLabels[invIdx]}</div>
+
+            <div className="printSlot">
+              {shapesByInv[invIdx]![0] ? <HexExcerptSvg degreeByPc={inv.degreeByPc} shape={shapesByInv[invIdx]![0]!} /> : null}
+            </div>
+            <div className="printSlot">
+              {shapesByInv[invIdx]![1] ? <HexExcerptSvg degreeByPc={inv.degreeByPc} shape={shapesByInv[invIdx]![1]!} /> : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 function xyKey(x: number, y: number) {
   return `${x},${y}`
 }
@@ -449,10 +583,24 @@ export default function GuidePage() {
   const [layoutId, setLayoutId] = useState<string>(initial.layout)
   const [iso, setIso] = useState<IsoInfo | null>(null)
   const [catalogue, setCatalogue] = useState<CatalogueItem[]>([])
-  const [expandAll, setExpandAll] = useState<boolean>(initial.print)
+  const [expandAll, setExpandAll] = useState<boolean>(false)
   const [loadError, setLoadError] = useState<string>('')
+  const [printChordKeys, setPrintChordKeys] = useState<string[]>([])
 
-  const printMode = initial.print
+  const [live, setLive] = useState<LiveState | null>(null)
+  const [guidePendingKey, setGuidePendingKey] = useState<string | null>(null)
+
+  useEffect(() => {
+    const onBeforePrint = () => {
+      try {
+        setPrintChordKeys(collectOpenChordKeysFromDom())
+      } catch {
+        setPrintChordKeys([])
+      }
+    }
+    window.addEventListener('beforeprint', onBeforePrint)
+    return () => window.removeEventListener('beforeprint', onBeforePrint)
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -471,6 +619,29 @@ export default function GuidePage() {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Subscribe to live state for guide-mode status.
+  useEffect(() => {
+    let closed = false
+    const es = new EventSource(new URL('api/live/stream', `${window.location.origin}/wtn/`).toString())
+    es.addEventListener('state', (ev: MessageEvent) => {
+      if (closed) return
+      try {
+        const obj: unknown = JSON.parse(String(ev.data || 'null'))
+        if (!obj || typeof obj !== 'object') return
+        setLive(obj as LiveState)
+      } catch {
+        // ignore
+      }
+    })
+    es.onerror = () => {
+      // silent retry
+    }
+    return () => {
+      closed = true
+      es.close()
+    }
   }, [])
 
   useEffect(() => {
@@ -502,6 +673,20 @@ export default function GuidePage() {
   const edo = iso?.edo ?? 12
   const dq = iso?.dq ?? 0
   const dr = iso?.dr ?? 0
+
+  const guideMode = String(live?.mode?.guide_mode || 'off')
+  const guideChordKey = (live?.mode?.guide_chord_key ?? null) as string | null
+
+  // Clear pending state once xenwooting reports guide mode.
+  useEffect(() => {
+    if (!guidePendingKey) return
+    if (guideChordKey === guidePendingKey) {
+      setGuidePendingKey(null)
+      return
+    }
+    // Do not clear on `guideMode === 'off'` immediately; SSE can lag behind the
+    // POST /guide/start and we want the button label to switch immediately.
+  }, [guidePendingKey, guideChordKey, guideMode])
 
   const catByPcs = useMemo(() => {
     const m = new Map<string, CatalogueItem>()
@@ -538,6 +723,7 @@ export default function GuidePage() {
       if (pcs.length !== 3) continue
       const it = catByPcs.get(pcs.join(','))
       if (!it || !it.bestName) continue
+      if (String(it.bestName).toLowerCase().includes('inversion')) continue
       out.push({ id: c.id, pcsRoot: pcs, item: it })
     }
     return out
@@ -557,6 +743,7 @@ export default function GuidePage() {
       if (pcs.length !== 4) continue
       const it = catByPcs.get(pcs.join(','))
       if (!it || !it.bestName) continue
+      if (String(it.bestName).toLowerCase().includes('inversion')) continue
       out.push({ id: c.id, pcsRoot: pcs, item: it })
     }
     return out
@@ -575,16 +762,56 @@ export default function GuidePage() {
         if (used.has(key)) return false
         return Boolean(it.bestName)
       })
-      .slice(0, 200)
+      .filter((it) => !String(it.bestName || '').toLowerCase().includes('inversion'))
+      // TuningSpecific should not include EDO12-derived names.
+      .filter((it) => !String(it.bestName || '').toLowerCase().includes('-edo12'))
+      // Also skip JI-approximated names with cents error suffix.
+      .filter((it) => !String(it.bestName || '').toLowerCase().match(/~\d+c\b/))
 
-    // Already sorted server-side; keep first N.
-    return candidates.slice(0, 12)
+    // Show all remaining chords (can be large; bodies render lazily).
+    return candidates
   }, [catalogue, coreTriads, coreSevenths])
 
   const layoutName = useMemo(() => {
     const hit = layouts.find((l) => l.id === layoutId)
     return hit?.name || hit?.id || layoutId || 'Guide'
   }, [layouts, layoutId])
+
+  const kbdAvailable = Boolean(layoutId)
+
+  const activeChordKey = guidePendingKey || guideChordKey
+
+  const headerButton = (title: string, pcsRoot: number[]) => {
+    const ck = chordKey(edo, title, pcsRoot)
+    const isThis = Boolean(activeChordKey && activeChordKey === ck && (guideMode !== 'off' || guidePendingKey))
+    const isWaiting = Boolean(activeChordKey && activeChordKey === ck && (guideMode === 'wait_root' || guidePendingKey))
+
+    return (
+      <span className="chHdrBtnWrap">
+        {isWaiting ? <span className="kbdHint">Waiting for root note</span> : null}
+        <button
+          className={isThis ? 'gBtnSecondary' : 'gBtn'}
+          type="button"
+          disabled={!kbdAvailable}
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            if (isThis) {
+              setGuidePendingKey(null)
+              void guideStop().catch(() => {})
+              return
+            }
+            setGuidePendingKey(ck)
+            void guideStart(layoutId, ck, title, pcsRoot).catch(() => {
+              setGuidePendingKey(null)
+            })
+          }}
+        >
+          {isThis ? 'Reset keyboard' : 'Show on keyboard'}
+        </button>
+      </span>
+    )
+  }
 
   return (
     <div className="guideRoot">
@@ -624,8 +851,8 @@ export default function GuidePage() {
             type="button"
             onClick={() => {
               if (!iso?.ok) return
-              setQuery({ print: true })
-              window.print()
+              setPrintChordKeys(collectOpenChordKeysFromDom())
+              setTimeout(() => window.print(), 50)
             }}
             disabled={!iso?.ok}
           >
@@ -650,13 +877,22 @@ export default function GuidePage() {
         </div>
 
         {iso?.ok && libs ? (
+          <>
           <div className="guideSections">
-            <details className="acc" open={expandAll || printMode}>
+            <details className="acc" open={expandAll}>
               <summary className="accSum">Core triads</summary>
               <div className="accBody">
                 {coreTriads.map((c) => (
-                  <details key={c.id} className="chAcc" open={expandAll || printMode}>
-                    <summary className="chSum">{c.item.bestName}</summary>
+                  <details
+                    key={c.id}
+                    className="chAcc"
+                    data-chord-key={chordKey(edo, c.item.bestName, c.pcsRoot)}
+                    open={expandAll}
+                  >
+                    <summary className="chSum">
+                      <span className="chSumTitle">{c.item.bestName}</span>
+                      <span className="chSumRight">{headerButton(c.item.bestName, c.pcsRoot)}</span>
+                    </summary>
                     <div className="chBody">
                       <ChordBlock
                         edo={edo}
@@ -666,7 +902,7 @@ export default function GuidePage() {
                         allNames={c.item.allNames}
                         pcsRoot={c.pcsRoot}
                         lib={libs.lib3}
-                        expandAll={expandAll || printMode}
+                        expandAll={expandAll}
                       />
                     </div>
                   </details>
@@ -675,12 +911,20 @@ export default function GuidePage() {
               </div>
             </details>
 
-            <details className="acc" open={expandAll || printMode}>
+            <details className="acc" open={expandAll}>
               <summary className="accSum">Core sevenths</summary>
               <div className="accBody">
                 {coreSevenths.map((c) => (
-                  <details key={c.id} className="chAcc" open={expandAll || printMode}>
-                    <summary className="chSum">{c.item.bestName}</summary>
+                  <details
+                    key={c.id}
+                    className="chAcc"
+                    data-chord-key={chordKey(edo, c.item.bestName, c.pcsRoot)}
+                    open={expandAll}
+                  >
+                    <summary className="chSum">
+                      <span className="chSumTitle">{c.item.bestName}</span>
+                      <span className="chSumRight">{headerButton(c.item.bestName, c.pcsRoot)}</span>
+                    </summary>
                     <div className="chBody">
                       <ChordBlock
                         edo={edo}
@@ -690,7 +934,7 @@ export default function GuidePage() {
                         allNames={c.item.allNames}
                         pcsRoot={c.pcsRoot}
                         lib={libs.lib4}
-                        expandAll={expandAll || printMode}
+                        expandAll={expandAll}
                       />
                     </div>
                   </details>
@@ -699,30 +943,57 @@ export default function GuidePage() {
               </div>
             </details>
 
-            <details className="acc" open={expandAll || printMode}>
+            <details className="acc" open={expandAll}>
               <summary className="accSum">Tuning-specific</summary>
               <div className="accBody">
-                {tuningSpecific.map((it, idx) => (
-                  <details key={`${idx}:${it.pattern}`} className="chAcc" open={false}>
-                    <summary className="chSum">{it.bestName}</summary>
-                    <div className="chBody">
-                      <ChordBlock
-                        edo={edo}
-                        dq={dq}
-                        dr={dr}
-                        title={it.bestName}
-                        allNames={it.allNames}
-                        pcsRoot={it.pcsRoot}
-                        lib={it.pcsRoot.length === 3 ? libs.lib3 : libs.lib4}
-                        expandAll={expandAll || printMode}
-                      />
-                    </div>
-                  </details>
+                {tuningSpecific.map((it) => (
+                  <TuningChordDetails
+                    key={chordKey(edo, it.bestName, it.pcsRoot)}
+                    chordKey={chordKey(edo, it.bestName, it.pcsRoot)}
+                    summary={it.bestName}
+                    headerRight={headerButton(it.bestName, it.pcsRoot)}
+                  >
+                    <ChordBlock
+                      edo={edo}
+                      dq={dq}
+                      dr={dr}
+                      title={it.bestName}
+                      allNames={it.allNames}
+                      pcsRoot={it.pcsRoot}
+                      lib={it.pcsRoot.length === 3 ? libs.lib3 : libs.lib4}
+                      expandAll={expandAll}
+                    />
+                  </TuningChordDetails>
                 ))}
                 {tuningSpecific.length === 0 ? <div className="empty">No tuning-specific chords found.</div> : null}
               </div>
             </details>
           </div>
+
+          <div className="printRoot" aria-hidden="true">
+            {(() => {
+              const all = [
+                ...coreTriads.map((c) => ({ title: c.item.bestName, pcsRoot: c.pcsRoot, lib: libs.lib3 })),
+                ...coreSevenths.map((c) => ({ title: c.item.bestName, pcsRoot: c.pcsRoot, lib: libs.lib4 })),
+                ...tuningSpecific.map((it) => ({ title: it.bestName, pcsRoot: it.pcsRoot, lib: it.pcsRoot.length === 3 ? libs.lib3 : libs.lib4 })),
+              ]
+              const want = new Set(printChordKeys)
+              const selected = want.size
+                ? all.filter((c) => want.has(chordKey(edo, c.title, c.pcsRoot)))
+                : []
+
+              return selected.map((c) => (
+                <PrintChordPage
+                  key={chordKey(edo, c.title, c.pcsRoot)}
+                  edo={edo}
+                  title={c.title}
+                  pcsRoot={c.pcsRoot}
+                  lib={c.lib}
+                />
+              ))
+            })()}
+          </div>
+          </>
         ) : null}
       </main>
     </div>

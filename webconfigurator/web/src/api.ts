@@ -54,20 +54,20 @@ export async function fetchGeometry(): Promise<Geometry> {
   return readJsonOrThrow(res)
 }
 
-export async function previewEnable(layoutId: string, boards: Boards): Promise<void> {
+export async function previewEnable(layoutId: string, boards: Boards, trainerMode?: 'wait' | 'active'): Promise<void> {
   const res = await fetch(apiUrl('api/preview/enable'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ layoutId, boards }),
+    body: JSON.stringify({ layoutId, boards, trainerMode: trainerMode || '' }),
   })
   if (!res.ok) throw new Error(await res.text())
 }
 
-export async function previewUpdate(layoutId: string, boards: Boards): Promise<void> {
+export async function previewUpdate(layoutId: string, boards: Boards, trainerMode?: 'wait' | 'active'): Promise<void> {
   const res = await fetch(apiUrl('api/preview/update'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ layoutId, boards }),
+    body: JSON.stringify({ layoutId, boards, trainerMode: trainerMode || '' }),
   })
   if (!res.ok) throw new Error(await res.text())
 }
@@ -85,6 +85,20 @@ export async function highlightKey(layoutId: string, board: 'Board0' | 'Board1',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ layoutId, board, idx, down }),
   })
+  if (!res.ok) throw new Error(await res.text())
+}
+
+export async function guideStart(layoutId: string, chordKey: string, chordTitle: string, pcsRoot: number[]): Promise<void> {
+  const res = await fetch(apiUrl('api/guide/start'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ layoutId, chordKey, chordTitle, pcsRoot }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+}
+
+export async function guideStop(): Promise<void> {
+  const res = await fetch(apiUrl('api/guide/stop'), { method: 'POST' })
   if (!res.ok) throw new Error(await res.text())
 }
 

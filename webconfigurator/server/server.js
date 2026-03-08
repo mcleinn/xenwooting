@@ -28,6 +28,8 @@ async function reloadXenwooting() {
 
 const PREVIEW_ENABLED_PATH = process.env.XENWTN_PREVIEW_ENABLED_PATH || '/tmp/xenwooting-preview.enabled'
 const PREVIEW_WTN_PATH = process.env.XENWTN_PREVIEW_WTN_PATH || '/tmp/xenwooting-preview.wtn'
+const TRAINER_MODE_PATH = process.env.XENWTN_TRAINER_MODE_PATH || '/tmp/xenwooting-trainer.mode'
+const GUIDE_PATH = process.env.XENWTN_GUIDE_PATH || '/tmp/xenwooting-guide.json'
 const HIGHLIGHT_PATH = process.env.XENWTN_HIGHLIGHT_PATH || '/tmp/xenwooting-highlight.txt'
 
 const LIVE_STATE_PATH = process.env.XENWTN_LIVE_STATE_PATH || '/tmp/xenwooting-live.json'
@@ -359,6 +361,9 @@ app.post(`${API_BASE}/preview/enable`, async (req, res) => {
 
     await writeFileAtomic(PREVIEW_WTN_PATH, formatWtn(boards))
     await writeFileAtomic(PREVIEW_ENABLED_PATH, `${layoutId}\n`)
+    const tm = String(req.body?.trainerMode || '')
+    if (tm === 'wait' || tm === 'active') await writeFileAtomic(TRAINER_MODE_PATH, `${tm}\n`)
+    else await safeUnlink(TRAINER_MODE_PATH)
     res.json({ ok: true })
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })
@@ -376,6 +381,9 @@ app.post(`${API_BASE}/preview/update`, async (req, res) => {
     await writeFileAtomic(PREVIEW_WTN_PATH, formatWtn(boards))
     // keep enabled file updated too
     await writeFileAtomic(PREVIEW_ENABLED_PATH, `${layoutId}\n`)
+    const tm = String(req.body?.trainerMode || '')
+    if (tm === 'wait' || tm === 'active') await writeFileAtomic(TRAINER_MODE_PATH, `${tm}\n`)
+    else await safeUnlink(TRAINER_MODE_PATH)
     res.json({ ok: true })
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })
@@ -386,6 +394,52 @@ app.post(`${API_BASE}/preview/disable`, async (_req, res) => {
   try {
     await safeUnlink(PREVIEW_ENABLED_PATH)
     await safeUnlink(PREVIEW_WTN_PATH)
+    await safeUnlink(TRAINER_MODE_PATH)
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+// Guide mode: xenwooting-owned chord trainer (physical RGB only).
+app.post(`${API_BASE}/guide/start`, async (req, res) => {
+  try {
+    const layoutId = String(req.body?.layoutId || '')
+    const chordKey = String(req.body?.chordKey || '')
+    const chordTitle = String(req.body?.chordTitle || '')
+    const pcsRoot = Array.isArray(req.body?.pcsRoot) ? req.body.pcsRoot : null
+    if (!layoutId || !chordKey || !pcsRoot) {
+      res.status(400).json({ error: 'Expected body: { layoutId, chordKey, chordTitle, pcsRoot:number[] }' })
+      return
+    }
+    const pcs = []
+    for (const x of pcsRoot) {
+      const n = Number.parseInt(String(x), 10)
+      if (!Number.isInteger(n)) continue
+      pcs.push(n)
+    }
+    if (pcs.length < 2) {
+      res.status(400).json({ error: 'pcsRoot too small' })
+      return
+    }
+    const body = {
+      enabled: true,
+      layout_id: layoutId,
+      chord_key: chordKey,
+      chord_title: chordTitle,
+      pcs_root: pcs,
+      dim: 0.20,
+    }
+    await writeFileAtomic(GUIDE_PATH, `${JSON.stringify(body)}\n`)
+    res.json({ ok: true })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+app.post(`${API_BASE}/guide/stop`, async (_req, res) => {
+  try {
+    await safeUnlink(GUIDE_PATH)
     res.json({ ok: true })
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })

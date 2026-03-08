@@ -2,10 +2,11 @@ use alsa::seq::{EvNote, Event, EventType, PortCap, PortType, Seq};
 use alsa::Direction;
 use anyhow::{Context, Result};
 use log::info;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
+use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,11 @@ struct LiveMode {
     press_threshold: f32,
     aftertouch: String,
     octave_shift: i8,
+    screensaver_active: bool,
+    preview_enabled: bool,
+    guide_mode: String,
+    guide_chord_key: Option<String>,
+    guide_root_pc: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +152,48 @@ fn write_file_atomic(path: &Path, text: &str) -> Result<()> {
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+fn dim_rgb(rgb: (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
+    let f = factor.clamp(0.0, 1.0);
+    let r = (rgb.0 as f32 * f).round().clamp(0.0, 255.0) as u8;
+    let g = (rgb.1 as f32 * f).round().clamp(0.0, 255.0) as u8;
+    let b = (rgb.2 as f32 * f).round().clamp(0.0, 255.0) as u8;
+    (r, g, b)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuideMode {
+    Off,
+    WaitRoot,
+    Active,
+}
+
+fn guide_idle_rgb(
+    base: (u8, u8, u8),
+    note: u8,
+    edo: i32,
+    pitch_offset: i32,
+    guide_mode: GuideMode,
+    pcs_abs: &HashSet<i32>,
+    dim: f32,
+) -> (u8, u8, u8) {
+    if guide_mode == GuideMode::Off {
+        return base;
+    }
+    if edo <= 0 {
+        return dim_rgb(base, dim);
+    }
+    let mut pc = (note as i32) + pitch_offset;
+    pc %= edo;
+    if pc < 0 {
+        pc += edo;
+    }
+    if guide_mode == GuideMode::Active && pcs_abs.contains(&pc) {
+        base
+    } else {
+        dim_rgb(base, dim)
+    }
 }
 
 // (analog_to_u7 helpers removed; aftertouch is peak-mapped like the Teensy firmware)
@@ -724,9 +772,37 @@ fn main() -> Result<()> {
     // Webconfigurator preview mode (temporary mapping without saving).
     let preview_enabled_path = PathBuf::from("/tmp/xenwooting-preview.enabled");
     let preview_wtn_path = PathBuf::from("/tmp/xenwooting-preview.wtn");
+    let trainer_mode_path = PathBuf::from("/tmp/xenwooting-trainer.mode");
+    let guide_path = PathBuf::from("/tmp/xenwooting-guide.json");
     let highlight_path = PathBuf::from("/tmp/xenwooting-highlight.txt");
     let mut preview_enabled = false;
     let mut preview_layout_id: Option<String> = None;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TrainerMode {
+        Off,
+        Wait,
+        Active,
+    }
+    let mut trainer_mode = TrainerMode::Off;
+
+    #[derive(Debug, Clone, Deserialize)]
+    struct GuideCfg {
+        enabled: bool,
+        layout_id: Option<String>,
+        chord_key: Option<String>,
+        pcs_root: Option<Vec<i32>>,
+        dim: Option<f32>,
+    }
+
+    let mut guide_mode = GuideMode::Off;
+    let mut guide_layout_id: Option<String> = None;
+    let mut guide_chord_key: Option<String> = None;
+    let mut guide_pcs_root: Vec<i32> = vec![];
+    let mut guide_pcs_abs: HashSet<i32> = HashSet::new();
+    let mut guide_root_pc: Option<i32> = None;
+    let mut guide_dim: f32 = 0.20;
+    let mut guide_last_sig: u64 = 0;
     let mut preview_wtn_mtime: Option<SystemTime> = None;
 
     // Manual highlight state (from the web UI).
@@ -1023,31 +1099,146 @@ fn main() -> Result<()> {
     rgb_index_by_device_id = rebuild_rgb_index_map(last_rgb_count);
     info!("RGB device_id->rgb_index map: {:?}", rgb_index_by_device_id);
 
-    let paint_base = |wtn: &Wtn, paint_control_bar: bool, rgb_map: &HashMap<u64, u8>| {
+    let paint_base =
+        |wtn: &Wtn, paint_control_bar: bool, rgb_map: &HashMap<u64, u8>, tm: TrainerMode| {
+            if !rgb_enabled {
+                return;
+            }
+            if log_edges || log_poll || log_midi {
+                eprintln!("paint_base: start");
+            }
+            for (dev_id, bcfg) in board_by_device.iter() {
+                let wtn_board = bcfg.wtn_board;
+                let Some(&dev_idx) = rgb_map.get(dev_id) else {
+                    continue;
+                };
+
+                // Paint base LEDs using the HID->KeyLoc map.
+                //
+                // This is critical because ANSI wide keys create holes in the LED column grid.
+                // Highlighting uses KeyLoc.led_row/led_col; base paint must use the same mapping
+                // or rows will appear shifted.
+                let compact_min_col = compact_min_col_by_device
+                    .get(dev_id)
+                    .unwrap_or(&[0u8, 0u8, 0u8, 0u8]);
+
+                for (_hid, loc0) in hid_map.all_locs().into_iter() {
+                    // Important: `wtn` is in *logical* orientation. If the board is rotated/mirrored,
+                    // map physical KeyLoc (midi_row/midi_col) to its logical lookup index.
+                    let loc = match rotate_4x14(loc0, bcfg.rotation_deg)
+                        .and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
+                    {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let Some(idx) = wtn_index_for_loc(loc, compact_min_col) else {
+                        continue;
+                    };
+                    if let Some(cell) = wtn.cell(wtn_board, idx) {
+                        try_send_drop(
+                            &rgb_tx,
+                            RgbCmd::SetKey(RgbKey {
+                                device_index: dev_idx,
+                                row: loc.led_row,
+                                col: loc.led_col,
+                                rgb: cell.col_rgb,
+                            }),
+                        );
+                    }
+                }
+                info!("Queued base LEDs for wtn_board {}", wtn_board);
+
+                // Paint reserved control bar.
+                // Note: layout changes repaint the 4x14 grid only; we intentionally do NOT repaint
+                // the control bar during layout switching so action flashes are not overridden.
+                if paint_control_bar {
+                    let rgb = match tm {
+                        TrainerMode::Wait => (0u8, 0u8, 0u8),
+                        TrainerMode::Active => (0u8, 255u8, 0u8),
+                        TrainerMode::Off => (255u8, 0u8, 0u8),
+                    };
+                    for c in 0..14u8 {
+                        try_send_drop(
+                            &rgb_tx,
+                            RgbCmd::SetKey(RgbKey {
+                                device_index: dev_idx,
+                                row: control_bar_row,
+                                col: c,
+                                rgb,
+                            }),
+                        );
+                    }
+                }
+            }
+            if log_edges || log_poll || log_midi {
+                eprintln!("paint_base: done");
+            }
+        };
+
+    let paint_control_bar = |rgb_map: &HashMap<u64, u8>, rgb: (u8, u8, u8)| {
         if !rgb_enabled {
             return;
         }
-        if log_edges || log_poll || log_midi {
-            eprintln!("paint_base: start");
+        for (dev_id, _bcfg) in board_by_device.iter() {
+            let Some(&dev_idx) = rgb_map.get(dev_id) else {
+                continue;
+            };
+            for c in 0..14u8 {
+                try_send_drop(
+                    &rgb_tx,
+                    RgbCmd::SetKey(RgbKey {
+                        device_index: dev_idx,
+                        row: control_bar_row,
+                        col: c,
+                        rgb,
+                    }),
+                );
+            }
         }
+    };
+
+    let paint_guide = |wtn: &Wtn,
+                       rgb_map: &HashMap<u64, u8>,
+                       edo: i32,
+                       pitch_offset: i32,
+                       mode: GuideMode,
+                       pcs_root: &Vec<i32>,
+                       root_pc: Option<i32>,
+                       dim: f32| {
+        if !rgb_enabled {
+            return;
+        }
+        if mode == GuideMode::Off {
+            return;
+        }
+        // edo/pitch_offset passed in to avoid borrowing layouts/layout_index.
+
+        let mut pcs_abs: HashSet<i32> = HashSet::new();
+        if mode == GuideMode::Active {
+            if let Some(rpc) = root_pc {
+                for pc in pcs_root.iter() {
+                    let mut x = (pc + rpc) % edo;
+                    if x < 0 {
+                        x += edo;
+                    }
+                    pcs_abs.insert(x);
+                }
+            }
+        }
+
+        let mut lit_root = 0u32;
+        let mut lit_total = 0u32;
+
         for (dev_id, bcfg) in board_by_device.iter() {
             let wtn_board = bcfg.wtn_board;
             let Some(&dev_idx) = rgb_map.get(dev_id) else {
                 continue;
             };
-
-            // Paint base LEDs using the HID->KeyLoc map.
-            //
-            // This is critical because ANSI wide keys create holes in the LED column grid.
-            // Highlighting uses KeyLoc.led_row/led_col; base paint must use the same mapping
-            // or rows will appear shifted.
             let compact_min_col = compact_min_col_by_device
                 .get(dev_id)
                 .unwrap_or(&[0u8, 0u8, 0u8, 0u8]);
 
             for (_hid, loc0) in hid_map.all_locs().into_iter() {
-                // Important: `wtn` is in *logical* orientation. If the board is rotated/mirrored,
-                // map physical KeyLoc (midi_row/midi_col) to its logical lookup index.
                 let loc = match rotate_4x14(loc0, bcfg.rotation_deg)
                     .and_then(|l| mirror_cols_4x14(l, bcfg.mirror_cols))
                 {
@@ -1057,44 +1248,65 @@ fn main() -> Result<()> {
                 let Some(idx) = wtn_index_for_loc(loc, compact_min_col) else {
                     continue;
                 };
-                if let Some(cell) = wtn.cell(wtn_board, idx) {
-                    try_send_drop(
-                        &rgb_tx,
-                        RgbCmd::SetKey(RgbKey {
-                            device_index: dev_idx,
-                            row: loc.led_row,
-                            col: loc.led_col,
-                            rgb: cell.col_rgb,
-                        }),
-                    );
-                }
-            }
-            info!("Queued base LEDs for wtn_board {}", wtn_board);
+                let Some(cell) = wtn.cell(wtn_board, idx) else {
+                    continue;
+                };
 
-            // Paint reserved control bar as red.
-            // Note: layout changes repaint the 4x14 grid only; we intentionally do NOT repaint
-            // the control bar during layout switching so action flashes are not overridden.
-            if paint_control_bar {
-                let red = (255u8, 0u8, 0u8);
-                for c in 0..14u8 {
-                    try_send_drop(
-                        &rgb_tx,
-                        RgbCmd::SetKey(RgbKey {
-                            device_index: dev_idx,
-                            row: control_bar_row,
-                            col: c,
-                            rgb: red,
-                        }),
-                    );
+                let mut pc = (cell.key as i32) + pitch_offset;
+                pc %= edo;
+                if pc < 0 {
+                    pc += edo;
                 }
+
+                let on = mode == GuideMode::Active && pcs_abs.contains(&pc);
+                let rgb = if on {
+                    lit_total += 1;
+                    if root_pc == Some(pc) {
+                        lit_root += 1;
+                    }
+                    cell.col_rgb
+                } else {
+                    dim_rgb(cell.col_rgb, dim)
+                };
+
+                try_send_drop(
+                    &rgb_tx,
+                    RgbCmd::SetKey(RgbKey {
+                        device_index: dev_idx,
+                        row: loc.led_row,
+                        col: loc.led_col,
+                        rgb,
+                    }),
+                );
+            }
+
+            let bar = match mode {
+                GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                GuideMode::Active => (0u8, 255u8, 0u8),
+                GuideMode::Off => (255u8, 0u8, 0u8),
+            };
+            for c in 0..14u8 {
+                try_send_drop(
+                    &rgb_tx,
+                    RgbCmd::SetKey(RgbKey {
+                        device_index: dev_idx,
+                        row: control_bar_row,
+                        col: c,
+                        rgb: bar,
+                    }),
+                );
             }
         }
-        if log_edges || log_poll || log_midi {
-            eprintln!("paint_base: done");
+
+        if mode == GuideMode::Active {
+            info!(
+                "guide: painted active (root_pc={:?}) lit_total={} lit_root={}",
+                root_pc, lit_total, lit_root
+            );
         }
     };
 
-    paint_base(&wtn, true, &rgb_index_by_device_id);
+    paint_base(&wtn, true, &rgb_index_by_device_id, trainer_mode);
 
     if log_edges || log_poll || log_midi {
         eprintln!("ready: waiting for key edges");
@@ -1144,6 +1356,11 @@ fn main() -> Result<()> {
          press_threshold_bits: &AtomicU32,
          aftertouch_mode: &AftertouchMode,
          octave_shift: i8,
+         screensaver_active: bool,
+         preview_enabled: bool,
+         guide_mode: GuideMode,
+         guide_chord_key: &Option<String>,
+         guide_root_pc: Option<i32>,
          board_by_device: &HashMap<u64, xenwooting::config::BoardConfig>,
          vel_state: &HashMap<(u64, HIDCodes), VelState>| {
             let layout = match layouts.get(layout_index) {
@@ -1220,6 +1437,17 @@ fn main() -> Result<()> {
             hasher.write_u32(press_threshold.to_bits());
             hasher.write(aftertouch_mode.name().as_bytes());
             hasher.write_i8(octave_shift);
+            hasher.write_u8(if screensaver_active { 1 } else { 0 });
+            hasher.write_u8(if preview_enabled { 1 } else { 0 });
+            hasher.write_u8(match guide_mode {
+                GuideMode::Off => 0,
+                GuideMode::WaitRoot => 1,
+                GuideMode::Active => 2,
+            });
+            if let Some(k) = guide_chord_key {
+                hasher.write(k.as_bytes());
+            }
+            hasher.write_i32(guide_root_pc.unwrap_or(i32::MIN));
             for p in pressed.get("Board0").into_iter().flatten() {
                 hasher.write_i32(*p);
             }
@@ -1258,6 +1486,15 @@ fn main() -> Result<()> {
                     press_threshold,
                     aftertouch: aftertouch_mode.name().to_string(),
                     octave_shift,
+                    screensaver_active,
+                    preview_enabled,
+                    guide_mode: match guide_mode {
+                        GuideMode::Off => "off".to_string(),
+                        GuideMode::WaitRoot => "wait_root".to_string(),
+                        GuideMode::Active => "active".to_string(),
+                    },
+                    guide_chord_key: guide_chord_key.clone(),
+                    guide_root_pc,
                 },
                 pressed,
                 layout_pitches: live_layout_pitches.clone(),
@@ -1312,7 +1549,13 @@ fn main() -> Result<()> {
         }
     };
 
-    let refresh_vel_led_bases = |wtn: &Wtn, vel_state: &mut HashMap<(u64, HIDCodes), VelState>| {
+    let refresh_vel_led_bases = |wtn: &Wtn,
+                                 vel_state: &mut HashMap<(u64, HIDCodes), VelState>,
+                                 edo: i32,
+                                 pitch_offset: i32,
+                                 guide_mode: GuideMode,
+                                 guide_pcs_abs: &HashSet<i32>,
+                                 guide_dim: f32| {
         for ((device_id, hid), st) in vel_state.iter_mut() {
             let Some(bcfg) = board_by_device.get(device_id) else {
                 continue;
@@ -1338,9 +1581,19 @@ fn main() -> Result<()> {
                 continue;
             };
 
+            let idle = guide_idle_rgb(
+                cell.col_rgb,
+                cell.key,
+                edo,
+                pitch_offset,
+                guide_mode,
+                guide_pcs_abs,
+                guide_dim,
+            );
+
             match st {
-                VelState::Tracking { led: Some(led), .. } => led.base_rgb = cell.col_rgb,
-                VelState::Aftershock { led: Some(led), .. } => led.base_rgb = cell.col_rgb,
+                VelState::Tracking { led: Some(led), .. } => led.base_rgb = idle,
+                VelState::Aftershock { led: Some(led), .. } => led.base_rgb = idle,
                 _ => {}
             }
         }
@@ -1354,6 +1607,11 @@ fn main() -> Result<()> {
         press_threshold_bits.as_ref(),
         &aftertouch_mode,
         octave_shift,
+        screensaver_active,
+        preview_enabled,
+        guide_mode,
+        &guide_chord_key,
+        guide_root_pc,
         &board_by_device,
         &vel_state,
     );
@@ -1366,6 +1624,11 @@ fn main() -> Result<()> {
             press_threshold_bits.as_ref(),
             &aftertouch_mode,
             octave_shift,
+            screensaver_active,
+            preview_enabled,
+            guide_mode,
+            &guide_chord_key,
+            guide_root_pc,
             &board_by_device,
             &vel_state,
         );
@@ -1378,7 +1641,7 @@ fn main() -> Result<()> {
                 last_rgb_count = now;
                 rgb_index_by_device_id = rebuild_rgb_index_map(last_rgb_count);
                 info!("RGB device_id->rgb_index map: {:?}", rgb_index_by_device_id);
-                paint_base(&wtn, true, &rgb_index_by_device_id);
+                paint_base(&wtn, true, &rgb_index_by_device_id, trainer_mode);
                 info!("RGB device count changed; repainted base ({})", now);
             }
         }
@@ -1395,7 +1658,7 @@ fn main() -> Result<()> {
                     last_connected_cfg_ids = now;
                     rgb_index_by_device_id = rebuild_rgb_index_map(last_rgb_count);
                     info!("RGB device_id->rgb_index map: {:?}", rgb_index_by_device_id);
-                    paint_base(&wtn, true, &rgb_index_by_device_id);
+                    paint_base(&wtn, true, &rgb_index_by_device_id, trainer_mode);
                     info!("Configured device set changed; repainted base");
                 }
             }
@@ -1485,8 +1748,23 @@ fn main() -> Result<()> {
                                             fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
                                         wtn_mtime = base_wtn_mtime;
                                         wtn = base_wtn.clone();
-                                        refresh_vel_led_bases(&wtn, &mut vel_state);
-                                        paint_base(&wtn, false, &rgb_index_by_device_id);
+                                        let edo = layouts[layout_index].edo_divisions;
+                                        let pitch_offset = layouts[layout_index].pitch_offset;
+                                        refresh_vel_led_bases(
+                                            &wtn,
+                                            &mut vel_state,
+                                            edo,
+                                            pitch_offset,
+                                            guide_mode,
+                                            &guide_pcs_abs,
+                                            guide_dim,
+                                        );
+                                        paint_base(
+                                            &wtn,
+                                            false,
+                                            &rgb_index_by_device_id,
+                                            trainer_mode,
+                                        );
                                         info!(
                                             "Reloaded config layouts ({} layouts)",
                                             layouts.len()
@@ -1510,6 +1788,137 @@ fn main() -> Result<()> {
         if last_wtn_check.elapsed() >= Duration::from_millis(200) {
             last_wtn_check = Instant::now();
 
+            // Guide mode config (xenwooting-owned chord trainer).
+            let guide_now: Option<GuideCfg> = fs::read_to_string(&guide_path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<GuideCfg>(&t).ok());
+            let mut gh = std::collections::hash_map::DefaultHasher::new();
+            if let Some(g) = &guide_now {
+                g.enabled.hash(&mut gh);
+                if let Some(id) = &g.layout_id {
+                    id.hash(&mut gh);
+                }
+                if let Some(k) = &g.chord_key {
+                    k.hash(&mut gh);
+                }
+                if let Some(p) = &g.pcs_root {
+                    for x in p.iter() {
+                        x.hash(&mut gh);
+                    }
+                }
+                ((g.dim.unwrap_or(0.20) * 1000.0) as i32).hash(&mut gh);
+            }
+            let sig = gh.finish();
+            if sig != guide_last_sig {
+                guide_last_sig = sig;
+                if let Some(g) = guide_now {
+                    if g.enabled {
+                        guide_layout_id = g.layout_id.clone();
+                        guide_chord_key = g.chord_key.clone();
+                        guide_pcs_root = g.pcs_root.unwrap_or_default();
+                        guide_dim = g.dim.unwrap_or(0.20).clamp(0.0, 1.0);
+                        guide_root_pc = None;
+                        guide_pcs_abs.clear();
+
+                        // Disable preview if active (guide owns LED output).
+                        if preview_enabled {
+                            let _ = fs::remove_file(&preview_enabled_path);
+                            let _ = fs::remove_file(&preview_wtn_path);
+                            let _ = fs::remove_file(&trainer_mode_path);
+                            preview_enabled = false;
+                            preview_layout_id = None;
+                            preview_wtn_mtime = None;
+                            info!("preview: disabled (guide enabled)");
+                        }
+
+                        // Switch layout if requested.
+                        if let Some(id) = &guide_layout_id {
+                            if let Some(i) = layouts.iter().position(|l| &l.id == id) {
+                                if i != layout_index {
+                                    layout_index = i;
+                                    info!(
+                                        "guide: switching layout -> {}",
+                                        layouts[layout_index].id
+                                    );
+                                    set_mts_table(&master, &layouts[layout_index])?;
+                                    wtn_path = resolve_path(&layouts[layout_index].wtn_path);
+                                    base_wtn = Wtn::load(&wtn_path).with_context(|| {
+                                        format!("Load wtn {}", wtn_path.display())
+                                    })?;
+                                    base_wtn_mtime =
+                                        fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
+                                    wtn = base_wtn.clone();
+                                    refresh_vel_led_bases(
+                                        &wtn,
+                                        &mut vel_state,
+                                        layouts[layout_index].edo_divisions,
+                                        layouts[layout_index].pitch_offset,
+                                        GuideMode::WaitRoot,
+                                        &guide_pcs_abs,
+                                        guide_dim,
+                                    );
+                                }
+                            }
+                        }
+
+                        guide_mode = GuideMode::WaitRoot;
+                        trainer_mode = TrainerMode::Wait;
+                        last_activity = Instant::now();
+                        if screensaver_active {
+                            info!("RGB screensaver: wake (guide enabled)");
+                            screensaver_active = false;
+                        }
+                        paint_guide(
+                            &wtn,
+                            &rgb_index_by_device_id,
+                            layouts
+                                .get(layout_index)
+                                .map(|l| l.edo_divisions)
+                                .unwrap_or(12),
+                            layouts
+                                .get(layout_index)
+                                .map(|l| l.pitch_offset)
+                                .unwrap_or(0),
+                            guide_mode,
+                            &guide_pcs_root,
+                            guide_root_pc,
+                            guide_dim,
+                        );
+                        info!("guide: enabled (wait_root) chord_key={:?}", guide_chord_key);
+                    } else {
+                        // explicit disabled
+                        guide_mode = GuideMode::Off;
+                        trainer_mode = TrainerMode::Off;
+                        guide_layout_id = None;
+                        guide_chord_key = None;
+                        guide_pcs_root.clear();
+                        guide_pcs_abs.clear();
+                        guide_root_pc = None;
+                        if !screensaver_active {
+                            paint_base(&wtn, true, &rgb_index_by_device_id, trainer_mode);
+                        }
+                        info!("guide: disabled");
+                    }
+                } else {
+                    // file missing -> off
+                    if guide_mode != GuideMode::Off {
+                        guide_mode = GuideMode::Off;
+                        trainer_mode = TrainerMode::Off;
+                        guide_layout_id = None;
+                        guide_chord_key = None;
+                        guide_pcs_root.clear();
+                        guide_pcs_abs.clear();
+                        guide_root_pc = None;
+                        if !screensaver_active {
+                            paint_base(&wtn, true, &rgb_index_by_device_id, trainer_mode);
+                        }
+                        info!("guide: disabled (file removed)");
+                    }
+                }
+            }
+
+            // trainer_mode is derived from guide_mode now.
+
             // Refresh base wtn if the on-disk file changed.
             if let Ok(modified) = fs::metadata(&wtn_path).and_then(|m| m.modified()) {
                 let changed = match base_wtn_mtime {
@@ -1524,8 +1933,18 @@ fn main() -> Result<()> {
                             if !preview_enabled {
                                 wtn = base_wtn.clone();
                                 wtn_mtime = base_wtn_mtime;
-                                refresh_vel_led_bases(&wtn, &mut vel_state);
-                                paint_base(&wtn, false, &rgb_index_by_device_id);
+                                let edo = layouts[layout_index].edo_divisions;
+                                let pitch_offset = layouts[layout_index].pitch_offset;
+                                refresh_vel_led_bases(
+                                    &wtn,
+                                    &mut vel_state,
+                                    edo,
+                                    pitch_offset,
+                                    guide_mode,
+                                    &guide_pcs_abs,
+                                    guide_dim,
+                                );
+                                paint_base(&wtn, false, &rgb_index_by_device_id, trainer_mode);
                                 info!("Reloaded wtn from disk: {}", wtn_path.display());
                             } else {
                                 info!("Reloaded base wtn (preview active): {}", wtn_path.display());
@@ -1554,6 +1973,14 @@ fn main() -> Result<()> {
                 preview_layout_id = layout_now.clone();
 
                 if preview_enabled {
+                    // Treat preview as activity (prevents screensaver from immediately blanking).
+                    last_activity = Instant::now();
+                    if screensaver_active {
+                        // Wake screensaver immediately on preview enable so the next physical key-down
+                        // can be used as a trainer root (not consumed as a wake key).
+                        info!("RGB screensaver: wake (preview enabled)");
+                        screensaver_active = false;
+                    }
                     if let Some(id) = layout_now {
                         if let Some(i) = layouts.iter().position(|l| l.id == id) {
                             if i != layout_index {
@@ -1580,8 +2007,21 @@ fn main() -> Result<()> {
                     wtn = base_wtn.clone();
                     wtn_mtime = base_wtn_mtime;
                     preview_wtn_mtime = None;
-                    refresh_vel_led_bases(&wtn, &mut vel_state);
-                    paint_base(&wtn, true, &rgb_index_by_device_id);
+                    let edo = layouts[layout_index].edo_divisions;
+                    let pitch_offset = layouts[layout_index].pitch_offset;
+                    refresh_vel_led_bases(
+                        &wtn,
+                        &mut vel_state,
+                        edo,
+                        pitch_offset,
+                        guide_mode,
+                        &guide_pcs_abs,
+                        guide_dim,
+                    );
+                    // If the RGB screensaver is active, keep LEDs blank.
+                    if !screensaver_active {
+                        paint_base(&wtn, true, &rgb_index_by_device_id, trainer_mode);
+                    }
                     info!("preview: disabled");
                 }
             }
@@ -1598,8 +2038,26 @@ fn main() -> Result<()> {
                             Ok(new_wtn) => {
                                 wtn = new_wtn;
                                 preview_wtn_mtime = Some(modified);
-                                refresh_vel_led_bases(&wtn, &mut vel_state);
-                                paint_base(&wtn, false, &rgb_index_by_device_id);
+                                // Treat preview updates as activity.
+                                last_activity = Instant::now();
+                                if screensaver_active {
+                                    info!("RGB screensaver: wake (preview update)");
+                                    screensaver_active = false;
+                                }
+                                let edo = layouts[layout_index].edo_divisions;
+                                let pitch_offset = layouts[layout_index].pitch_offset;
+                                refresh_vel_led_bases(
+                                    &wtn,
+                                    &mut vel_state,
+                                    edo,
+                                    pitch_offset,
+                                    guide_mode,
+                                    &guide_pcs_abs,
+                                    guide_dim,
+                                );
+                                if !screensaver_active {
+                                    paint_base(&wtn, true, &rgb_index_by_device_id, trainer_mode);
+                                }
                                 info!("preview: reloaded wtn {}", preview_wtn_path.display());
                             }
                             Err(e) => {
@@ -1832,6 +2290,20 @@ fn main() -> Result<()> {
                     "RGB screensaver: blank after {}s idle",
                     cfg.rgb.screensaver_timeout_sec
                 );
+                // If a web-driven preview (e.g. chord trainer) is active, disable it so it can't
+                // keep re-applying colors after wake.
+                let _ = fs::remove_file(&preview_enabled_path);
+                let _ = fs::remove_file(&preview_wtn_path);
+                let _ = fs::remove_file(&trainer_mode_path);
+                let _ = fs::remove_file(&guide_path);
+                preview_enabled = false;
+                preview_layout_id = None;
+                guide_mode = GuideMode::Off;
+                trainer_mode = TrainerMode::Off;
+                guide_layout_id = None;
+                guide_chord_key = None;
+                guide_pcs_root.clear();
+                guide_root_pc = None;
                 paint_off(&rgb_index_by_device_id);
                 screensaver_active = true;
             }
@@ -1843,6 +2315,11 @@ fn main() -> Result<()> {
                 press_threshold_bits.as_ref(),
                 &aftertouch_mode,
                 octave_shift,
+                screensaver_active,
+                preview_enabled,
+                guide_mode,
+                &guide_chord_key,
+                guide_root_pc,
                 &board_by_device,
                 &vel_state,
             );
@@ -1891,7 +2368,7 @@ fn main() -> Result<()> {
         if screensaver_active && kind == "down" {
             // Restore base LEDs immediately.
             info!("RGB screensaver: wake");
-            paint_base(&wtn, true, &rgb_index_by_device_id);
+            paint_base(&wtn, true, &rgb_index_by_device_id, trainer_mode);
             screensaver_active = false;
             suppressed_keys.insert(key_id.clone());
             continue;
@@ -2053,6 +2530,27 @@ fn main() -> Result<()> {
             if let Some(action) = actions_by_hid.get(&hid) {
                 match action.as_str() {
                     "layout_next" => {
+                        if preview_enabled {
+                            let _ = fs::remove_file(&preview_enabled_path);
+                            let _ = fs::remove_file(&preview_wtn_path);
+                            let _ = fs::remove_file(&trainer_mode_path);
+                            preview_enabled = false;
+                            preview_layout_id = None;
+                            preview_wtn_mtime = None;
+                            info!("preview: disabled due to layout change");
+                        }
+                        if guide_mode != GuideMode::Off {
+                            let _ = fs::remove_file(&guide_path);
+                            guide_mode = GuideMode::Off;
+                            trainer_mode = TrainerMode::Off;
+                            guide_layout_id = None;
+                            guide_chord_key = None;
+                            guide_pcs_root.clear();
+                            guide_root_pc = None;
+                            info!("guide: disabled due to layout change");
+                            // Layout switching does not repaint the control bar; restore it explicitly.
+                            paint_control_bar(&rgb_index_by_device_id, (255, 0, 0));
+                        }
                         layout_index = (layout_index + 1) % layouts.len();
                         eprintln!("layout_next -> {}", layouts[layout_index].id);
                         set_mts_table(&master, &layouts[layout_index])?;
@@ -2064,11 +2562,42 @@ fn main() -> Result<()> {
                         wtn_mtime = base_wtn_mtime;
                         if !preview_enabled {
                             wtn = base_wtn.clone();
-                            refresh_vel_led_bases(&wtn, &mut vel_state);
-                            paint_base(&wtn, false, &rgb_index_by_device_id);
+                            let edo = layouts[layout_index].edo_divisions;
+                            let pitch_offset = layouts[layout_index].pitch_offset;
+                            refresh_vel_led_bases(
+                                &wtn,
+                                &mut vel_state,
+                                edo,
+                                pitch_offset,
+                                guide_mode,
+                                &guide_pcs_abs,
+                                guide_dim,
+                            );
+                            paint_base(&wtn, false, &rgb_index_by_device_id, trainer_mode);
                         }
                     }
                     "layout_prev" => {
+                        if preview_enabled {
+                            let _ = fs::remove_file(&preview_enabled_path);
+                            let _ = fs::remove_file(&preview_wtn_path);
+                            let _ = fs::remove_file(&trainer_mode_path);
+                            preview_enabled = false;
+                            preview_layout_id = None;
+                            preview_wtn_mtime = None;
+                            info!("preview: disabled due to layout change");
+                        }
+                        if guide_mode != GuideMode::Off {
+                            let _ = fs::remove_file(&guide_path);
+                            guide_mode = GuideMode::Off;
+                            trainer_mode = TrainerMode::Off;
+                            guide_layout_id = None;
+                            guide_chord_key = None;
+                            guide_pcs_root.clear();
+                            guide_root_pc = None;
+                            info!("guide: disabled due to layout change");
+                            // Layout switching does not repaint the control bar; restore it explicitly.
+                            paint_control_bar(&rgb_index_by_device_id, (255, 0, 0));
+                        }
                         if layout_index == 0 {
                             layout_index = layouts.len() - 1;
                         } else {
@@ -2084,8 +2613,18 @@ fn main() -> Result<()> {
                         wtn_mtime = base_wtn_mtime;
                         if !preview_enabled {
                             wtn = base_wtn.clone();
-                            refresh_vel_led_bases(&wtn, &mut vel_state);
-                            paint_base(&wtn, false, &rgb_index_by_device_id);
+                            let edo = layouts[layout_index].edo_divisions;
+                            let pitch_offset = layouts[layout_index].pitch_offset;
+                            refresh_vel_led_bases(
+                                &wtn,
+                                &mut vel_state,
+                                edo,
+                                pitch_offset,
+                                guide_mode,
+                                &guide_pcs_abs,
+                                guide_dim,
+                            );
+                            paint_base(&wtn, false, &rgb_index_by_device_id, trainer_mode);
                         }
                     }
                     "octave_up" => {
@@ -2125,6 +2664,61 @@ fn main() -> Result<()> {
                 let shifted = (base_ch as i16) + (octave_shift as i16) + hold;
                 let out_ch: u8 = shifted.clamp(0, 15) as u8;
                 let note = cell.key;
+                let edo = layouts
+                    .get(layout_index)
+                    .map(|l| l.edo_divisions)
+                    .unwrap_or(12);
+                let pitch_offset = layouts
+                    .get(layout_index)
+                    .map(|l| l.pitch_offset)
+                    .unwrap_or(0);
+
+                // Guide: first non-control-bar key-down selects the root pitch class.
+                // This does not suppress MIDI; it only affects LED painting.
+                if kind == "down" && guide_mode == GuideMode::WaitRoot {
+                    let mut pc = (note as i32) + pitch_offset;
+                    pc %= edo;
+                    if pc < 0 {
+                        pc += edo;
+                    }
+                    guide_root_pc = Some(pc);
+                    guide_mode = GuideMode::Active;
+                    trainer_mode = TrainerMode::Active;
+                    guide_pcs_abs.clear();
+                    for rel in guide_pcs_root.iter() {
+                        let mut x = (rel + pc) % edo;
+                        if x < 0 {
+                            x += edo;
+                        }
+                        guide_pcs_abs.insert(x);
+                    }
+                    last_activity = Instant::now();
+                    info!(
+                        "guide: root selected pc={} chord_key={:?}",
+                        pc, guide_chord_key
+                    );
+                    paint_guide(
+                        &wtn,
+                        &rgb_index_by_device_id,
+                        edo,
+                        pitch_offset,
+                        guide_mode,
+                        &guide_pcs_root,
+                        guide_root_pc,
+                        guide_dim,
+                    );
+
+                    // Ensure any currently-held keys restore to the correct (dimmed) guide idle colors.
+                    refresh_vel_led_bases(
+                        &wtn,
+                        &mut vel_state,
+                        edo,
+                        pitch_offset,
+                        guide_mode,
+                        &guide_pcs_abs,
+                        guide_dim,
+                    );
+                }
 
                 let press_threshold =
                     f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
@@ -2156,7 +2750,15 @@ fn main() -> Result<()> {
                                 dev_idx,
                                 row: loc.led_row,
                                 col: loc.led_col,
-                                base_rgb: cell.col_rgb,
+                                base_rgb: guide_idle_rgb(
+                                    cell.col_rgb,
+                                    cell.key,
+                                    edo,
+                                    pitch_offset,
+                                    guide_mode,
+                                    &guide_pcs_abs,
+                                    guide_dim,
+                                ),
                             })
                         } else {
                             None
@@ -2281,7 +2883,15 @@ fn main() -> Result<()> {
                                             device_index: dev_idx,
                                             row: loc.led_row,
                                             col: loc.led_col,
-                                            rgb: cell.col_rgb,
+                                            rgb: guide_idle_rgb(
+                                                cell.col_rgb,
+                                                cell.key,
+                                                edo,
+                                                pitch_offset,
+                                                guide_mode,
+                                                &guide_pcs_abs,
+                                                guide_dim,
+                                            ),
                                         }),
                                     );
                                 }
