@@ -1,0 +1,97 @@
+.dpRoot {
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 700px at 12% 10%, rgba(70, 135, 255, 0.14), transparent 55%),
+    radial-gradient(900px 600px at 86% 12%, rgba(255, 140, 90, 0.10), transparent 55%),
+    radial-gradient(1000px 700px at 50% 90%, rgba(120, 255, 220, 0.10), transparent 60%),
+    linear-gradient(180deg, var(--bg0), var(--bg1));
+}
+
+.dpGrid {
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 14px;
+  padding: 14px;
+}
+
+@media (max-width: 980px) {
+  .dpGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.dpPanel {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.dpLeft {
+  display: flex;
+  flex-direction: column;
+  min-height: 82vh;
+}
+
+.dpMain {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  gap: 12px;
+  min-height: 82vh;
+}
+
+.dpHeader {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--stroke);
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dpHeader small {
+  color: var(--muted);
+}
+
+.dpListWrap {
+  padding: 10px;
+}
+
+.dpChartWrap {
+  padding: 10px;
+  border-bottom: 1px solid var(--stroke);
+}
+
+.dpTxt {
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.12);
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.86);
+}
+
+.dpControls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 2px 2px 2px;
+}
+
+.dpControlsLeft {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dpMut {
+  color: var(--muted);
+}
+
+.dpErr {
+  color: #ffb4a8;
+}

@@ -157,6 +157,32 @@ export async function fetchChordCatalogue(
   return readJsonOrThrow(res)
 }
 
+export type DumpEntry = {
+  tsMs: number
+  kind: 'dump' | 'capture'
+  hasCsv: boolean
+  hasTxt: boolean
+  csvName: string | null
+  txtName: string | null
+  sizeCsv: number
+  sizeTxt: number
+  mtimeMs: number
+}
+
+export type DumpBoard = { deviceId: string; wtnBoard: number }
+
+export async function fetchDumpsList(): Promise<{ outputDir: string; boards: DumpBoard[]; entries: DumpEntry[] }> {
+  const res = await fetch(apiUrl('api/dumps/list'))
+  if (!res.ok) throw new Error(await res.text())
+  return readJsonOrThrow(res)
+}
+
+export async function fetchDumpFileText(tsMs: number, kind: 'dump' | 'capture', ext: 'csv' | 'txt'): Promise<string> {
+  const res = await fetch(apiUrl(`api/dumps/${encodeURIComponent(String(tsMs))}/${encodeURIComponent(kind)}.${ext}`))
+  if (!res.ok) throw new Error(await res.text())
+  return res.text()
+}
+
 export async function addLayout(body: {
   name: string
   edoDivisions: number

@@ -1,6 +1,7 @@
 import express from 'express'
 import path from 'node:path'
 import fs from 'node:fs/promises'
+import fsSync from 'node:fs'
 import TOML from '@iarna/toml'
 
 import { formatWtn, readWtnFile, writeWtnFile } from './wtn.js'
@@ -24,6 +25,51 @@ app.use(express.json({ limit: '2mb' }))
 async function reloadXenwooting() {
   // xenwooting watches the .wtn file and reloads on change.
   return { ok: true }
+}
+
+function defaultOutputDir() {
+  const xdg = String(process.env.XDG_STATE_HOME || '').trim()
+  if (xdg) return path.join(xdg, 'xenwooting')
+  const home = String(process.env.HOME || '').trim()
+  if (home) return path.join(home, '.local', 'state', 'xenwooting')
+  return '/tmp/xenwooting'
+}
+
+async function resolveOutputDir() {
+  try {
+    const raw = await fs.readFile(CONFIG_TOML, 'utf8')
+    const cfg = TOML.parse(raw)
+    const od = String(cfg?.output_dir || '').trim()
+    if (od) return od
+  } catch {
+    // ignore
+  }
+  return defaultOutputDir()
+}
+
+async function resolveBoards() {
+  try {
+    const raw = await fs.readFile(CONFIG_TOML, 'utf8')
+    const cfg = TOML.parse(raw)
+    const boards = Array.isArray(cfg?.boards) ? cfg.boards : []
+    const out = []
+    for (const b of boards) {
+      const deviceId = String(b?.device_id || '').trim()
+      const wtnBoard = Number(b?.wtn_board)
+      if (!deviceId) continue
+      if (!Number.isFinite(wtnBoard)) continue
+      out.push({ deviceId, wtnBoard })
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+function parseDumpFilename(name) {
+  const m = String(name || '').match(/^(\d+)_(dump|capture)\.(csv|txt)$/)
+  if (!m) return null
+  return { tsMs: Number.parseInt(m[1], 10), kind: m[2], ext: m[3] }
 }
 
 const PREVIEW_ENABLED_PATH = process.env.XENWTN_PREVIEW_ENABLED_PATH || '/tmp/xenwooting-preview.enabled'
@@ -113,6 +159,98 @@ app.get(`${API_BASE}/layouts`, async (_req, res) => {
   } catch (err) {
     res.status(500).json({ error: String(err?.message || err) })
   }
+})
+
+app.get(`${API_BASE}/dumps/list`, async (_req, res) => {
+  try {
+    const outDir = await resolveOutputDir()
+    const boards = await resolveBoards()
+    let names = []
+    try {
+      names = await fs.readdir(outDir)
+    } catch {
+      res.json({ outputDir: outDir, boards, entries: [] })
+      return
+    }
+
+    const byKey = new Map()
+    for (const name of names) {
+      const p = parseDumpFilename(name)
+      if (!p || !Number.isFinite(p.tsMs)) continue
+      const fp = path.join(outDir, name)
+      let st = null
+      try {
+        st = await fs.stat(fp)
+      } catch {
+        continue
+      }
+      const k = `${p.tsMs}:${p.kind}`
+      const cur = byKey.get(k) || {
+        tsMs: p.tsMs,
+        kind: p.kind,
+        hasCsv: false,
+        hasTxt: false,
+        csvName: null,
+        txtName: null,
+        sizeCsv: 0,
+        sizeTxt: 0,
+        mtimeMs: 0,
+      }
+      cur.mtimeMs = Math.max(cur.mtimeMs, Number(st.mtimeMs || 0))
+      if (p.ext === 'csv') {
+        cur.hasCsv = true
+        cur.csvName = name
+        cur.sizeCsv = Number(st.size || 0)
+      } else if (p.ext === 'txt') {
+        cur.hasTxt = true
+        cur.txtName = name
+        cur.sizeTxt = Number(st.size || 0)
+      }
+      byKey.set(k, cur)
+    }
+
+    const entries = Array.from(byKey.values()).sort((a, b) => (b.tsMs - a.tsMs) || String(a.kind).localeCompare(String(b.kind)))
+    res.json({ outputDir: outDir, boards, entries })
+  } catch (err) {
+    res.status(500).json({ error: String(err?.message || err) })
+  }
+})
+
+app.get(`${API_BASE}/dumps/:ts/:kind.:ext`, async (req, res) => {
+  const ts = String(req.params.ts || '')
+  const kind = String(req.params.kind || '')
+  const ext = String(req.params.ext || '')
+  if (!/^\d+$/.test(ts)) {
+    res.status(400).send('Bad ts')
+    return
+  }
+  if (kind !== 'dump' && kind !== 'capture') {
+    res.status(400).send('Bad kind')
+    return
+  }
+  if (ext !== 'csv' && ext !== 'txt') {
+    res.status(400).send('Bad ext')
+    return
+  }
+
+  const outDir = await resolveOutputDir()
+  const name = `${ts}_${kind}.${ext}`
+  const fp = path.join(outDir, name)
+  try {
+    const st = await fs.stat(fp)
+    if (!st.isFile()) throw new Error('not file')
+  } catch {
+    res.status(404).send('Not found')
+    return
+  }
+
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('Content-Type', ext === 'csv' ? 'text/csv; charset=utf-8' : 'text/plain; charset=utf-8')
+  const stream = fsSync.createReadStream(fp)
+  stream.on('error', () => {
+    res.status(500).end('Read error')
+  })
+  stream.pipe(res)
 })
 
 function naturalCompare(a, b) {

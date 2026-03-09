@@ -10,9 +10,9 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use wooting_analog_wrapper as sdk;
@@ -288,6 +288,254 @@ struct PendingNoteOff {
     due: Instant,
     ch: u8,
     note: u8,
+    origin_device_id: Option<u64>,
+    origin_hid: Option<HIDCodes>,
+}
+
+#[derive(Default)]
+struct ActiveMask {
+    w0: AtomicU64,
+    w1: AtomicU64,
+    w2: AtomicU64,
+    w3: AtomicU64,
+}
+
+impl ActiveMask {
+    fn clear_all(&self) {
+        self.w0.store(0, Ordering::Relaxed);
+        self.w1.store(0, Ordering::Relaxed);
+        self.w2.store(0, Ordering::Relaxed);
+        self.w3.store(0, Ordering::Relaxed);
+    }
+
+    fn set(&self, code: u8, down: bool) {
+        let idx = (code as usize) / 64;
+        let bit = (code as usize) % 64;
+        let mask = 1u64 << bit;
+        let w = match idx {
+            0 => &self.w0,
+            1 => &self.w1,
+            2 => &self.w2,
+            _ => &self.w3,
+        };
+        if down {
+            w.fetch_or(mask, Ordering::Relaxed);
+        } else {
+            w.fetch_and(!mask, Ordering::Relaxed);
+        }
+    }
+
+    fn words(&self) -> [u64; 4] {
+        [
+            self.w0.load(Ordering::Relaxed),
+            self.w1.load(Ordering::Relaxed),
+            self.w2.load(Ordering::Relaxed),
+            self.w3.load(Ordering::Relaxed),
+        ]
+    }
+}
+
+struct CaptureSamplesState {
+    base_ts_ms: u64,
+    trigger_device_id: u64,
+    start: Instant,
+    end: Instant,
+    start_unix_ms: u64,
+    cfg_line: String,
+    out_dir: PathBuf,
+
+    // Fixed-size ring buffer for samples. Each sample is 16 bytes:
+    // [t_us:u32][device_id:u64][hid_u8:u8][pad:u8][analog_q:u16]
+    // Total: 4+8+1+1+2 = 16
+    ring: Vec<u8>,
+    write_idx: u32,
+    wrapped: bool,
+    dropped_samples: u64,
+}
+
+struct CaptureEventsState {
+    base_ts_ms: u64,
+    trigger_device_id: u64,
+    start: Instant,
+    end: Instant,
+    start_unix_ms: u64,
+    cfg_line: String,
+    out_dir: PathBuf,
+
+    csv_lines: Vec<String>,
+    txt_lines: Vec<String>,
+}
+
+struct CaptureShared {
+    active: AtomicBool,
+    samples: Mutex<Option<CaptureSamplesState>>,
+    events: Mutex<Option<CaptureEventsState>>,
+    lock_drops: std::sync::atomic::AtomicU64,
+}
+
+const CAPTURE_REC_BYTES: usize = 16;
+
+fn capture_write_sample(
+    st: &mut CaptureSamplesState,
+    t_us: u32,
+    device_id: u64,
+    hid: u8,
+    analog_q: u16,
+) {
+    if st.ring.is_empty() {
+        return;
+    }
+    let cap_recs = (st.ring.len() / CAPTURE_REC_BYTES) as u32;
+    if cap_recs == 0 {
+        return;
+    }
+    let idx = st.write_idx % cap_recs;
+    let off = (idx as usize) * CAPTURE_REC_BYTES;
+
+    st.ring[off..off + 4].copy_from_slice(&t_us.to_le_bytes());
+    st.ring[off + 4..off + 12].copy_from_slice(&device_id.to_le_bytes());
+    st.ring[off + 12] = hid;
+    st.ring[off + 13] = 0u8;
+    st.ring[off + 14..off + 16].copy_from_slice(&analog_q.to_le_bytes());
+
+    st.write_idx = st.write_idx.wrapping_add(1);
+    if !st.wrapped && st.write_idx >= cap_recs {
+        st.wrapped = true;
+    }
+}
+
+fn capture_stop_and_flush(
+    capture: &Arc<CaptureShared>,
+) -> std::io::Result<Option<(u64, String, String, String, String)>> {
+    // Stop polling capture first to reduce contention.
+    capture.active.store(false, Ordering::Relaxed);
+
+    let lock_drops = capture.lock_drops.load(Ordering::Relaxed);
+    let mut guard = capture
+        .samples
+        .lock()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "capture lock poisoned"))?;
+    let Some(st) = guard.take() else {
+        // Best-effort: still clear events if present.
+        if let Ok(mut eg) = capture.events.lock() {
+            *eg = None;
+        }
+        return Ok(None);
+    };
+    let mut events_guard = capture.events.lock().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::Other, "capture events lock poisoned")
+    })?;
+    let events = events_guard.take();
+
+    let trigger_device_id = st.trigger_device_id;
+    let base_ts_ms = st.base_ts_ms;
+    let stopped_unix_ms = unix_time_ms();
+
+    let cap_recs = st.ring.len() / CAPTURE_REC_BYTES;
+    let count = if st.wrapped {
+        cap_recs
+    } else {
+        (st.write_idx as usize).min(cap_recs)
+    };
+
+    std::fs::create_dir_all(&st.out_dir)?;
+    let capture_csv_path = st.out_dir.join(format!("{base_ts_ms}_capture.csv"));
+    let capture_txt_path = st.out_dir.join(format!("{base_ts_ms}_capture.txt"));
+    let dump_csv_path = st.out_dir.join(format!("{base_ts_ms}_dump.csv"));
+    let dump_txt_path = st.out_dir.join(format!("{base_ts_ms}_dump.txt"));
+
+    // TXT metadata.
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&capture_txt_path)?);
+        writeln!(f, "timestamp_ms={}", base_ts_ms)?;
+        writeln!(f, "trigger_device_id={}", st.trigger_device_id)?;
+        writeln!(f, "start_unix_ms={}", st.start_unix_ms)?;
+        writeln!(f, "stop_unix_ms={}", stopped_unix_ms)?;
+        writeln!(f, "duration_ms_target={}", (st.end - st.start).as_millis())?;
+        writeln!(f, "ring_bytes={}", st.ring.len())?;
+        writeln!(f, "rec_bytes={}", CAPTURE_REC_BYTES)?;
+        writeln!(f, "write_idx={}", st.write_idx)?;
+        writeln!(f, "wrapped={}", st.wrapped)?;
+        writeln!(f, "dropped_samples={}", st.dropped_samples)?;
+        writeln!(f, "lock_drops={}", lock_drops)?;
+        writeln!(f, "{}", st.cfg_line)?;
+    }
+
+    // CSV samples.
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&capture_csv_path)?);
+        writeln!(f, "t_us,device_id,hid,analog,analog_q")?;
+
+        let start_idx = if st.wrapped {
+            (st.write_idx as usize) % cap_recs
+        } else {
+            0
+        };
+        for i in 0..count {
+            let idx = (start_idx + i) % cap_recs;
+            let off = idx * CAPTURE_REC_BYTES;
+            let t_us = u32::from_le_bytes(st.ring[off..off + 4].try_into().unwrap());
+            let dev = u64::from_le_bytes(st.ring[off + 4..off + 12].try_into().unwrap());
+            let hid_u8 = st.ring[off + 12];
+            let analog_q = u16::from_le_bytes(st.ring[off + 14..off + 16].try_into().unwrap());
+            let analog = (analog_q as f32) / 65535.0;
+            let hid = HIDCodes::from_u8(hid_u8)
+                .map(|h| format!("{h:?}"))
+                .unwrap_or_else(|| format!("u8_{hid_u8}"));
+            writeln!(
+                f,
+                "{t_us},{dev},{},{:.6},{analog_q}",
+                csv_escape(&hid),
+                analog
+            )?;
+        }
+    }
+
+    // Dump CSV/TXT for this capture window (event log with shared timebase).
+    if let Some(mut ev) = events {
+        ev.txt_lines
+            .push(format!("stop_unix_ms={}", stopped_unix_ms));
+        ev.txt_lines
+            .push(format!("events_rows={}", ev.csv_lines.len()));
+        // TXT
+        {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&dump_txt_path)?);
+            for line in ev.txt_lines {
+                writeln!(f, "{}", line)?;
+            }
+        }
+        // CSV
+        {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&dump_csv_path)?);
+            // Keep manual-dump columns compatible; add t_cap_ms + pressure.
+            writeln!(f, "t_ms,t_cap_ms,event,kind,device_id,hid,analog,age_ms,peak,last,peak_speed,pressed,playing,ch,note,vel,pressure,delta,thr_down,thr_up,msg")?;
+            for line in ev.csv_lines {
+                writeln!(f, "{}", line)?;
+            }
+        }
+    } else {
+        // Still create empty files so the UI can show "missing events" gracefully.
+        std::fs::write(
+            &dump_txt_path,
+            format!(
+                "timestamp_ms={}\nstop_unix_ms={}\n(no capture dump events)\n",
+                base_ts_ms, stopped_unix_ms
+            ),
+        )?;
+        std::fs::write(&dump_csv_path, "t_ms,t_cap_ms,event,kind,device_id,hid,analog,age_ms,peak,last,peak_speed,pressed,playing,ch,note,vel,pressure,delta,thr_down,thr_up,msg\n")?;
+    }
+
+    Ok(Some((
+        trigger_device_id,
+        capture_csv_path.display().to_string(),
+        capture_txt_path.display().to_string(),
+        dump_csv_path.display().to_string(),
+        dump_txt_path.display().to_string(),
+    )))
 }
 
 fn schedule_midi_ping(
@@ -307,6 +555,8 @@ fn schedule_midi_ping(
                 due: Instant::now() + dur,
                 ch,
                 note,
+                origin_device_id: None,
+                origin_hid: None,
             });
         }
     }
@@ -316,19 +566,6 @@ fn schedule_midi_ping(
 struct DebugEvent {
     t_ms: u64,
     msg: String,
-}
-
-fn cpu_rusage_ms() -> Option<(u64, u64)> {
-    // Cheap per-process CPU accounting (kernel-provided).
-    unsafe {
-        let mut ru: libc::rusage = std::mem::zeroed();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut ru as *mut libc::rusage) != 0 {
-            return None;
-        }
-        let u_ms = (ru.ru_utime.tv_sec as u64) * 1000u64 + (ru.ru_utime.tv_usec as u64) / 1000u64;
-        let s_ms = (ru.ru_stime.tv_sec as u64) * 1000u64 + (ru.ru_stime.tv_usec as u64) / 1000u64;
-        Some((u_ms, s_ms))
-    }
 }
 
 fn dbg_push(dbg_ring: &mut VecDeque<DebugEvent>, start_ts: &Instant, msg: impl Into<String>) {
@@ -341,35 +578,12 @@ fn dbg_push(dbg_ring: &mut VecDeque<DebugEvent>, start_ts: &Instant, msg: impl I
     });
 }
 
-fn dbg_dump(
-    dbg_ring: &VecDeque<DebugEvent>,
-    reason: &str,
-    dumps: &mut u64,
-    rgb_drop_critical: u64,
-) {
-    *dumps = dumps.saturating_add(1);
-    let (u_ms, s_ms) = cpu_rusage_ms().unwrap_or((0, 0));
-    warn!(
-        "DBG_RING_BEGIN reason={} len={} dumps={} rgb_drop_critical={} cpu_u_ms={} cpu_s_ms={} ",
-        reason,
-        dbg_ring.len(),
-        *dumps,
-        rgb_drop_critical,
-        u_ms,
-        s_ms
-    );
-    for e in dbg_ring.iter() {
-        warn!("DBG {:>7}ms {}", e.t_ms, e.msg);
-    }
-    warn!("DBG_RING_END");
-}
-
 fn rgb_send_critical(
     rgb_tx: &crossbeam_channel::Sender<RgbCmd>,
     dbg_ring: &mut VecDeque<DebugEvent>,
     start_ts: &Instant,
-    dbg_dumps: &mut u64,
     rgb_drop_critical: &mut u64,
+    cfg_line: &str,
     cmd: RgbCmd,
     what: String,
 ) {
@@ -384,7 +598,7 @@ fn rgb_send_critical(
                 what, *rgb_drop_critical
             );
             dbg_push(dbg_ring, start_ts, format!("RGB DROP {}", what));
-            dbg_dump(dbg_ring, "rgb_drop_critical", dbg_dumps, *rgb_drop_critical);
+            dbg_push(dbg_ring, start_ts, cfg_line.to_string());
         }
         Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
             warn!("RGB channel disconnected; dropped {}", what);
@@ -514,6 +728,277 @@ fn config_path() -> Result<PathBuf> {
     Ok(base.join("xenwooting").join("config.toml"))
 }
 
+fn state_base_dir() -> Result<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        if !xdg.trim().is_empty() {
+            return Ok(PathBuf::from(xdg));
+        }
+    }
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    Ok(Path::new(&home).join(".local").join("state"))
+}
+
+fn resolve_output_dir(cfg: &Config) -> Result<PathBuf> {
+    if let Some(s) = cfg.output_dir.as_deref() {
+        let p = s.trim();
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
+    Ok(state_base_dir()?.join("xenwooting"))
+}
+
+fn unix_time_ms() -> u64 {
+    use std::time::UNIX_EPOCH;
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn csv_escape(s: &str) -> String {
+    // Minimal CSV escaping: quote if needed; double internal quotes.
+    let needs = s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r');
+    if !needs {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        if ch == '"' {
+            out.push('"');
+            out.push('"');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn capture_events_push_row_at(capture: &Arc<CaptureShared>, when: Instant, mut row: [String; 21]) {
+    if !capture.active.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(mut guard) = capture.events.try_lock() else {
+        return;
+    };
+    let Some(ev) = guard.as_mut() else {
+        return;
+    };
+    if when > ev.end {
+        return;
+    }
+
+    // Fill capture-relative timestamp.
+    let t_cap_ms = when
+        .duration_since(ev.start)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    row[1] = t_cap_ms.to_string();
+
+    // CSV-escape everything; caller provides numeric strings too.
+    let line: Vec<String> = row.iter().map(|s| csv_escape(s)).collect();
+    ev.csv_lines.push(line.join(","));
+}
+
+fn capture_events_push_row(capture: &Arc<CaptureShared>, row: [String; 21]) {
+    capture_events_push_row_at(capture, Instant::now(), row)
+}
+
+fn parse_kv_tokens<'a>(tokens: impl Iterator<Item = &'a str>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for tok in tokens {
+        if let Some((k, v)) = tok.split_once('=') {
+            out.insert(k.to_string(), v.to_string());
+        }
+    }
+    out
+}
+
+fn write_manual_dump_files(
+    out_dir: &Path,
+    ts_ms: u64,
+    reason: &str,
+    cfg_line: &str,
+    dbg_ring: &VecDeque<DebugEvent>,
+    rgb_drop_critical: u64,
+) -> std::io::Result<(String, String)> {
+    std::fs::create_dir_all(out_dir)?;
+
+    let csv_path = out_dir.join(format!("{ts_ms}_{reason}.csv"));
+    let txt_path = out_dir.join(format!("{ts_ms}_{reason}.txt"));
+
+    // TXT: metadata + raw lines.
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&txt_path)?);
+        writeln!(f, "timestamp_ms={ts_ms}")?;
+        writeln!(f, "reason={reason}")?;
+        writeln!(f, "len={}", dbg_ring.len())?;
+        writeln!(f, "rgb_drop_critical={rgb_drop_critical}")?;
+        writeln!(f, "{cfg_line}")?;
+        for e in dbg_ring.iter() {
+            writeln!(f, "DBG {:>7}ms {}", e.t_ms, e.msg)?;
+        }
+    }
+
+    // CSV: best-effort structured parse + raw msg.
+    {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&csv_path)?);
+        let cols = [
+            "t_ms",
+            "t_cap_ms",
+            "event",
+            "kind",
+            "device_id",
+            "hid",
+            "analog",
+            "age_ms",
+            "peak",
+            "last",
+            "peak_speed",
+            "pressed",
+            "playing",
+            "ch",
+            "note",
+            "vel",
+            "pressure",
+            "delta",
+            "thr_down",
+            "thr_up",
+            "msg",
+        ];
+        writeln!(f, "{}", cols.join(","))?;
+
+        for e in dbg_ring.iter() {
+            let body = e.msg.as_str();
+            let mut row: HashMap<&str, String> = HashMap::new();
+            row.insert("t_ms", e.t_ms.to_string());
+            row.insert("msg", body.to_string());
+
+            if let Some(rest) = body.strip_prefix("EDGE ") {
+                // EDGE <kind> dev=... hid=... analog=...
+                let mut it = rest.split_whitespace();
+                let kind = it.next().unwrap_or("");
+                row.insert("event", "EDGE".to_string());
+                row.insert("kind", kind.to_string());
+                let kv = parse_kv_tokens(it);
+                for (k, v) in kv {
+                    if let Some(col) = match k.as_str() {
+                        "dev" => Some("device_id"),
+                        "hid" => Some("hid"),
+                        "analog" => Some("analog"),
+                        _ => None,
+                    } {
+                        row.insert(col, v);
+                    }
+                }
+            } else if let Some(rest) = body.strip_prefix("NOTEON_TICK ") {
+                row.insert("event", "NOTEON_TICK".to_string());
+                let kv = parse_kv_tokens(rest.split_whitespace());
+                for (k, v) in kv {
+                    let col = match k.as_str() {
+                        "dev" => "device_id",
+                        "hid" => "hid",
+                        "age_ms" => "age_ms",
+                        "playing" => "playing",
+                        "pressed" => "pressed",
+                        "peak" => "peak",
+                        "last" => "last",
+                        "peak_speed" => "peak_speed",
+                        _ => continue,
+                    };
+                    row.insert(col, v);
+                }
+            } else if let Some(rest) = body.strip_prefix("TAP_NOTE ") {
+                row.insert("event", "TAP_NOTE".to_string());
+                let kv = parse_kv_tokens(rest.split_whitespace());
+                for (k, v) in kv {
+                    let col = match k.as_str() {
+                        "dev" => "device_id",
+                        "hid" => "hid",
+                        "ch" => "ch",
+                        "note" => "note",
+                        "vel" => "vel",
+                        "age_ms" => "age_ms",
+                        "peak" => "peak",
+                        "peak_speed" => "peak_speed",
+                        _ => continue,
+                    };
+                    row.insert(col, v);
+                }
+            } else if let Some(rest) = body.strip_prefix("MIDI ") {
+                // MIDI noteon ok ... or MIDI noteoff ok ...
+                row.insert("event", "MIDI".to_string());
+                if rest.starts_with("noteon") {
+                    row.insert("kind", "noteon".to_string());
+                } else if rest.starts_with("noteoff") {
+                    row.insert("kind", "noteoff".to_string());
+                }
+                let kv = parse_kv_tokens(rest.split_whitespace());
+                for (k, v) in kv {
+                    let col = match k.as_str() {
+                        "dev" => "device_id",
+                        "hid" => "hid",
+                        "ch" => "ch",
+                        "note" => "note",
+                        "vel" => "vel",
+                        _ => continue,
+                    };
+                    row.insert(col, v);
+                }
+            } else if let Some(rest) = body.strip_prefix("POLL rapid_release ") {
+                row.insert("event", "POLL".to_string());
+                row.insert("kind", "rapid_release".to_string());
+                let kv = parse_kv_tokens(rest.split_whitespace());
+                for (k, v) in kv {
+                    let col = match k.as_str() {
+                        "device_id" => "device_id",
+                        "hid" => "hid",
+                        "peak" => "peak",
+                        "analog" => "analog",
+                        "delta" => "delta",
+                        "thr_down" => "thr_down",
+                        "thr_up" => "thr_up",
+                        _ => continue,
+                    };
+                    row.insert(col, v);
+                }
+            } else if let Some(rest) = body.strip_prefix("SUPPRESS ") {
+                row.insert("event", "SUPPRESS".to_string());
+                row.insert(
+                    "kind",
+                    rest.split_whitespace().next().unwrap_or("").to_string(),
+                );
+                let kv = parse_kv_tokens(rest.split_whitespace());
+                for (k, v) in kv {
+                    let col = match k.as_str() {
+                        "dev" => "device_id",
+                        "hid" => "hid",
+                        _ => continue,
+                    };
+                    row.insert(col, v);
+                }
+            } else {
+                row.insert("event", "RAW".to_string());
+            }
+
+            let line: Vec<String> = cols
+                .iter()
+                .map(|c| csv_escape(row.get(*c).map(|s| s.as_str()).unwrap_or("")))
+                .collect();
+            writeln!(f, "{}", line.join(","))?;
+        }
+    }
+
+    Ok((
+        csv_path.display().to_string(),
+        txt_path.display().to_string(),
+    ))
+}
+
 fn write_default_config(path: &Path) -> Result<()> {
     let dir = path.parent().context("config has no parent")?;
     fs::create_dir_all(dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
@@ -545,6 +1030,7 @@ fn write_default_config(path: &Path) -> Result<()> {
         refresh_hz: 1000.0,
         press_threshold: 0.10,
         press_threshold_step: 0.05,
+        aftertouch_press_threshold: 0.10,
         velocity_peak_track_ms: 6,
         aftershock_ms: 35,
         velocity_max_swing: 1.0,
@@ -577,6 +1063,7 @@ fn write_default_config(path: &Path) -> Result<()> {
         rgb: xenwooting::config::RgbConfig::default(),
         control_bar: xenwooting::config::ControlBarConfig::default(),
         hid_overrides: vec![],
+        output_dir: None,
     };
 
     // Provide a placeholder layout pointing to a wtn path you can create.
@@ -792,6 +1279,8 @@ fn main() -> Result<()> {
         .context("config path has no parent")?
         .to_path_buf();
 
+    let output_dir = resolve_output_dir(&cfg)?;
+
     let resolve_path = |p: &str| {
         let pb = PathBuf::from(p);
         if pb.is_absolute() {
@@ -888,6 +1377,15 @@ fn main() -> Result<()> {
         control_bar_cols_by_hid.insert(hid, cols.as_vec());
     }
 
+    // Capture skips: control-bar + action keys are not "musical".
+    let mut capture_skip_hids: HashSet<HIDCodes> = HashSet::new();
+    for h in control_bar_cols_by_hid.keys() {
+        capture_skip_hids.insert(h.clone());
+    }
+    for h in actions_by_hid.keys() {
+        capture_skip_hids.insert(h.clone());
+    }
+
     let highlight_rgb = parse_hex_rgb(&cfg.rgb.highlight_hex).unwrap_or((255, 255, 255));
 
     // MTS master
@@ -955,10 +1453,19 @@ fn main() -> Result<()> {
     // MIDI out
     let mut midi_out = AlsaMidiOut::new(&cfg.midi_out_name)?;
     info!("ALSA MIDI out ready: {}", cfg.midi_out_name);
+    info!(
+        "CFG refresh_hz={:.0} peak_track_ms={} press_threshold={:.3} aftertouch_press_threshold={:.3} release_delta={:.3} rgb_screensaver_timeout_sec={} output_dir={}",
+        cfg.refresh_hz,
+        cfg.velocity_peak_track_ms,
+        cfg.press_threshold,
+        cfg.aftertouch_press_threshold,
+        cfg.release_delta,
+        cfg.rgb.screensaver_timeout_sec,
+        output_dir.display()
+    );
 
     let start_ts = Instant::now();
     let mut dbg_ring: VecDeque<DebugEvent> = VecDeque::with_capacity(200);
-    let mut dbg_dumps: u64 = 0;
     let mut rgb_drop_critical: u64 = 0;
     let (dbg_tx, dbg_rx) = crossbeam_channel::bounded::<String>(4096);
 
@@ -1044,9 +1551,8 @@ fn main() -> Result<()> {
         AftertouchMode::SpeedMapped
     };
 
-    // When aftertouch is enabled, use a fixed low note-on threshold so expressive control works
-    // even with very light presses.
-    const AFTERTOUCH_PRESS_THRESHOLD: f32 = 0.10;
+    // When aftertouch is enabled, use a fixed note-on threshold.
+    let aftertouch_press_threshold: f32 = cfg.aftertouch_press_threshold.clamp(0.02, 0.98);
     let mut manual_press_threshold: f32 = cfg.press_threshold;
 
     let mut aftertouch_speed_max: f32 = cfg.aftertouch_speed_max.clamp(1.0, 200.0);
@@ -1067,7 +1573,7 @@ fn main() -> Result<()> {
     let threshold_init = if matches!(aftertouch_mode, AftertouchMode::Off) {
         manual_press_threshold
     } else {
-        AFTERTOUCH_PRESS_THRESHOLD
+        aftertouch_press_threshold
     };
     let press_threshold_bits =
         Arc::new(std::sync::atomic::AtomicU32::new(threshold_init.to_bits()));
@@ -1076,18 +1582,40 @@ fn main() -> Result<()> {
     let press_threshold_bits_poll = Arc::clone(&press_threshold_bits);
     let configured_device_ids_poll = configured_device_ids.clone();
     let dbg_tx_poll = dbg_tx.clone();
+
+    // Per-device set of keys to sample during capture (bitmask, lock-free reads).
+    let mut active_masks_by_device: HashMap<u64, Arc<ActiveMask>> = HashMap::new();
+    for id in configured_device_ids.iter() {
+        active_masks_by_device.insert(*id, Arc::new(ActiveMask::default()));
+    }
+    let active_masks_by_device_poll = active_masks_by_device.clone();
+
+    let capture_skip_hids_poll = capture_skip_hids.clone();
+
+    let capture = Arc::new(CaptureShared {
+        active: AtomicBool::new(false),
+        samples: Mutex::new(None),
+        events: Mutex::new(None),
+        lock_drops: AtomicU64::new(0),
+    });
+    let capture_poll = Arc::clone(&capture);
     std::thread::spawn(move || {
+        let active_masks_by_device_poll = active_masks_by_device_poll;
+        let capture_skip_hids_poll = capture_skip_hids_poll;
         let mut down_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut last_analog_by_device: HashMap<u64, HashMap<HIDCodes, f32>> = HashMap::new();
         let mut active_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut last_seen_by_device: HashMap<u64, HashMap<HIDCodes, Instant>> = HashMap::new();
+        let mut last_code_by_device: HashMap<u64, HashMap<HIDCodes, u8>> = HashMap::new();
         let mut peak_by_device: HashMap<u64, HashMap<HIDCodes, f32>> = HashMap::new();
         let mut startup_suppressed_by_device: HashMap<u64, HashSet<HIDCodes>> = HashMap::new();
         let mut did_init_device: HashSet<u64> = HashSet::new();
         let mut poll_err_since: HashMap<u64, Option<Instant>> = HashMap::new();
 
         // Edge detection is noisy near the threshold; use hysteresis.
-        const RELEASE_HYSTERESIS: f32 = 0.01;
+        // Release hysteresis (thr_up = thr_down - hysteresis). Smaller values release sooner but
+        // can be more sensitive to jitter near the threshold.
+        const RELEASE_HYSTERESIS: f32 = 0.005;
         // Some SDK/plugins may only report a release as "missing from buffer" (or as a one-shot 0.0).
         // Treat a key that's missing for this long as released.
         const MISSING_RELEASE_MS: u64 = 50;
@@ -1131,6 +1659,7 @@ fn main() -> Result<()> {
                                     .or_insert_with(HashMap::new);
                                 active_by_device.entry(*id).or_insert_with(HashSet::new);
                                 last_seen_by_device.entry(*id).or_insert_with(HashMap::new);
+                                last_code_by_device.entry(*id).or_insert_with(HashMap::new);
                                 peak_by_device.entry(*id).or_insert_with(HashMap::new);
                                 startup_suppressed_by_device
                                     .entry(*id)
@@ -1142,6 +1671,7 @@ fn main() -> Result<()> {
                             last_analog_by_device.retain(|id, _| new_ids.contains(id));
                             active_by_device.retain(|id, _| new_ids.contains(id));
                             last_seen_by_device.retain(|id, _| new_ids.contains(id));
+                            last_code_by_device.retain(|id, _| new_ids.contains(id));
                             peak_by_device.retain(|id, _| new_ids.contains(id));
                             startup_suppressed_by_device.retain(|id, _| new_ids.contains(id));
                             poll_err_since.retain(|id, _| new_ids.contains(id));
@@ -1239,6 +1769,7 @@ fn main() -> Result<()> {
                 let last_analog = last_analog_by_device.get_mut(device_id).unwrap();
                 let active = active_by_device.get_mut(device_id).unwrap();
                 let last_seen = last_seen_by_device.get_mut(device_id).unwrap();
+                let last_code = last_code_by_device.get_mut(device_id).unwrap();
                 let peak = peak_by_device.get_mut(device_id).unwrap();
                 let startup_suppressed = startup_suppressed_by_device.get_mut(device_id).unwrap();
 
@@ -1270,6 +1801,7 @@ fn main() -> Result<()> {
                     };
 
                     seen.insert(hid.clone());
+                    last_code.insert(hid.clone(), *code_u16 as u8);
                     last_seen.insert(hid.clone(), now);
 
                     let press_threshold = f32::from_bits(
@@ -1332,6 +1864,16 @@ fn main() -> Result<()> {
                         }
 
                         active.insert(hid.clone());
+
+                        // Capture sampling: start tracking this key's press dynamics immediately.
+                        if capture_poll.active.load(Ordering::Relaxed)
+                            && !capture_skip_hids_poll.contains(&hid)
+                        {
+                            if let Some(mask) = active_masks_by_device_poll.get(device_id) {
+                                mask.set(*code_u16 as u8, true);
+                            }
+                        }
+
                         if verbose {
                             eprintln!(
                                 "send DOWN device_id={} hid={:?} analog={:.3} thr={:.3}",
@@ -1354,8 +1896,15 @@ fn main() -> Result<()> {
                         down.remove(&hid);
                         last_analog.remove(&hid);
                         last_seen.remove(&hid);
+                        last_code.remove(&hid);
                         peak.remove(&hid);
                         startup_suppressed.remove(&hid);
+
+                        if capture_poll.active.load(Ordering::Relaxed) {
+                            if let Some(mask) = active_masks_by_device_poll.get(device_id) {
+                                mask.set(*code_u16 as u8, false);
+                            }
+                        }
 
                         // Only emit Up if we previously emitted Down.
                         if active.remove(&hid) {
@@ -1419,6 +1968,7 @@ fn main() -> Result<()> {
                     down.remove(&hid);
                     last_analog.remove(&hid);
                     last_seen.remove(&hid);
+                    let code_opt = last_code.remove(&hid);
                     peak.remove(&hid);
                     startup_suppressed.remove(&hid);
 
@@ -1432,10 +1982,66 @@ fn main() -> Result<()> {
                         ));
                         let _ = tx.send(KeyEdge::Up {
                             device_id: *device_id,
-                            hid,
+                            hid: hid.clone(),
                             analog: 0.0,
                             ts: Instant::now(),
                         });
+
+                        if capture_poll.active.load(Ordering::Relaxed)
+                            && !capture_skip_hids_poll.contains(&hid)
+                        {
+                            if let (Some(mask), Some(code)) =
+                                (active_masks_by_device_poll.get(device_id), code_opt)
+                            {
+                                mask.set(code, false);
+                            }
+                        }
+                    }
+                }
+
+                // Optional sample capture (triggered, writes to an in-memory ring buffer).
+                // Sample keys that have become active during this capture window.
+                if capture_poll.active.load(Ordering::Relaxed) {
+                    if let Some(mask) = active_masks_by_device_poll.get(device_id) {
+                        let ws = mask.words();
+                        if !ws.iter().all(|w| *w == 0) {
+                            if let Ok(mut guard) = capture_poll.samples.try_lock() {
+                                if let Some(st) = guard.as_mut() {
+                                    if now <= st.end {
+                                        let t_us = now
+                                            .duration_since(st.start)
+                                            .as_micros()
+                                            .min(u32::MAX as u128)
+                                            as u32;
+
+                                        let mut analog_by_code: [f32; 256] = [0.0; 256];
+                                        for (code_u16, analog) in data.iter() {
+                                            if *code_u16 > 255 {
+                                                continue;
+                                            }
+                                            analog_by_code[*code_u16 as usize] =
+                                                (*analog).clamp(0.0, 1.0);
+                                        }
+
+                                        for (word_idx, mut w) in ws.into_iter().enumerate() {
+                                            while w != 0 {
+                                                let bit = w.trailing_zeros() as u8;
+                                                let code: u8 = (word_idx as u8) * 64 + bit;
+                                                w &= w - 1;
+
+                                                let a = analog_by_code[code as usize];
+                                                let analog_q = (a * 65535.0).round() as u16;
+                                                capture_write_sample(
+                                                    st, t_us, *device_id, code, analog_q,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                capture_poll.lock_drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
             }
@@ -1528,11 +2134,41 @@ fn main() -> Result<()> {
             }
         };
 
+    // Paint the control-bar LEDs corresponding to the Left/Right Ctrl keys.
+    // Used as a persistent mode indicator (capture armed).
+    let paint_ctrl_indicator =
+        |device_id: u64, rgb_map: &HashMap<u64, u8>, base_rgb: (u8, u8, u8), on: bool| {
+            if !rgb_enabled {
+                return;
+            }
+            let Some(&dev_idx) = rgb_map.get(&device_id) else {
+                return;
+            };
+            let rgb = if on { (255u8, 255u8, 255u8) } else { base_rgb };
+            for hid in [HIDCodes::LeftCtrl, HIDCodes::RightCtrl] {
+                let Some(cols) = control_bar_cols_by_hid.get(&hid) else {
+                    continue;
+                };
+                for &c in cols.iter() {
+                    try_send_drop(
+                        &rgb_tx,
+                        RgbCmd::SetKey(RgbKey {
+                            device_index: dev_idx,
+                            row: control_bar_row,
+                            col: c,
+                            rgb,
+                        }),
+                    );
+                }
+            }
+        };
+
     let paint_base = |wtn: &Wtn,
                       paint_control_bar: bool,
                       rgb_map: &HashMap<u64, u8>,
                       tm: TrainerMode,
-                      octave_hold_by_device: &HashSet<u64>| {
+                      octave_hold_by_device: &HashSet<u64>,
+                      capture_indicator_devices: &HashSet<u64>| {
         if !rgb_enabled {
             return;
         }
@@ -1604,6 +2240,14 @@ fn main() -> Result<()> {
                     rgb,
                     octave_hold_by_device.contains(dev_id),
                 );
+
+                // Ctrl capture-mode indicator overrides the base bar color.
+                paint_ctrl_indicator(
+                    *dev_id,
+                    rgb_map,
+                    rgb,
+                    capture_indicator_devices.contains(dev_id),
+                );
             }
         }
         if log_edges || log_poll || log_midi {
@@ -1611,7 +2255,9 @@ fn main() -> Result<()> {
         }
     };
 
-    let paint_control_bar = |rgb_map: &HashMap<u64, u8>, rgb: (u8, u8, u8)| {
+    let paint_control_bar = |rgb_map: &HashMap<u64, u8>,
+                             rgb: (u8, u8, u8),
+                             capture_indicator_devices: &HashSet<u64>| {
         if !rgb_enabled {
             return;
         }
@@ -1630,6 +2276,13 @@ fn main() -> Result<()> {
                     }),
                 );
             }
+
+            paint_ctrl_indicator(
+                *dev_id,
+                rgb_map,
+                rgb,
+                capture_indicator_devices.contains(dev_id),
+            );
         }
     };
 
@@ -1641,7 +2294,8 @@ fn main() -> Result<()> {
                        pcs_root: &Vec<i32>,
                        root_pc: Option<i32>,
                        dim: f32,
-                       octave_hold_by_device: &HashSet<u64>| {
+                       octave_hold_by_device: &HashSet<u64>,
+                       capture_indicator_devices: &HashSet<u64>| {
         if !rgb_enabled {
             return;
         }
@@ -1741,6 +2395,13 @@ fn main() -> Result<()> {
                 bar,
                 octave_hold_by_device.contains(dev_id),
             );
+
+            paint_ctrl_indicator(
+                *dev_id,
+                rgb_map,
+                bar,
+                capture_indicator_devices.contains(dev_id),
+            );
         }
 
         if mode == GuideMode::Active {
@@ -1751,12 +2412,15 @@ fn main() -> Result<()> {
         }
     };
 
+    let mut capture_indicator_devices: HashSet<u64> = HashSet::new();
+
     paint_base(
         &wtn,
         true,
         &rgb_index_by_device_id,
         trainer_mode,
         &octave_hold_by_device,
+        &capture_indicator_devices,
     );
 
     if log_edges || log_poll || log_midi {
@@ -1770,6 +2434,9 @@ fn main() -> Result<()> {
     let mut note_by_key: HashMap<(u64, HIDCodes), (u8, u8)> = HashMap::new();
     let mut note_on_count: HashMap<(u8, u8), u32> = HashMap::new();
     let mut pending_noteoffs: VecDeque<PendingNoteOff> = VecDeque::new();
+
+    // Last aftertouch pressure sent per key (only logged during capture).
+    let mut last_aftertouch_pressure_by_key: HashMap<(u64, HIDCodes), u8> = HashMap::new();
 
     // Live HUD state published for /wtn/live.
     let live_state_path = PathBuf::from(LIVE_STATE_PATH);
@@ -1964,8 +2631,12 @@ fn main() -> Result<()> {
     let mut pressed_keys: HashSet<(u64, HIDCodes)> = HashSet::new();
     let mut suppressed_keys: HashSet<(u64, HIDCodes)> = HashSet::new();
 
-    let mut last_leftctrl_down: Option<Instant> = None;
-    let mut last_rightctrl_down: Option<Instant> = None;
+    let mut last_leftctrl_down: Option<(u64, Instant)> = None;
+    let mut last_rightctrl_down: Option<(u64, Instant)> = None;
+
+    const CAPTURE_DURATION_MS: u64 = 30_000;
+    const CAPTURE_MAX_BYTES: usize = 128 * 1024 * 1024;
+    const CAPTURE_RELEASE_HYSTERESIS: f32 = 0.005;
 
     let paint_off = |rgb_map: &HashMap<u64, u8>| {
         if !rgb_enabled {
@@ -2101,6 +2772,7 @@ fn main() -> Result<()> {
                     &rgb_index_by_device_id,
                     trainer_mode,
                     &octave_hold_by_device,
+                    &capture_indicator_devices,
                 );
                 info!("RGB device count changed; repainted base ({})", now);
             }
@@ -2124,6 +2796,7 @@ fn main() -> Result<()> {
                         &rgb_index_by_device_id,
                         trainer_mode,
                         &octave_hold_by_device,
+                        &capture_indicator_devices,
                     );
                     info!("Configured device set changed; repainted base");
                 }
@@ -2231,6 +2904,7 @@ fn main() -> Result<()> {
                                             &rgb_index_by_device_id,
                                             trainer_mode,
                                             &octave_hold_by_device,
+                                            &capture_indicator_devices,
                                         );
                                         info!(
                                             "Reloaded config layouts ({} layouts)",
@@ -2358,6 +3032,7 @@ fn main() -> Result<()> {
                                 guide_root_pc,
                                 guide_dim,
                                 &octave_hold_by_device,
+                                &capture_indicator_devices,
                             );
                             info!("guide: enabled (wait_root) chord_key={:?}", guide_chord_key);
                         } else {
@@ -2376,6 +3051,7 @@ fn main() -> Result<()> {
                                     &rgb_index_by_device_id,
                                     trainer_mode,
                                     &octave_hold_by_device,
+                                    &capture_indicator_devices,
                                 );
                             }
                             info!("guide: disabled");
@@ -2397,6 +3073,7 @@ fn main() -> Result<()> {
                                     &rgb_index_by_device_id,
                                     trainer_mode,
                                     &octave_hold_by_device,
+                                    &capture_indicator_devices,
                                 );
                             }
                             info!("guide: disabled (file removed)");
@@ -2438,6 +3115,7 @@ fn main() -> Result<()> {
                                     &rgb_index_by_device_id,
                                     trainer_mode,
                                     &octave_hold_by_device,
+                                    &capture_indicator_devices,
                                 );
                                 info!("Reloaded wtn from disk: {}", wtn_path.display());
                             } else {
@@ -2520,6 +3198,7 @@ fn main() -> Result<()> {
                             &rgb_index_by_device_id,
                             trainer_mode,
                             &octave_hold_by_device,
+                            &capture_indicator_devices,
                         );
                     }
                     info!("preview: disabled");
@@ -2562,6 +3241,7 @@ fn main() -> Result<()> {
                                         &rgb_index_by_device_id,
                                         trainer_mode,
                                         &octave_hold_by_device,
+                                        &capture_indicator_devices,
                                     );
                                 }
                                 info!("preview: reloaded wtn {}", preview_wtn_path.display());
@@ -2691,6 +3371,77 @@ fn main() -> Result<()> {
             dbg_push(&mut dbg_ring, &start_ts, format!("POLL {}", msg));
         }
 
+        // Auto-stop capture when duration elapsed.
+        if capture.active.load(Ordering::Relaxed) {
+            let now = Instant::now();
+            let should_stop = if let Ok(guard) = capture.samples.try_lock() {
+                guard.as_ref().map(|st| now > st.end).unwrap_or(false)
+            } else {
+                false
+            };
+            if should_stop {
+                match capture_stop_and_flush(&capture) {
+                    Ok(Some((
+                        dev_id,
+                        capture_csv_path,
+                        capture_txt_path,
+                        dump_csv_path,
+                        dump_txt_path,
+                    ))) => {
+                        capture_indicator_devices.remove(&dev_id);
+                        let base_rgb = match guide_mode {
+                            GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                            GuideMode::Active => (0u8, 255u8, 0u8),
+                            GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                        };
+                        paint_ctrl_indicator(dev_id, &rgb_index_by_device_id, base_rgb, false);
+                        // Clear capture sampling masks.
+                        for m in active_masks_by_device.values() {
+                            m.clear_all();
+                        }
+                        last_aftertouch_pressure_by_key.clear();
+                        dbg_push(
+                            &mut dbg_ring,
+                            &start_ts,
+                            format!(
+                                "CAPTURE stop (timeout) dev={} capture_csv={} capture_txt={} dump_csv={} dump_txt={}",
+                                dev_id, capture_csv_path, capture_txt_path, dump_csv_path, dump_txt_path
+                            ),
+                        );
+                        // Clear ring after saving (fresh for next manual dump).
+                        dbg_ring.clear();
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        dbg_push(
+                            &mut dbg_ring,
+                            &start_ts,
+                            format!("CAPTURE stop failed: {e}"),
+                        );
+                    }
+                }
+            }
+        }
+
+        let thr_down =
+            f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
+        let thr_up = (thr_down - CAPTURE_RELEASE_HYSTERESIS).clamp(0.0, 0.99);
+        let cfg_line = format!(
+            "CFG refresh_hz={:.0} poll_ms={:.3} peak_track_ms={} thr={:.3} thr_up={:.3} hyst={:.3} thr_at={:.3} aftertouch_mode={} aftertouch_speed_max={:.2} release_delta={:.3} rapid_release_enabled={} screensaver_timeout_sec={}",
+            cfg.refresh_hz,
+            poll_period.as_secs_f32() * 1000.0,
+            cfg.velocity_peak_track_ms,
+            thr_down,
+            thr_up,
+            CAPTURE_RELEASE_HYSTERESIS,
+            aftertouch_press_threshold,
+            aftertouch_mode.name(),
+            aftertouch_speed_max,
+            cfg.release_delta,
+            rapid_release_enabled,
+            cfg.rgb.screensaver_timeout_sec
+        );
+
         for edge in edges {
             let (device_id, hid, analog, kind, ts) = match edge {
                 KeyEdge::Down {
@@ -2738,6 +3489,7 @@ fn main() -> Result<()> {
                     &rgb_index_by_device_id,
                     trainer_mode,
                     &octave_hold_by_device,
+                    &capture_indicator_devices,
                 );
                 screensaver_active = false;
                 suppressed_keys.insert(key_id.clone());
@@ -2752,45 +3504,171 @@ fn main() -> Result<()> {
                 continue;
             }
 
-            // Manual debug dump: press LeftCtrl and RightCtrl within 400ms.
-            if kind == "down" && hid == HIDCodes::LeftCtrl {
+            // Ctrl chord: press LeftCtrl and RightCtrl within 400ms.
+            // Board0: toggle 30s capture (no MIDI ping).
+            // Board1: debug ring dump + MIDI ping.
+            if kind == "down" && (hid == HIDCodes::LeftCtrl || hid == HIDCodes::RightCtrl) {
                 let now = Instant::now();
-                last_leftctrl_down = Some(now);
-                if let Some(t) = last_rightctrl_down {
-                    if now.duration_since(t) <= Duration::from_millis(400) {
-                        dbg_push(&mut dbg_ring, &start_ts, "MANUAL_DUMP ctrl_chord");
-                        dbg_dump(
-                            &dbg_ring,
-                            "manual_ctrl_chord",
-                            &mut dbg_dumps,
-                            rgb_drop_critical,
-                        );
-                        schedule_midi_ping(
-                            &mut midi_out,
-                            &mut note_on_count,
-                            &mut pending_noteoffs,
-                        );
+                let mut chord = false;
+                if hid == HIDCodes::LeftCtrl {
+                    last_leftctrl_down = Some((device_id, now));
+                    if let Some((dev2, t)) = last_rightctrl_down {
+                        chord = dev2 == device_id
+                            && now.duration_since(t) <= Duration::from_millis(400);
+                    }
+                } else {
+                    last_rightctrl_down = Some((device_id, now));
+                    if let Some((dev2, t)) = last_leftctrl_down {
+                        chord = dev2 == device_id
+                            && now.duration_since(t) <= Duration::from_millis(400);
                     }
                 }
-            }
-            if kind == "down" && hid == HIDCodes::RightCtrl {
-                let now = Instant::now();
-                last_rightctrl_down = Some(now);
-                if let Some(t) = last_leftctrl_down {
-                    if now.duration_since(t) <= Duration::from_millis(400) {
-                        dbg_push(&mut dbg_ring, &start_ts, "MANUAL_DUMP ctrl_chord");
-                        dbg_dump(
+
+                if chord {
+                    let board = board_by_device
+                        .get(&device_id)
+                        .map(|b| b.wtn_board)
+                        .unwrap_or(1u8);
+
+                    if board == 0u8 {
+                        if capture.active.load(Ordering::Relaxed) {
+                            match capture_stop_and_flush(&capture) {
+                                Ok(Some((
+                                    dev_id,
+                                    capture_csv_path,
+                                    capture_txt_path,
+                                    dump_csv_path,
+                                    dump_txt_path,
+                                ))) => {
+                                    capture_indicator_devices.remove(&dev_id);
+                                    let base_rgb = match guide_mode {
+                                        GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                                        GuideMode::Active => (0u8, 255u8, 0u8),
+                                        GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                                    };
+                                    paint_ctrl_indicator(
+                                        dev_id,
+                                        &rgb_index_by_device_id,
+                                        base_rgb,
+                                        false,
+                                    );
+                                    for m in active_masks_by_device.values() {
+                                        m.clear_all();
+                                    }
+                                    last_aftertouch_pressure_by_key.clear();
+                                    dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!(
+                                            "CAPTURE stop (manual) dev={} capture_csv={} capture_txt={} dump_csv={} dump_txt={}",
+                                            dev_id, capture_csv_path, capture_txt_path, dump_csv_path, dump_txt_path
+                                        ),
+                                    );
+                                    dbg_ring.clear();
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!("CAPTURE stop failed: {e}"),
+                                    );
+                                }
+                            }
+                        } else {
+                            // Start capture window. Keys are captured dynamically when they become active.
+                            for m in active_masks_by_device.values() {
+                                m.clear_all();
+                            }
+                            capture.lock_drops.store(0, Ordering::Relaxed);
+                            let base_ts_ms = unix_time_ms();
+                            let start = Instant::now();
+                            let end = start + Duration::from_millis(CAPTURE_DURATION_MS);
+
+                            if let Ok(mut guard) = capture.samples.lock() {
+                                *guard = Some(CaptureSamplesState {
+                                    base_ts_ms,
+                                    trigger_device_id: device_id,
+                                    start,
+                                    end,
+                                    start_unix_ms: base_ts_ms,
+                                    cfg_line: cfg_line.clone(),
+                                    out_dir: output_dir.clone(),
+                                    ring: vec![0u8; CAPTURE_MAX_BYTES],
+                                    write_idx: 0,
+                                    wrapped: false,
+                                    dropped_samples: 0,
+                                });
+                            }
+                            if let Ok(mut guard) = capture.events.lock() {
+                                *guard = Some(CaptureEventsState {
+                                    base_ts_ms,
+                                    trigger_device_id: device_id,
+                                    start,
+                                    end,
+                                    start_unix_ms: base_ts_ms,
+                                    cfg_line: cfg_line.clone(),
+                                    out_dir: output_dir.clone(),
+                                    csv_lines: Vec::new(),
+                                    txt_lines: vec![
+                                        format!("timestamp_ms={}", base_ts_ms),
+                                        format!("trigger_device_id={}", device_id),
+                                        format!("start_unix_ms={}", base_ts_ms),
+                                        format!("duration_ms_target={}", CAPTURE_DURATION_MS),
+                                        cfg_line.clone(),
+                                    ],
+                                });
+                            }
+
+                            capture.active.store(true, Ordering::Relaxed);
+                            last_aftertouch_pressure_by_key.clear();
+                            capture_indicator_devices.insert(device_id);
+                            let base_rgb = match guide_mode {
+                                GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                                GuideMode::Active => (0u8, 255u8, 0u8),
+                                GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                            };
+                            paint_ctrl_indicator(
+                                device_id,
+                                &rgb_index_by_device_id,
+                                base_rgb,
+                                true,
+                            );
+                            dbg_push(
+                                &mut dbg_ring,
+                                &start_ts,
+                                format!(
+                                    "CAPTURE start dev={} dur_ms={} base_ts_ms={} ring_bytes={}",
+                                    device_id, CAPTURE_DURATION_MS, base_ts_ms, CAPTURE_MAX_BYTES
+                                ),
+                            );
+                        }
+                    } else {
+                        let ts_ms = unix_time_ms();
+                        match write_manual_dump_files(
+                            &output_dir,
+                            ts_ms,
+                            "dump",
+                            &cfg_line,
                             &dbg_ring,
-                            "manual_ctrl_chord",
-                            &mut dbg_dumps,
                             rgb_drop_critical,
-                        );
+                        ) {
+                            Ok((csv_path, txt_path)) => {
+                                dbg_ring.clear();
+                                info!("MANUAL_DUMP saved csv={} txt={}", csv_path, txt_path);
+                            }
+                            Err(e) => {
+                                warn!("manual dump save failed: {e}");
+                            }
+                        }
                         schedule_midi_ping(
                             &mut midi_out,
                             &mut note_on_count,
                             &mut pending_noteoffs,
                         );
                     }
+
+                    continue;
                 }
             }
 
@@ -2875,7 +3753,7 @@ fn main() -> Result<()> {
                                 .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
                         } else {
                             press_threshold_bits
-                                .store(AFTERTOUCH_PRESS_THRESHOLD.to_bits(), Ordering::Relaxed);
+                                .store(aftertouch_press_threshold.to_bits(), Ordering::Relaxed);
                         }
                         info!(
                             "aftertouch_mode now {} (thr {:.2})",
@@ -3026,7 +3904,11 @@ fn main() -> Result<()> {
                                 guide_root_pc = None;
                                 info!("guide: disabled due to layout change");
                                 // Layout switching does not repaint the control bar; restore it explicitly.
-                                paint_control_bar(&rgb_index_by_device_id, (255, 0, 0));
+                                paint_control_bar(
+                                    &rgb_index_by_device_id,
+                                    (255, 0, 0),
+                                    &capture_indicator_devices,
+                                );
                                 // Consume the first layout keypress to exit guide mode only.
                                 continue;
                             }
@@ -3059,6 +3941,7 @@ fn main() -> Result<()> {
                                     &rgb_index_by_device_id,
                                     trainer_mode,
                                     &octave_hold_by_device,
+                                    &capture_indicator_devices,
                                 );
                             }
                         }
@@ -3082,7 +3965,11 @@ fn main() -> Result<()> {
                                 guide_root_pc = None;
                                 info!("guide: disabled due to layout change");
                                 // Layout switching does not repaint the control bar; restore it explicitly.
-                                paint_control_bar(&rgb_index_by_device_id, (255, 0, 0));
+                                paint_control_bar(
+                                    &rgb_index_by_device_id,
+                                    (255, 0, 0),
+                                    &capture_indicator_devices,
+                                );
                                 // Consume the first layout keypress to exit guide mode only.
                                 continue;
                             }
@@ -3119,6 +4006,7 @@ fn main() -> Result<()> {
                                     &rgb_index_by_device_id,
                                     trainer_mode,
                                     &octave_hold_by_device,
+                                    &capture_indicator_devices,
                                 );
                             }
                         }
@@ -3202,6 +4090,7 @@ fn main() -> Result<()> {
                             guide_root_pc,
                             guide_dim,
                             &octave_hold_by_device,
+                            &capture_indicator_devices,
                         );
 
                         // Ensure any currently-held keys restore to the correct (dimmed) guide idle colors.
@@ -3226,6 +4115,43 @@ fn main() -> Result<()> {
                                 device_id, hid, analog
                             ),
                         );
+
+                        // Capture-session dump row (timebase-synced).
+                        if capture.active.load(Ordering::Relaxed) {
+                            let t_ms = start_ts.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            let thr_down_now =
+                                f32::from_bits(press_threshold_bits.load(Ordering::Relaxed))
+                                    .clamp(0.0, 0.99);
+                            let thr_up_now =
+                                (thr_down_now - CAPTURE_RELEASE_HYSTERESIS).clamp(0.0, 0.99);
+                            capture_events_push_row_at(
+                                &capture,
+                                ts,
+                                [
+                                    t_ms.to_string(),
+                                    String::new(),
+                                    "EDGE".to_string(),
+                                    "down".to_string(),
+                                    device_id.to_string(),
+                                    format!("{hid:?}"),
+                                    format!("{analog:.6}"),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    format!("{thr_down_now:.6}"),
+                                    format!("{thr_up_now:.6}"),
+                                    String::new(),
+                                ],
+                            );
+                        }
                         let already_playing = note_by_key.contains_key(&key_id);
 
                         let led = if rgb_enabled {
@@ -3234,8 +4160,8 @@ fn main() -> Result<()> {
                                     &rgb_tx,
                                     &mut dbg_ring,
                                     &start_ts,
-                                    &mut dbg_dumps,
                                     &mut rgb_drop_critical,
+                                    &cfg_line,
                                     RgbCmd::SetKey(RgbKey {
                                         device_index: dev_idx,
                                         row: loc.led_row,
@@ -3294,6 +4220,38 @@ fn main() -> Result<()> {
                                 ),
                             );
                         }
+
+                        if capture.active.load(Ordering::Relaxed) {
+                            let t_ms = start_ts.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            capture_events_push_row_at(
+                                &capture,
+                                ts,
+                                [
+                                    t_ms.to_string(),
+                                    String::new(),
+                                    "EDGE".to_string(),
+                                    "update".to_string(),
+                                    device_id.to_string(),
+                                    format!("{hid:?}"),
+                                    format!("{analog:.6}"),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                ],
+                            );
+                        }
+
                         if let Some(st) = vel_state.get_mut(&key_id) {
                             match st {
                                 VelState::Tracking {
@@ -3328,6 +4286,42 @@ fn main() -> Result<()> {
                                 device_id, hid, analog
                             ),
                         );
+
+                        if capture.active.load(Ordering::Relaxed) {
+                            let t_ms = start_ts.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            let thr_down_now =
+                                f32::from_bits(press_threshold_bits.load(Ordering::Relaxed))
+                                    .clamp(0.0, 0.99);
+                            let thr_up_now =
+                                (thr_down_now - CAPTURE_RELEASE_HYSTERESIS).clamp(0.0, 0.99);
+                            capture_events_push_row_at(
+                                &capture,
+                                ts,
+                                [
+                                    t_ms.to_string(),
+                                    String::new(),
+                                    "EDGE".to_string(),
+                                    "up".to_string(),
+                                    device_id.to_string(),
+                                    format!("{hid:?}"),
+                                    format!("{analog:.6}"),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    format!("{thr_down_now:.6}"),
+                                    format!("{thr_up_now:.6}"),
+                                    String::new(),
+                                ],
+                            );
+                        }
                         let removed = vel_state.remove(&key_id);
 
                         // Restore LED immediately.
@@ -3336,8 +4330,8 @@ fn main() -> Result<()> {
                                 &rgb_tx,
                                 &mut dbg_ring,
                                 &start_ts,
-                                &mut dbg_dumps,
                                 &mut rgb_drop_critical,
+                                &cfg_line,
                                 RgbCmd::SetKey(RgbKey {
                                     device_index: led.dev_idx,
                                     row: led.row,
@@ -3397,6 +4391,40 @@ fn main() -> Result<()> {
                                                 device_id, hid, ch, note0
                                             ),
                                         );
+
+                                        if capture.active.load(Ordering::Relaxed) {
+                                            let t_ms = start_ts
+                                                .elapsed()
+                                                .as_millis()
+                                                .min(u64::MAX as u128)
+                                                as u64;
+                                            capture_events_push_row(
+                                                &capture,
+                                                [
+                                                    t_ms.to_string(),
+                                                    String::new(),
+                                                    "MIDI".to_string(),
+                                                    "noteoff".to_string(),
+                                                    device_id.to_string(),
+                                                    format!("{hid:?}"),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    ch.to_string(),
+                                                    note0.to_string(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    "noteoff".to_string(),
+                                                ],
+                                            );
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(
@@ -3411,12 +4439,7 @@ fn main() -> Result<()> {
                                             &start_ts,
                                             format!("PANIC noteoff_error ch={} note={}", ch, note0),
                                         );
-                                        dbg_dump(
-                                            &dbg_ring,
-                                            "noteoff_error",
-                                            &mut dbg_dumps,
-                                            rgb_drop_critical,
-                                        );
+                                        dbg_push(&mut dbg_ring, &start_ts, cfg_line.clone());
                                         midi_out.panic_all();
                                         note_by_key.clear();
                                         note_on_count.clear();
@@ -3442,6 +4465,40 @@ fn main() -> Result<()> {
                                             device_id, hid, out_ch, note0
                                         ),
                                     );
+
+                                        if capture.active.load(Ordering::Relaxed) {
+                                            let t_ms = start_ts
+                                                .elapsed()
+                                                .as_millis()
+                                                .min(u64::MAX as u128)
+                                                as u64;
+                                            capture_events_push_row(
+                                                &capture,
+                                                [
+                                                    t_ms.to_string(),
+                                                    String::new(),
+                                                    "MIDI".to_string(),
+                                                    "noteoff_fallback".to_string(),
+                                                    device_id.to_string(),
+                                                    format!("{hid:?}"),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    out_ch.to_string(),
+                                                    note0.to_string(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    "noteoff_fallback".to_string(),
+                                                ],
+                                            );
+                                        }
                                     }
                                     Err(e) => {
                                         warn!(
@@ -3458,12 +4515,6 @@ fn main() -> Result<()> {
                                                 "PANIC noteoff_error_fallback ch={} note={}",
                                                 out_ch, note0
                                             ),
-                                        );
-                                        dbg_dump(
-                                            &dbg_ring,
-                                            "noteoff_error_fallback",
-                                            &mut dbg_dumps,
-                                            rgb_drop_critical,
                                         );
                                         midi_out.panic_all();
                                         note_by_key.clear();
@@ -3533,6 +4584,40 @@ fn main() -> Result<()> {
                                                     device_id, hid, out_ch, note, vel
                                                 ),
                                             );
+
+                                            if capture.active.load(Ordering::Relaxed) {
+                                                let t_ms = start_ts
+                                                    .elapsed()
+                                                    .as_millis()
+                                                    .min(u64::MAX as u128)
+                                                    as u64;
+                                                capture_events_push_row(
+                                                    &capture,
+                                                    [
+                                                        t_ms.to_string(),
+                                                        String::new(),
+                                                        "MIDI".to_string(),
+                                                        "noteon_tap".to_string(),
+                                                        device_id.to_string(),
+                                                        format!("{hid:?}"),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        out_ch.to_string(),
+                                                        note.to_string(),
+                                                        vel.to_string(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        "noteon_tap".to_string(),
+                                                    ],
+                                                );
+                                            }
                                             *note_on_count.entry((*out_ch, *note)).or_insert(0) +=
                                                 1;
                                             pending_noteoffs.push_back(PendingNoteOff {
@@ -3540,6 +4625,8 @@ fn main() -> Result<()> {
                                                     + Duration::from_millis(TAP_NOTE_OFF_MS),
                                                 ch: *out_ch,
                                                 note: *note,
+                                                origin_device_id: Some(device_id),
+                                                origin_hid: Some(hid.clone()),
                                             });
                                         }
                                         Err(e) => {
@@ -3547,12 +4634,7 @@ fn main() -> Result<()> {
                                                 "MIDI noteon failed (tap) ch={} note={} vel={} err={:?}",
                                                 out_ch, note, vel, e
                                             );
-                                            dbg_dump(
-                                                &dbg_ring,
-                                                "tap_noteon_failed",
-                                                &mut dbg_dumps,
-                                                rgb_drop_critical,
-                                            );
+                                            dbg_push(&mut dbg_ring, &start_ts, cfg_line.clone());
                                         }
                                     }
                                     sent = true;
@@ -3581,12 +4663,7 @@ fn main() -> Result<()> {
                                             device_id, hid
                                         ),
                                     );
-                                    dbg_dump(
-                                        &dbg_ring,
-                                        "up_without_note_mapping_playing",
-                                        &mut dbg_dumps,
-                                        rgb_drop_critical,
-                                    );
+                                    dbg_push(&mut dbg_ring, &start_ts, cfg_line.clone());
                                     midi_out.panic_all();
                                     note_by_key.clear();
                                     note_on_count.clear();
@@ -3654,12 +4731,6 @@ fn main() -> Result<()> {
                                     last_analog
                                 ),
                             );
-                            dbg_dump(
-                                &dbg_ring,
-                                "late_noteon_skip",
-                                &mut dbg_dumps,
-                                rgb_drop_critical,
-                            );
                             vel_state.remove(&key);
                             continue;
                         }
@@ -3722,12 +4793,7 @@ fn main() -> Result<()> {
                                             out_ch, note, vel
                                         ),
                                     );
-                                    dbg_dump(
-                                        &dbg_ring,
-                                        "noteon_failed",
-                                        &mut dbg_dumps,
-                                        rgb_drop_critical,
-                                    );
+                                    dbg_push(&mut dbg_ring, &start_ts, cfg_line.clone());
                                     false
                                 }
                             };
@@ -3741,6 +4807,37 @@ fn main() -> Result<()> {
                                         key.0, key.1, out_ch, note, vel
                                     ),
                                 );
+
+                                if capture.active.load(Ordering::Relaxed) {
+                                    let t_ms =
+                                        start_ts.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                                    capture_events_push_row(
+                                        &capture,
+                                        [
+                                            t_ms.to_string(),
+                                            String::new(),
+                                            "MIDI".to_string(),
+                                            "noteon".to_string(),
+                                            key.0.to_string(),
+                                            format!("{:?}", key.1),
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                            out_ch.to_string(),
+                                            note.to_string(),
+                                            vel.to_string(),
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                            "noteon".to_string(),
+                                        ],
+                                    );
+                                }
                                 note_by_key.insert(key.clone(), (out_ch, note));
                                 *note_on_count.entry((out_ch, note)).or_insert(0) += 1;
 
@@ -3748,7 +4845,50 @@ fn main() -> Result<()> {
                                     match aftertouch_mode {
                                         AftertouchMode::PeakMapped
                                         | AftertouchMode::SpeedMapped => {
-                                            let _ = midi_out.send_polytouch(out_ch, note, pressure);
+                                            let ok = midi_out
+                                                .send_polytouch(out_ch, note, pressure)
+                                                .is_ok();
+                                            if ok && capture.active.load(Ordering::Relaxed) {
+                                                let last = last_aftertouch_pressure_by_key
+                                                    .get(&key)
+                                                    .copied()
+                                                    .unwrap_or(255);
+                                                if pressure != last {
+                                                    last_aftertouch_pressure_by_key
+                                                        .insert(key.clone(), pressure);
+                                                    let t_ms = start_ts
+                                                        .elapsed()
+                                                        .as_millis()
+                                                        .min(u64::MAX as u128)
+                                                        as u64;
+                                                    capture_events_push_row(
+                                                        &capture,
+                                                        [
+                                                            t_ms.to_string(),
+                                                            String::new(),
+                                                            "AFTERTOUCH".to_string(),
+                                                            "polytouch".to_string(),
+                                                            key.0.to_string(),
+                                                            format!("{:?}", key.1),
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                            out_ch.to_string(),
+                                                            note.to_string(),
+                                                            String::new(),
+                                                            pressure.to_string(),
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                            "polytouch".to_string(),
+                                                        ],
+                                                    );
+                                                }
+                                            }
                                         }
                                         AftertouchMode::Off => {}
                                     }
@@ -3774,7 +4914,49 @@ fn main() -> Result<()> {
                             if !no_aftertouch {
                                 match aftertouch_mode {
                                     AftertouchMode::PeakMapped | AftertouchMode::SpeedMapped => {
-                                        let _ = midi_out.send_polytouch(out_ch, note, pressure);
+                                        let ok =
+                                            midi_out.send_polytouch(out_ch, note, pressure).is_ok();
+                                        if ok && capture.active.load(Ordering::Relaxed) {
+                                            let last = last_aftertouch_pressure_by_key
+                                                .get(&key)
+                                                .copied()
+                                                .unwrap_or(255);
+                                            if pressure != last {
+                                                last_aftertouch_pressure_by_key
+                                                    .insert(key.clone(), pressure);
+                                                let t_ms = start_ts
+                                                    .elapsed()
+                                                    .as_millis()
+                                                    .min(u64::MAX as u128)
+                                                    as u64;
+                                                capture_events_push_row(
+                                                    &capture,
+                                                    [
+                                                        t_ms.to_string(),
+                                                        String::new(),
+                                                        "AFTERTOUCH".to_string(),
+                                                        "polytouch".to_string(),
+                                                        key.0.to_string(),
+                                                        format!("{:?}", key.1),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        out_ch.to_string(),
+                                                        note.to_string(),
+                                                        String::new(),
+                                                        pressure.to_string(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        "polytouch".to_string(),
+                                                    ],
+                                                );
+                                            }
+                                        }
                                     }
                                     AftertouchMode::Off => {}
                                 }
@@ -3862,6 +5044,39 @@ fn main() -> Result<()> {
                             &start_ts,
                             format!("MIDI noteoff ok (scheduled) ch={} note={}", p.ch, p.note),
                         );
+
+                        if capture.active.load(Ordering::Relaxed) {
+                            if let (Some(dev), Some(hid)) = (p.origin_device_id, p.origin_hid) {
+                                let t_ms =
+                                    start_ts.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                                capture_events_push_row(
+                                    &capture,
+                                    [
+                                        t_ms.to_string(),
+                                        String::new(),
+                                        "MIDI".to_string(),
+                                        "noteoff_scheduled".to_string(),
+                                        dev.to_string(),
+                                        format!("{hid:?}"),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        p.ch.to_string(),
+                                        p.note.to_string(),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        "noteoff_scheduled".to_string(),
+                                    ],
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -3874,12 +5089,7 @@ fn main() -> Result<()> {
                             &start_ts,
                             format!("PANIC scheduled_noteoff_error ch={} note={}", p.ch, p.note),
                         );
-                        dbg_dump(
-                            &dbg_ring,
-                            "scheduled_noteoff_error",
-                            &mut dbg_dumps,
-                            rgb_drop_critical,
-                        );
+                        dbg_push(&mut dbg_ring, &start_ts, cfg_line.clone());
                         midi_out.panic_all();
                         note_by_key.clear();
                         note_on_count.clear();

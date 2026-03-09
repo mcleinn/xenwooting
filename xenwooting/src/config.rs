@@ -15,6 +15,11 @@ pub struct Config {
     #[serde(default = "default_press_threshold_step")]
     pub press_threshold_step: f32,
 
+    /// When aftertouch mode is enabled, xenwooting forces the note-on threshold to this value.
+    /// This helps avoid accidental/hover presses triggering velocity/aftertouch tracking.
+    #[serde(default = "default_aftertouch_press_threshold")]
+    pub aftertouch_press_threshold: f32,
+
     /// Time window to track the press peak (ms) before firing NoteOn.
     #[serde(default = "default_velocity_peak_track_ms")]
     pub velocity_peak_track_ms: u32,
@@ -71,6 +76,12 @@ pub struct Config {
 
     #[serde(default)]
     pub hid_overrides: Vec<HidOverride>,
+
+    /// Output directory for manual dumps and captures.
+    ///
+    /// If unset, defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/xenwooting`.
+    #[serde(default)]
+    pub output_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +157,10 @@ fn default_press_threshold() -> f32 {
 
 fn default_press_threshold_step() -> f32 {
     0.05
+}
+
+fn default_aftertouch_press_threshold() -> f32 {
+    0.10
 }
 
 fn default_velocity_peak_track_ms() -> u32 {
