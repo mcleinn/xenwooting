@@ -538,6 +538,20 @@ fn capture_stop_and_flush(
     )))
 }
 
+fn capture_stop_discard(capture: &Arc<CaptureShared>) -> bool {
+    // Stop polling capture first to reduce contention.
+    capture.active.store(false, Ordering::Relaxed);
+
+    let mut had = false;
+    if let Ok(mut guard) = capture.samples.lock() {
+        had = guard.take().is_some();
+    }
+    if let Ok(mut eg) = capture.events.lock() {
+        *eg = None;
+    }
+    had
+}
+
 fn schedule_midi_ping(
     midi_out: &mut AlsaMidiOut,
     note_on_count: &mut HashMap<(u8, u8), u32>,
@@ -1028,7 +1042,7 @@ fn write_default_config(path: &Path) -> Result<()> {
     let mut cfg = Config {
         midi_out_name: "XenWTN".to_string(),
         refresh_hz: 1000.0,
-        press_threshold: 0.10,
+        press_threshold: 0.75,
         press_threshold_step: 0.05,
         aftertouch_press_threshold: 0.10,
         velocity_peak_track_ms: 6,
@@ -1036,7 +1050,7 @@ fn write_default_config(path: &Path) -> Result<()> {
         velocity_max_swing: 1.0,
         aftertouch_delta: 0.01,
         release_delta: 0.12,
-        aftertouch_speed_max: 74.0,
+        aftertouch_speed_max: 100.0,
         aftertouch_speed_step: 2.0,
         aftertouch_speed_attack_ms: 12,
         aftertouch_speed_decay_ms: 250,
@@ -1556,7 +1570,7 @@ fn main() -> Result<()> {
     let aftertouch_press_threshold: f32 = cfg.aftertouch_press_threshold.clamp(0.02, 0.98);
     let mut manual_press_threshold: f32 = cfg.press_threshold;
 
-    let mut aftertouch_speed_max: f32 = cfg.aftertouch_speed_max.clamp(1.0, 200.0);
+    let mut aftertouch_speed_max: f32 = cfg.aftertouch_speed_max.clamp(1.0, 1000.0);
 
     // Global run-flag is controlled by signal handler.
     RUNNING.store(true, Ordering::SeqCst);
@@ -3711,118 +3725,38 @@ fn main() -> Result<()> {
 
                     if board == 0u8 {
                         if capture.active.load(Ordering::Relaxed) {
-                            match capture_stop_and_flush(&capture) {
-                                Ok(Some((
-                                    dev_id,
-                                    capture_csv_path,
-                                    capture_txt_path,
-                                    dump_csv_path,
-                                    dump_txt_path,
-                                ))) => {
-                                    if !cfg.capture_always_on {
-                                        capture_indicator_devices.remove(&dev_id);
-                                        let base_rgb = match guide_mode {
-                                            GuideMode::WaitRoot => (0u8, 0u8, 0u8),
-                                            GuideMode::Active => (0u8, 255u8, 0u8),
-                                            GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
-                                        };
-                                        paint_ctrl_indicator(
-                                            dev_id,
-                                            &rgb_index_by_device_id,
-                                            base_rgb,
-                                            false,
-                                        );
-                                    }
-                                    for m in active_masks_by_device.values() {
-                                        m.clear_all();
-                                    }
-                                    // Note: do not clear last_aftertouch_sent_by_key here; keys may still be held.
-                                    dbg_push(
-                                        &mut dbg_ring,
-                                        &start_ts,
-                                        format!(
-                                            "CAPTURE stop (manual) dev={} capture_csv={} capture_txt={} dump_csv={} dump_txt={}",
-                                            dev_id, capture_csv_path, capture_txt_path, dump_csv_path, dump_txt_path
-                                        ),
-                                    );
-                                    dbg_ring.clear();
-
-                                    // In always-on mode, immediately restart capture so recording continues.
-                                    if cfg.capture_always_on {
-                                        for m in active_masks_by_device.values() {
-                                            m.clear_all();
-                                        }
-                                        capture.lock_drops.store(0, Ordering::Relaxed);
-                                        let base_ts_ms = unix_time_ms();
-                                        let start = Instant::now();
-                                        let end = start + Duration::from_secs(365 * 24 * 60 * 60);
-
-                                        if let Ok(mut guard) = capture.samples.lock() {
-                                            *guard = Some(CaptureSamplesState {
-                                                base_ts_ms,
-                                                trigger_device_id: dev_id,
-                                                start,
-                                                end,
-                                                start_unix_ms: base_ts_ms,
-                                                cfg_line: cfg_line.clone(),
-                                                out_dir: output_dir.clone(),
-                                                ring: vec![0u8; CAPTURE_MAX_BYTES],
-                                                write_idx: 0,
-                                                wrapped: false,
-                                                dropped_samples: 0,
-                                            });
-                                        }
-                                        if let Ok(mut guard) = capture.events.lock() {
-                                            *guard = Some(CaptureEventsState {
-                                                base_ts_ms,
-                                                trigger_device_id: dev_id,
-                                                start,
-                                                end,
-                                                start_unix_ms: base_ts_ms,
-                                                cfg_line: cfg_line.clone(),
-                                                out_dir: output_dir.clone(),
-                                                csv_lines: Vec::new(),
-                                                txt_lines: vec![
-                                                    format!("timestamp_ms={}", base_ts_ms),
-                                                    format!("trigger_device_id={}", dev_id),
-                                                    format!("start_unix_ms={}", base_ts_ms),
-                                                    format!("duration_ms_target={}", "always"),
-                                                    cfg_line.clone(),
-                                                ],
-                                            });
-                                        }
-                                        capture.active.store(true, Ordering::Relaxed);
-                                        capture_indicator_devices.insert(dev_id);
-                                        let base_rgb = match guide_mode {
-                                            GuideMode::WaitRoot => (0u8, 0u8, 0u8),
-                                            GuideMode::Active => (0u8, 255u8, 0u8),
-                                            GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
-                                        };
-                                        paint_ctrl_indicator(
-                                            dev_id,
-                                            &rgb_index_by_device_id,
-                                            base_rgb,
-                                            true,
-                                        );
-                                        dbg_push(
-                                            &mut dbg_ring,
-                                            &start_ts,
-                                            format!(
-                                                "CAPTURE restart (always_on) dev={} base_ts_ms={} ring_bytes={}",
-                                                dev_id, base_ts_ms, CAPTURE_MAX_BYTES
-                                            ),
-                                        );
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    dbg_push(
-                                        &mut dbg_ring,
-                                        &start_ts,
-                                        format!("CAPTURE stop failed: {e}"),
-                                    );
-                                }
+                            // Disarm capture (do not write files).
+                            let had = capture_stop_discard(&capture);
+                            for m in active_masks_by_device.values() {
+                                m.clear_all();
                             }
+                            // Note: do not clear last_aftertouch_sent_by_key here; keys may still be held.
+
+                            let base_rgb = match guide_mode {
+                                GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                                GuideMode::Active => (0u8, 255u8, 0u8),
+                                GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                            };
+                            for (dev_id, bcfg) in board_by_device.iter() {
+                                if bcfg.wtn_board != 0 {
+                                    continue;
+                                }
+                                capture_indicator_devices.remove(dev_id);
+                                paint_ctrl_indicator(
+                                    *dev_id,
+                                    &rgb_index_by_device_id,
+                                    base_rgb,
+                                    false,
+                                );
+                            }
+                            dbg_push(
+                                &mut dbg_ring,
+                                &start_ts,
+                                format!(
+                                    "CAPTURE disarm (manual) dev={} had_state={}",
+                                    device_id, had
+                                ),
+                            );
                         } else {
                             // Start capture window. Keys are captured dynamically when they become active.
                             for m in active_masks_by_device.values() {
@@ -3878,18 +3812,28 @@ fn main() -> Result<()> {
 
                             capture.active.store(true, Ordering::Relaxed);
                             // Note: do not clear last_aftertouch_sent_by_key here; keys may still be held.
-                            capture_indicator_devices.insert(device_id);
+                            // Capture indicator applies to board0 control bar.
+                            for (dev_id, bcfg) in board_by_device.iter() {
+                                if bcfg.wtn_board == 0 {
+                                    capture_indicator_devices.insert(*dev_id);
+                                }
+                            }
                             let base_rgb = match guide_mode {
                                 GuideMode::WaitRoot => (0u8, 0u8, 0u8),
                                 GuideMode::Active => (0u8, 255u8, 0u8),
                                 GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
                             };
-                            paint_ctrl_indicator(
-                                device_id,
-                                &rgb_index_by_device_id,
-                                base_rgb,
-                                true,
-                            );
+                            for (dev_id, bcfg) in board_by_device.iter() {
+                                if bcfg.wtn_board != 0 {
+                                    continue;
+                                }
+                                paint_ctrl_indicator(
+                                    *dev_id,
+                                    &rgb_index_by_device_id,
+                                    base_rgb,
+                                    true,
+                                );
+                            }
                             dbg_push(
                                 &mut dbg_ring,
                                 &start_ts,
@@ -4093,7 +4037,7 @@ fn main() -> Result<()> {
                         } else {
                             aftertouch_speed_max = (aftertouch_speed_max
                                 - cfg.aftertouch_speed_step)
-                                .clamp(1.0, 200.0);
+                                .clamp(1.0, 1000.0);
                             info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
                         }
                         continue;
@@ -4109,7 +4053,7 @@ fn main() -> Result<()> {
                         } else {
                             aftertouch_speed_max = (aftertouch_speed_max
                                 + cfg.aftertouch_speed_step)
-                                .clamp(1.0, 200.0);
+                                .clamp(1.0, 1000.0);
                             info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
                         }
                         continue;

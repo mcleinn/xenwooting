@@ -159,7 +159,7 @@ fn default_refresh_hz() -> f32 {
 
 fn default_press_threshold() -> f32 {
     // Note-on threshold (0..1). Kept low because velocity uses a peak tracker.
-    0.10
+    0.75
 }
 
 fn default_press_threshold_step() -> f32 {
@@ -191,7 +191,7 @@ fn default_release_delta() -> f32 {
 }
 
 fn default_aftertouch_speed_max() -> f32 {
-    74.0
+    100.0
 }
 
 fn default_aftertouch_speed_step() -> f32 {
