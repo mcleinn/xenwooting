@@ -1064,6 +1064,7 @@ fn write_default_config(path: &Path) -> Result<()> {
         control_bar: xenwooting::config::ControlBarConfig::default(),
         hid_overrides: vec![],
         output_dir: None,
+        capture_always_on: false,
     };
 
     // Provide a placeholder layout pointing to a wtn path you can create.
@@ -2144,7 +2145,8 @@ fn main() -> Result<()> {
             let Some(&dev_idx) = rgb_map.get(&device_id) else {
                 return;
             };
-            let rgb = if on { (255u8, 255u8, 255u8) } else { base_rgb };
+            // Armed capture mode indicator: yellow.
+            let rgb = if on { (255u8, 255u8, 0u8) } else { base_rgb };
             for hid in [HIDCodes::LeftCtrl, HIDCodes::RightCtrl] {
                 let Some(cols) = control_bar_cols_by_hid.get(&hid) else {
                     continue;
@@ -2163,12 +2165,48 @@ fn main() -> Result<()> {
             }
         };
 
+    // Paint the control-bar LEDs corresponding to the RightAlt key.
+    // Used as a persistent mode indicator (aftertouch mode).
+    let paint_aftertouch_mode_indicator =
+        |device_id: u64,
+         rgb_map: &HashMap<u64, u8>,
+         base_rgb: (u8, u8, u8),
+         mode: &AftertouchMode| {
+            if !rgb_enabled {
+                return;
+            }
+            let Some(&dev_idx) = rgb_map.get(&device_id) else {
+                return;
+            };
+            let Some(cols) = control_bar_cols_by_hid.get(&HIDCodes::RightAlt) else {
+                return;
+            };
+            // Default speed-mapped mode uses the base control-bar color.
+            let rgb = match mode {
+                AftertouchMode::SpeedMapped => base_rgb,
+                AftertouchMode::PeakMapped => (255u8, 255u8, 0u8),
+                AftertouchMode::Off => (0u8, 128u8, 255u8),
+            };
+            for &c in cols.iter() {
+                try_send_drop(
+                    &rgb_tx,
+                    RgbCmd::SetKey(RgbKey {
+                        device_index: dev_idx,
+                        row: control_bar_row,
+                        col: c,
+                        rgb,
+                    }),
+                );
+            }
+        };
+
     let paint_base = |wtn: &Wtn,
                       paint_control_bar: bool,
                       rgb_map: &HashMap<u64, u8>,
                       tm: TrainerMode,
                       octave_hold_by_device: &HashSet<u64>,
-                      capture_indicator_devices: &HashSet<u64>| {
+                      capture_indicator_devices: &HashSet<u64>,
+                      aftertouch_mode: &AftertouchMode| {
         if !rgb_enabled {
             return;
         }
@@ -2248,6 +2286,9 @@ fn main() -> Result<()> {
                     rgb,
                     capture_indicator_devices.contains(dev_id),
                 );
+
+                // RightAlt aftertouch-mode indicator overrides the base bar color.
+                paint_aftertouch_mode_indicator(*dev_id, rgb_map, rgb, aftertouch_mode);
             }
         }
         if log_edges || log_poll || log_midi {
@@ -2257,7 +2298,9 @@ fn main() -> Result<()> {
 
     let paint_control_bar = |rgb_map: &HashMap<u64, u8>,
                              rgb: (u8, u8, u8),
-                             capture_indicator_devices: &HashSet<u64>| {
+                             capture_indicator_devices: &HashSet<u64>,
+                             octave_hold_by_device: &HashSet<u64>,
+                             aftertouch_mode: &AftertouchMode| {
         if !rgb_enabled {
             return;
         }
@@ -2283,6 +2326,15 @@ fn main() -> Result<()> {
                 rgb,
                 capture_indicator_devices.contains(dev_id),
             );
+
+            paint_spacebar_indicator(
+                *dev_id,
+                rgb_map,
+                rgb,
+                octave_hold_by_device.contains(dev_id),
+            );
+
+            paint_aftertouch_mode_indicator(*dev_id, rgb_map, rgb, aftertouch_mode);
         }
     };
 
@@ -2413,6 +2465,101 @@ fn main() -> Result<()> {
     };
 
     let mut capture_indicator_devices: HashSet<u64> = HashSet::new();
+    // Debounce the aftertouch-mode toggle key (RightAlt): avoid toggling multiple times due to
+    // analog threshold bounce (down/up/down within a single physical press).
+    let mut last_aftertouch_toggle_at: HashMap<u64, Instant> = HashMap::new();
+
+    // Optional: start armed capture immediately at startup.
+    if cfg.capture_always_on {
+        // Prefer a configured board0 device as the trigger.
+        let mut board0_devs: Vec<u64> = board_by_device
+            .iter()
+            .filter_map(|(dev_id, bcfg)| {
+                if bcfg.wtn_board == 0 {
+                    Some(*dev_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        board0_devs.sort();
+        if let Some(&trigger_device_id) = board0_devs.first() {
+            for d in board0_devs.iter() {
+                capture_indicator_devices.insert(*d);
+            }
+
+            // Start capture window. Keys are captured dynamically when they become active.
+            for m in active_masks_by_device.values() {
+                m.clear_all();
+            }
+            capture.lock_drops.store(0, Ordering::Relaxed);
+            let base_ts_ms = unix_time_ms();
+            let start = Instant::now();
+            let end = start + Duration::from_secs(365 * 24 * 60 * 60);
+
+            let thr_down0 =
+                f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
+            let thr_up0 = (thr_down0 - CAPTURE_RELEASE_HYSTERESIS).clamp(0.0, 0.99);
+            let cfg_line0 = format!(
+                "CFG refresh_hz={:.0} poll_ms={:.3} peak_track_ms={} thr={:.3} thr_up={:.3} hyst={:.3} thr_at={:.3} aftertouch_mode={} aftertouch_speed_max={:.2} release_delta={:.3} rapid_release_enabled={} screensaver_timeout_sec={}",
+                cfg.refresh_hz,
+                poll_period.as_secs_f32() * 1000.0,
+                cfg.velocity_peak_track_ms,
+                thr_down0,
+                thr_up0,
+                CAPTURE_RELEASE_HYSTERESIS,
+                aftertouch_press_threshold,
+                aftertouch_mode.name(),
+                aftertouch_speed_max,
+                release_delta,
+                rapid_release_enabled,
+                cfg.rgb.screensaver_timeout_sec,
+            );
+
+            if let Ok(mut guard) = capture.samples.lock() {
+                *guard = Some(CaptureSamplesState {
+                    base_ts_ms,
+                    trigger_device_id,
+                    start,
+                    end,
+                    start_unix_ms: base_ts_ms,
+                    cfg_line: cfg_line0.clone(),
+                    out_dir: output_dir.clone(),
+                    ring: vec![0u8; CAPTURE_MAX_BYTES],
+                    write_idx: 0,
+                    wrapped: false,
+                    dropped_samples: 0,
+                });
+            }
+            if let Ok(mut guard) = capture.events.lock() {
+                *guard = Some(CaptureEventsState {
+                    base_ts_ms,
+                    trigger_device_id,
+                    start,
+                    end,
+                    start_unix_ms: base_ts_ms,
+                    cfg_line: cfg_line0.clone(),
+                    out_dir: output_dir.clone(),
+                    csv_lines: Vec::new(),
+                    txt_lines: vec![
+                        format!("timestamp_ms={}", base_ts_ms),
+                        format!("trigger_device_id={}", trigger_device_id),
+                        format!("start_unix_ms={}", base_ts_ms),
+                        format!("duration_ms_target={}", "always"),
+                        cfg_line0.clone(),
+                    ],
+                });
+            }
+
+            capture.active.store(true, Ordering::Relaxed);
+            info!(
+                "capture_always_on: started (trigger_device_id={})",
+                trigger_device_id
+            );
+        } else {
+            warn!("capture_always_on: no configured board0 device found; ignoring");
+        }
+    }
 
     paint_base(
         &wtn,
@@ -2421,7 +2568,27 @@ fn main() -> Result<()> {
         trainer_mode,
         &octave_hold_by_device,
         &capture_indicator_devices,
+        &aftertouch_mode,
     );
+
+    // Ensure mode indicators paint after initial base.
+    if rgb_enabled {
+        let base_rgb = control_bar_rgb_for_tm(trainer_mode);
+        for (dev_id, _bcfg) in board_by_device.iter() {
+            paint_aftertouch_mode_indicator(
+                *dev_id,
+                &rgb_index_by_device_id,
+                base_rgb,
+                &aftertouch_mode,
+            );
+            paint_ctrl_indicator(
+                *dev_id,
+                &rgb_index_by_device_id,
+                base_rgb,
+                capture_indicator_devices.contains(dev_id),
+            );
+        }
+    }
 
     if log_edges || log_poll || log_midi {
         eprintln!("ready: waiting for key edges");
@@ -2636,7 +2803,9 @@ fn main() -> Result<()> {
     let mut last_rightctrl_down: Option<(u64, Instant)> = None;
 
     const CAPTURE_DURATION_MS: u64 = 30_000;
-    const CAPTURE_MAX_BYTES: usize = 128 * 1024 * 1024;
+    // Fixed-size ring buffer for armed capture samples.
+    // Reduced to keep memory footprint reasonable on small systems.
+    const CAPTURE_MAX_BYTES: usize = 32 * 1024 * 1024;
     const CAPTURE_RELEASE_HYSTERESIS: f32 = 0.005;
 
     let paint_off = |rgb_map: &HashMap<u64, u8>| {
@@ -2774,6 +2943,7 @@ fn main() -> Result<()> {
                     trainer_mode,
                     &octave_hold_by_device,
                     &capture_indicator_devices,
+                    &aftertouch_mode,
                 );
                 info!("RGB device count changed; repainted base ({})", now);
             }
@@ -2798,6 +2968,7 @@ fn main() -> Result<()> {
                         trainer_mode,
                         &octave_hold_by_device,
                         &capture_indicator_devices,
+                        &aftertouch_mode,
                     );
                     info!("Configured device set changed; repainted base");
                 }
@@ -2906,6 +3077,7 @@ fn main() -> Result<()> {
                                             trainer_mode,
                                             &octave_hold_by_device,
                                             &capture_indicator_devices,
+                                            &aftertouch_mode,
                                         );
                                         info!(
                                             "Reloaded config layouts ({} layouts)",
@@ -3053,6 +3225,7 @@ fn main() -> Result<()> {
                                     trainer_mode,
                                     &octave_hold_by_device,
                                     &capture_indicator_devices,
+                                    &aftertouch_mode,
                                 );
                             }
                             info!("guide: disabled");
@@ -3075,6 +3248,7 @@ fn main() -> Result<()> {
                                     trainer_mode,
                                     &octave_hold_by_device,
                                     &capture_indicator_devices,
+                                    &aftertouch_mode,
                                 );
                             }
                             info!("guide: disabled (file removed)");
@@ -3117,6 +3291,7 @@ fn main() -> Result<()> {
                                     trainer_mode,
                                     &octave_hold_by_device,
                                     &capture_indicator_devices,
+                                    &aftertouch_mode,
                                 );
                                 info!("Reloaded wtn from disk: {}", wtn_path.display());
                             } else {
@@ -3200,6 +3375,7 @@ fn main() -> Result<()> {
                             trainer_mode,
                             &octave_hold_by_device,
                             &capture_indicator_devices,
+                            &aftertouch_mode,
                         );
                     }
                     info!("preview: disabled");
@@ -3243,6 +3419,7 @@ fn main() -> Result<()> {
                                         trainer_mode,
                                         &octave_hold_by_device,
                                         &capture_indicator_devices,
+                                        &aftertouch_mode,
                                     );
                                 }
                                 info!("preview: reloaded wtn {}", preview_wtn_path.display());
@@ -3491,6 +3668,7 @@ fn main() -> Result<()> {
                     trainer_mode,
                     &octave_hold_by_device,
                     &capture_indicator_devices,
+                    &aftertouch_mode,
                 );
                 screensaver_active = false;
                 suppressed_keys.insert(key_id.clone());
@@ -3541,18 +3719,20 @@ fn main() -> Result<()> {
                                     dump_csv_path,
                                     dump_txt_path,
                                 ))) => {
-                                    capture_indicator_devices.remove(&dev_id);
-                                    let base_rgb = match guide_mode {
-                                        GuideMode::WaitRoot => (0u8, 0u8, 0u8),
-                                        GuideMode::Active => (0u8, 255u8, 0u8),
-                                        GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
-                                    };
-                                    paint_ctrl_indicator(
-                                        dev_id,
-                                        &rgb_index_by_device_id,
-                                        base_rgb,
-                                        false,
-                                    );
+                                    if !cfg.capture_always_on {
+                                        capture_indicator_devices.remove(&dev_id);
+                                        let base_rgb = match guide_mode {
+                                            GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                                            GuideMode::Active => (0u8, 255u8, 0u8),
+                                            GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                                        };
+                                        paint_ctrl_indicator(
+                                            dev_id,
+                                            &rgb_index_by_device_id,
+                                            base_rgb,
+                                            false,
+                                        );
+                                    }
                                     for m in active_masks_by_device.values() {
                                         m.clear_all();
                                     }
@@ -3566,6 +3746,73 @@ fn main() -> Result<()> {
                                         ),
                                     );
                                     dbg_ring.clear();
+
+                                    // In always-on mode, immediately restart capture so recording continues.
+                                    if cfg.capture_always_on {
+                                        for m in active_masks_by_device.values() {
+                                            m.clear_all();
+                                        }
+                                        capture.lock_drops.store(0, Ordering::Relaxed);
+                                        let base_ts_ms = unix_time_ms();
+                                        let start = Instant::now();
+                                        let end = start + Duration::from_secs(365 * 24 * 60 * 60);
+
+                                        if let Ok(mut guard) = capture.samples.lock() {
+                                            *guard = Some(CaptureSamplesState {
+                                                base_ts_ms,
+                                                trigger_device_id: dev_id,
+                                                start,
+                                                end,
+                                                start_unix_ms: base_ts_ms,
+                                                cfg_line: cfg_line.clone(),
+                                                out_dir: output_dir.clone(),
+                                                ring: vec![0u8; CAPTURE_MAX_BYTES],
+                                                write_idx: 0,
+                                                wrapped: false,
+                                                dropped_samples: 0,
+                                            });
+                                        }
+                                        if let Ok(mut guard) = capture.events.lock() {
+                                            *guard = Some(CaptureEventsState {
+                                                base_ts_ms,
+                                                trigger_device_id: dev_id,
+                                                start,
+                                                end,
+                                                start_unix_ms: base_ts_ms,
+                                                cfg_line: cfg_line.clone(),
+                                                out_dir: output_dir.clone(),
+                                                csv_lines: Vec::new(),
+                                                txt_lines: vec![
+                                                    format!("timestamp_ms={}", base_ts_ms),
+                                                    format!("trigger_device_id={}", dev_id),
+                                                    format!("start_unix_ms={}", base_ts_ms),
+                                                    format!("duration_ms_target={}", "always"),
+                                                    cfg_line.clone(),
+                                                ],
+                                            });
+                                        }
+                                        capture.active.store(true, Ordering::Relaxed);
+                                        capture_indicator_devices.insert(dev_id);
+                                        let base_rgb = match guide_mode {
+                                            GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                                            GuideMode::Active => (0u8, 255u8, 0u8),
+                                            GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                                        };
+                                        paint_ctrl_indicator(
+                                            dev_id,
+                                            &rgb_index_by_device_id,
+                                            base_rgb,
+                                            true,
+                                        );
+                                        dbg_push(
+                                            &mut dbg_ring,
+                                            &start_ts,
+                                            format!(
+                                                "CAPTURE restart (always_on) dev={} base_ts_ms={} ring_bytes={}",
+                                                dev_id, base_ts_ms, CAPTURE_MAX_BYTES
+                                            ),
+                                        );
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
@@ -3584,7 +3831,11 @@ fn main() -> Result<()> {
                             capture.lock_drops.store(0, Ordering::Relaxed);
                             let base_ts_ms = unix_time_ms();
                             let start = Instant::now();
-                            let end = start + Duration::from_millis(CAPTURE_DURATION_MS);
+                            let end = if cfg.capture_always_on {
+                                start + Duration::from_secs(365 * 24 * 60 * 60)
+                            } else {
+                                start + Duration::from_millis(CAPTURE_DURATION_MS)
+                            };
 
                             if let Ok(mut guard) = capture.samples.lock() {
                                 *guard = Some(CaptureSamplesState {
@@ -3615,7 +3866,11 @@ fn main() -> Result<()> {
                                         format!("timestamp_ms={}", base_ts_ms),
                                         format!("trigger_device_id={}", device_id),
                                         format!("start_unix_ms={}", base_ts_ms),
-                                        format!("duration_ms_target={}", CAPTURE_DURATION_MS),
+                                        if cfg.capture_always_on {
+                                            format!("duration_ms_target={}", "always")
+                                        } else {
+                                            format!("duration_ms_target={}", CAPTURE_DURATION_MS)
+                                        },
                                         cfg_line.clone(),
                                     ],
                                 });
@@ -3657,18 +3912,20 @@ fn main() -> Result<()> {
                                     dump_csv_path,
                                     dump_txt_path,
                                 ))) => {
-                                    capture_indicator_devices.remove(&dev_id);
-                                    let base_rgb = match guide_mode {
-                                        GuideMode::WaitRoot => (0u8, 0u8, 0u8),
-                                        GuideMode::Active => (0u8, 255u8, 0u8),
-                                        GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
-                                    };
-                                    paint_ctrl_indicator(
-                                        dev_id,
-                                        &rgb_index_by_device_id,
-                                        base_rgb,
-                                        false,
-                                    );
+                                    if !cfg.capture_always_on {
+                                        capture_indicator_devices.remove(&dev_id);
+                                        let base_rgb = match guide_mode {
+                                            GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                                            GuideMode::Active => (0u8, 255u8, 0u8),
+                                            GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                                        };
+                                        paint_ctrl_indicator(
+                                            dev_id,
+                                            &rgb_index_by_device_id,
+                                            base_rgb,
+                                            false,
+                                        );
+                                    }
                                     for m in active_masks_by_device.values() {
                                         m.clear_all();
                                     }
@@ -3682,6 +3939,73 @@ fn main() -> Result<()> {
                                         ),
                                     );
                                     dbg_ring.clear();
+
+                                    // In always-on mode, immediately restart capture so recording continues.
+                                    if cfg.capture_always_on {
+                                        for m in active_masks_by_device.values() {
+                                            m.clear_all();
+                                        }
+                                        capture.lock_drops.store(0, Ordering::Relaxed);
+                                        let base_ts_ms = unix_time_ms();
+                                        let start = Instant::now();
+                                        let end = start + Duration::from_secs(365 * 24 * 60 * 60);
+
+                                        if let Ok(mut guard) = capture.samples.lock() {
+                                            *guard = Some(CaptureSamplesState {
+                                                base_ts_ms,
+                                                trigger_device_id: dev_id,
+                                                start,
+                                                end,
+                                                start_unix_ms: base_ts_ms,
+                                                cfg_line: cfg_line.clone(),
+                                                out_dir: output_dir.clone(),
+                                                ring: vec![0u8; CAPTURE_MAX_BYTES],
+                                                write_idx: 0,
+                                                wrapped: false,
+                                                dropped_samples: 0,
+                                            });
+                                        }
+                                        if let Ok(mut guard) = capture.events.lock() {
+                                            *guard = Some(CaptureEventsState {
+                                                base_ts_ms,
+                                                trigger_device_id: dev_id,
+                                                start,
+                                                end,
+                                                start_unix_ms: base_ts_ms,
+                                                cfg_line: cfg_line.clone(),
+                                                out_dir: output_dir.clone(),
+                                                csv_lines: Vec::new(),
+                                                txt_lines: vec![
+                                                    format!("timestamp_ms={}", base_ts_ms),
+                                                    format!("trigger_device_id={}", dev_id),
+                                                    format!("start_unix_ms={}", base_ts_ms),
+                                                    format!("duration_ms_target={}", "always"),
+                                                    cfg_line.clone(),
+                                                ],
+                                            });
+                                        }
+                                        capture.active.store(true, Ordering::Relaxed);
+                                        capture_indicator_devices.insert(dev_id);
+                                        let base_rgb = match guide_mode {
+                                            GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                                            GuideMode::Active => (0u8, 255u8, 0u8),
+                                            GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                                        };
+                                        paint_ctrl_indicator(
+                                            dev_id,
+                                            &rgb_index_by_device_id,
+                                            base_rgb,
+                                            true,
+                                        );
+                                        dbg_push(
+                                            &mut dbg_ring,
+                                            &start_ts,
+                                            format!(
+                                                "CAPTURE restart (always_on) dev={} base_ts_ms={} ring_bytes={}",
+                                                dev_id, base_ts_ms, CAPTURE_MAX_BYTES
+                                            ),
+                                        );
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(e) => {
@@ -3799,10 +4123,50 @@ fn main() -> Result<()> {
                         continue;
                     }
                     HIDCodes::RightAlt => {
+                        // Debounce: ignore rapid re-triggers (common due to analog threshold bounce).
+                        let now = Instant::now();
+                        if let Some(prev) = last_aftertouch_toggle_at.get(&device_id) {
+                            if now.duration_since(*prev) < Duration::from_millis(160) {
+                                dbg_push(
+                                    &mut dbg_ring,
+                                    &start_ts,
+                                    format!(
+                                        "RightAlt debounce dev={} dt_ms={} kind={}",
+                                        device_id,
+                                        now.duration_since(*prev).as_millis(),
+                                        kind
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                        last_aftertouch_toggle_at.insert(device_id, now);
+
+                        // Flash the mode key (white) on keypress.
+                        if rgb_enabled {
+                            if let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) {
+                                if let Some(cols) = control_bar_cols_by_hid.get(&HIDCodes::RightAlt)
+                                {
+                                    for &lc in cols {
+                                        try_send_drop(
+                                            &rgb_tx,
+                                            RgbCmd::SetKey(RgbKey {
+                                                device_index: dev_idx,
+                                                row: control_bar_row,
+                                                col: lc,
+                                                rgb: highlight_rgb,
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        let prev_mode = aftertouch_mode.name();
                         aftertouch_mode = match aftertouch_mode {
-                            AftertouchMode::PeakMapped => AftertouchMode::SpeedMapped,
-                            AftertouchMode::SpeedMapped => AftertouchMode::Off,
-                            AftertouchMode::Off => AftertouchMode::PeakMapped,
+                            AftertouchMode::SpeedMapped => AftertouchMode::PeakMapped,
+                            AftertouchMode::PeakMapped => AftertouchMode::Off,
+                            AftertouchMode::Off => AftertouchMode::SpeedMapped,
                         };
                         if matches!(aftertouch_mode, AftertouchMode::Off) {
                             press_threshold_bits
@@ -3812,10 +4176,28 @@ fn main() -> Result<()> {
                                 .store(aftertouch_press_threshold.to_bits(), Ordering::Relaxed);
                         }
                         info!(
-                            "aftertouch_mode now {} (thr {:.2})",
+                            "aftertouch_mode {} -> {} (thr {:.2})",
+                            prev_mode,
                             aftertouch_mode.name(),
                             f32::from_bits(press_threshold_bits.load(Ordering::Relaxed))
                         );
+
+                        // Update mode indicator color on both boards.
+                        if rgb_enabled {
+                            let base_rgb = control_bar_rgb_for_tm(trainer_mode);
+                            for (dev_id, _bcfg) in board_by_device.iter() {
+                                if *dev_id == device_id {
+                                    // Keep the keypress flash on this device.
+                                    continue;
+                                }
+                                paint_aftertouch_mode_indicator(
+                                    *dev_id,
+                                    &rgb_index_by_device_id,
+                                    base_rgb,
+                                    &aftertouch_mode,
+                                );
+                            }
+                        }
                         continue;
                     }
                     HIDCodes::Space => {
@@ -3951,6 +4333,12 @@ fn main() -> Result<()> {
                             base_rgb,
                             capture_indicator_devices.contains(&device_id),
                         );
+                        paint_aftertouch_mode_indicator(
+                            device_id,
+                            &rgb_index_by_device_id,
+                            base_rgb,
+                            &aftertouch_mode,
+                        );
                     }
                 }
             }
@@ -3982,6 +4370,8 @@ fn main() -> Result<()> {
                                     &rgb_index_by_device_id,
                                     (255, 0, 0),
                                     &capture_indicator_devices,
+                                    &octave_hold_by_device,
+                                    &aftertouch_mode,
                                 );
                                 // Consume the first layout keypress to exit guide mode only.
                                 continue;
@@ -4016,6 +4406,7 @@ fn main() -> Result<()> {
                                     trainer_mode,
                                     &octave_hold_by_device,
                                     &capture_indicator_devices,
+                                    &aftertouch_mode,
                                 );
                             }
                         }
@@ -4043,6 +4434,8 @@ fn main() -> Result<()> {
                                     &rgb_index_by_device_id,
                                     (255, 0, 0),
                                     &capture_indicator_devices,
+                                    &octave_hold_by_device,
+                                    &aftertouch_mode,
                                 );
                                 // Consume the first layout keypress to exit guide mode only.
                                 continue;
@@ -4081,6 +4474,7 @@ fn main() -> Result<()> {
                                     trainer_mode,
                                     &octave_hold_by_device,
                                     &capture_indicator_devices,
+                                    &aftertouch_mode,
                                 );
                             }
                         }

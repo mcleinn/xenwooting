@@ -82,6 +82,13 @@ pub struct Config {
     /// If unset, defaults to `${XDG_STATE_HOME:-$HOME/.local/state}/xenwooting`.
     #[serde(default)]
     pub output_dir: Option<String>,
+
+    /// If true, armed capture is always on from startup.
+    ///
+    /// When enabled, the capture ring buffer records immediately without requiring the board0
+    /// arming chord. Manual dump chords still flush the current capture pair to disk.
+    #[serde(default)]
+    pub capture_always_on: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
