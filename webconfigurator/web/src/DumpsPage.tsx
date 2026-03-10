@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import './DumpsPage.css'
 import { fetchDumpsList, fetchDumpFileText, type DumpBoard, type DumpEntry } from './api'
 import ReactECharts from 'echarts-for-react'
+import { Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TableSortLabel, TextField } from '@mui/material'
 
 function apiUrl(path: string) {
   return new URL(path.replace(/^\//, ''), `${window.location.origin}/wtn/`).toString()
@@ -34,6 +35,53 @@ type DumpEvent = {
 }
 
 type CurvePoint = { x: number; last: number; peak?: number }
+
+type DumpCsvTerm =
+  | { kind: 'exact'; needle: string }
+  | { kind: 're'; re: RegExp }
+
+function buildDumpCsvTerms(filter: string): DumpCsvTerm[] {
+  const q = String(filter || '').trim().toLowerCase()
+  if (!q) return []
+  const parts = q.split(/\s+/).filter(Boolean)
+  const terms: DumpCsvTerm[] = []
+  for (const p of parts) {
+    if (!p) continue
+    if (p.includes('*')) {
+      // Simple glob: '*' matches any substring, case-insensitive.
+      const esc = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*')
+      terms.push({ kind: 're', re: new RegExp(`^${esc}$`, 'i') })
+    } else {
+      terms.push({ kind: 'exact', needle: p })
+    }
+  }
+  return terms
+}
+
+function dumpCsvRowMatches(row: string[], terms: DumpCsvTerm[]) {
+  if (!terms.length) return true
+  // AND semantics: every term must match at least one column.
+  for (const t of terms) {
+    let ok = false
+    for (const cell of row) {
+      const s = String(cell || '')
+      if (!s) continue
+      if (t.kind === 'exact') {
+        if (s.toLowerCase() === t.needle) {
+          ok = true
+          break
+        }
+      } else {
+        if (t.re.test(s)) {
+          ok = true
+          break
+        }
+      }
+    }
+    if (!ok) return false
+  }
+  return true
+}
 
 function parseCfg(txt: string): ParsedCfg {
   const out: ParsedCfg = {}
@@ -143,9 +191,23 @@ function downsampleBucketLast(pts: CurvePoint[], x0: number, x1: number, buckets
 }
 
 function parseDumpEvents(dumpCsv: string, preferCapMs: boolean): DumpEvent[] {
-  const lines = (dumpCsv || '').split('\n').filter(Boolean)
-  if (!lines.length) return []
-  const header = parseCsvRow(lines[0])
+  const raw = String(dumpCsv || '')
+  if (!raw) return []
+
+  // Stream parse line-by-line to avoid allocating a huge `split('\n')` array.
+  let pos = 0
+  const readLine = () => {
+    if (pos >= raw.length) return null
+    let nl = raw.indexOf('\n', pos)
+    if (nl === -1) nl = raw.length
+    const line = raw.slice(pos, nl)
+    pos = nl + 1
+    return line
+  }
+
+  const headerLine = readLine()
+  if (!headerLine) return []
+  const header = parseCsvRow(headerLine)
   const idx = new Map<string, number>()
   for (let i = 0; i < header.length; i++) idx.set(header[i], i)
 
@@ -163,11 +225,22 @@ function parseDumpEvents(dumpCsv: string, preferCapMs: boolean): DumpEvent[] {
   const iAnalog = gi('analog')
 
   const out: DumpEvent[] = []
-  for (let li = 1; li < lines.length; li++) {
-    const row = parseCsvRow(lines[li])
+
+  for (;;) {
+    const line = readLine()
+    if (line === null) break
+    if (!line) continue
+
+    const row = parseCsvRow(line)
     const ev = iEvent !== undefined ? (row[iEvent] || '') : ''
     const kind = iKind !== undefined ? (row[iKind] || '') : ''
     if (!ev) continue
+
+    // Keep only events we actually visualize (reduces work massively).
+    if (ev === 'NOTEON_TICK') continue
+    if (ev === 'EDGE' && kind !== 'down' && kind !== 'up') continue
+    if (ev === 'MIDI' && !String(kind).includes('noteon') && !String(kind).includes('noteoff')) continue
+    if (ev !== 'EDGE' && ev !== 'MIDI' && ev !== 'AFTERTOUCH') continue
 
     const xRaw = preferCapMs && iCap !== undefined ? row[iCap] : iTms !== undefined ? row[iTms] : ''
     const xMs = Number.parseFloat(String(xRaw || ''))
@@ -199,19 +272,44 @@ export default function DumpsPage() {
 
   const [captureTxt, setCaptureTxt] = useState<string>('')
   const [dumpTxt, setDumpTxt] = useState<string>('')
+  const [dumpCsvRaw, setDumpCsvRaw] = useState<string>('')
+  const [dumpCsvFilter, setDumpCsvFilter] = useState<string>('')
+  const [dumpCsvFilterDebounced, setDumpCsvFilterDebounced] = useState<string>('')
+  const [dumpCsvSort, setDumpCsvSort] = useState<{ col: number | null; dir: 'asc' | 'desc' }>({ col: null, dir: 'asc' })
   const [cfg, setCfg] = useState<ParsedCfg>({})
 
   const workerRef = useRef<Worker | null>(null)
   const chartRef = useRef<any>(null)
+  const atChartRef = useRef<any>(null)
   const [seriesIds, setSeriesIds] = useState<string[]>([])
   const [xMin, setXMin] = useState<number>(0)
   const [xMax, setXMax] = useState<number>(1)
   const [viewPairsById, setViewPairsById] = useState<Map<string, Array<[number, number, number?]>>>(new Map())
   const [events, setEvents] = useState<DumpEvent[]>([])
   const [cursorX, setCursorX] = useState<number | null>(null)
-  const [_atKeys, setAtKeys] = useState<string[]>([])
   const [boards, setBoards] = useState<DumpBoard[]>([])
   const [eventInfo, setEventInfo] = useState<string>('')
+  const [zoomRange, setZoomRange] = useState<{ x0: number; x1: number }>({ x0: 0, x1: 1 })
+  const [legendSelectedByName, setLegendSelectedByName] = useState<Record<string, boolean>>({})
+
+  // dump.csv table parsing/virtualization state
+  const dumpCsvHeaderRef = useRef<string[] | null>(null)
+  const dumpCsvRowsRef = useRef<string[][]>([])
+  const dumpCsvTmsRef = useRef<number[]>([])
+  const dumpCsvMatchesRef = useRef<number[] | null>(null) // null means "no filter" (identity)
+  const dumpCsvViewIndicesRef = useRef<number[]>([]) // indices into dumpCsvRowsRef, after filter+sort
+  const dumpCsvParseJobRef = useRef<number>(0)
+  const dumpCsvFilterJobRef = useRef<number>(0)
+  const dumpCsvViewJobRef = useRef<number>(0)
+  const dumpCsvFilterRef = useRef<string>('')
+  const dumpCsvTermsRef = useRef<DumpCsvTerm[]>([])
+  const [dumpCsvParsedCount, setDumpCsvParsedCount] = useState<number>(0)
+  const [dumpCsvTableRev, setDumpCsvTableRev] = useState<number>(0)
+  const [dumpCsvParsing, setDumpCsvParsing] = useState<boolean>(false)
+  const [dumpCsvTableScrollTop, setDumpCsvTableScrollTop] = useState<number>(0)
+  const dumpCsvTableWrapRef = useRef<HTMLDivElement | null>(null)
+  const dumpCsvLastViewBuildAtRef = useRef<number>(0)
+  const dumpCsvSortRef = useRef<{ col: number | null; dir: 'asc' | 'desc' }>(dumpCsvSort)
 
   const lastSessionTsRef = useRef<number | null>(null)
 
@@ -231,6 +329,7 @@ export default function DumpsPage() {
         setSeriesIds(ids)
         setXMin(Number(msg.xMin || 0))
         setXMax(Number(msg.xMax || 0) || 1)
+        setZoomRange({ x0: Number(msg.xMin || 0), x1: Number(msg.xMax || 0) || 1 })
         // Request full-range view (downsampled); ECharts handles zoom/pan.
         w.postMessage({ type: 'view', xMin: Number(msg.xMin || 0), xMax: Number(msg.xMax || 0), buckets })
         return
@@ -261,6 +360,15 @@ export default function DumpsPage() {
       workerRef.current = null
     }
   }, [])
+
+  useEffect(() => {
+    const t = setTimeout(() => setDumpCsvFilterDebounced(dumpCsvFilter), 150)
+    return () => clearTimeout(t)
+  }, [dumpCsvFilter])
+
+  useEffect(() => {
+    dumpCsvSortRef.current = dumpCsvSort
+  }, [dumpCsvSort])
 
   useEffect(() => {
     let cancelled = false
@@ -348,11 +456,32 @@ export default function DumpsPage() {
     setTimeout(() => {
       const inst = chartRef.current?.getEchartsInstance?.()
       if (!inst) return
-      inst.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, start: 0, end: 100 })
-      inst.dispatchAction({ type: 'dataZoom', dataZoomIndex: 1, start: 0, end: 100 })
+      // Reset via setOption (more reliable than dispatchAction for sliders).
+      inst.setOption(
+        {
+          dataZoom: [
+            { id: 'x_in', start: 0, end: 100 },
+            { id: 'x_sl', start: 0, end: 100 },
+            { id: 'y_in', start: 0, end: 100 },
+            { id: 'y_sl', start: 0, end: 100 },
+          ],
+        },
+        false,
+      )
       inst.dispatchAction({ type: 'legendAllSelect' })
-      inst.dispatchAction({ type: 'legendUnSelect', name: 'thresholds' })
-      inst.dispatchAction({ type: 'legendUnSelect', name: 'cursor' })
+
+      const atInst = atChartRef.current?.getEchartsInstance?.()
+      if (atInst) {
+        atInst.setOption(
+          {
+            dataZoom: [
+              { id: 'at_y_in', start: 0, end: 100 },
+              { id: 'at_y_sl', start: 0, end: 100 },
+            ],
+          },
+          false,
+        )
+      }
     }, 0)
   }, [selected?.tsMs])
 
@@ -362,10 +491,31 @@ export default function DumpsPage() {
     setStatus('Loading session...')
     setCaptureTxt('')
     setDumpTxt('')
+    setDumpCsvRaw('')
+    setDumpCsvFilter('')
+    setDumpCsvFilterDebounced('')
     setCfg({})
     setEvents([])
     setCursorX(null)
     setEventInfo('')
+    setZoomRange({ x0: xMin, x1: xMax })
+    setLegendSelectedByName({})
+
+    // reset dump.csv parsing state
+    dumpCsvParseJobRef.current++
+    dumpCsvFilterJobRef.current++
+    dumpCsvViewJobRef.current++
+    dumpCsvHeaderRef.current = null
+    dumpCsvRowsRef.current = []
+    dumpCsvTmsRef.current = []
+    dumpCsvMatchesRef.current = null
+    dumpCsvViewIndicesRef.current = []
+    dumpCsvTermsRef.current = []
+    setDumpCsvParsedCount(0)
+    setDumpCsvTableRev((v) => v + 1)
+    setDumpCsvParsing(false)
+    setDumpCsvTableScrollTop(0)
+    setDumpCsvSort({ col: null, dir: 'asc' })
 
     const ts = selected.tsMs
     const loadTxt = async () => {
@@ -379,9 +529,11 @@ export default function DumpsPage() {
     const loadDumpEvents = async () => {
       if (!selected.dump?.hasCsv) {
         setEvents([])
+        setDumpCsvRaw('')
         return
       }
       const dumpCsv = await fetchDumpFileText(ts, 'dump', 'csv')
+      setDumpCsvRaw(dumpCsv)
       const preferCap = Boolean(selected.capture?.hasCsv)
       setEvents(parseDumpEvents(dumpCsv, preferCap))
     }
@@ -398,6 +550,7 @@ export default function DumpsPage() {
         setSeriesIds(ids)
         setXMin(curves.xMin)
         setXMax(curves.xMax)
+        setZoomRange({ x0: curves.xMin, x1: curves.xMax })
 
         // Build initial view pairs.
         const x0 = curves.xMin
@@ -410,6 +563,7 @@ export default function DumpsPage() {
       } else {
         setSeriesIds([])
         setViewPairsById(new Map())
+        setZoomRange({ x0: 0, x1: 1 })
       }
     }
 
@@ -421,20 +575,224 @@ export default function DumpsPage() {
       })
   }, [selected])
 
-  // Aftertouch series are only shown during capture.
+  const scheduleDumpCsvViewBuild = (throttleMs = 120) => {
+    const now = performance.now()
+    if (dumpCsvParsing && now - dumpCsvLastViewBuildAtRef.current < throttleMs) return
+    dumpCsvLastViewBuildAtRef.current = now
+
+    const jobId = ++dumpCsvViewJobRef.current
+    setTimeout(() => {
+      if (dumpCsvViewJobRef.current !== jobId) return
+      const header = dumpCsvHeaderRef.current || []
+      const rowsLen = dumpCsvRowsRef.current.length
+      const matches = dumpCsvMatchesRef.current
+
+      let base: number[]
+      if (matches) {
+        base = matches.slice()
+      } else {
+        base = Array.from({ length: rowsLen }, (_, i) => i)
+      }
+
+      const tmsCol = header.findIndex((h) => String(h || '').toLowerCase() === 't_ms')
+      const tms = dumpCsvTmsRef.current
+
+      const sort = dumpCsvSortRef.current
+      const col = sort.col !== null && sort.col >= 0 ? sort.col : tmsCol >= 0 ? tmsCol : 0
+      const colName = header[col] ? String(header[col]) : ''
+      const dirMul = sort.dir === 'desc' ? -1 : 1
+      const numericCol =
+        colName === 't_ms' ||
+        colName.endsWith('_ms') ||
+        ['t_cap_ms', 'analog', 'age_ms', 'peak', 'last', 'peak_speed', 'pressed', 'playing', 'ch', 'note', 'vel', 'pressure', 'delta', 'thr_down', 'thr_up'].includes(colName)
+
+      const cmp = (a: number, b: number) => {
+        if (col === tmsCol && tmsCol >= 0) {
+          const da = tms[a]
+          const db = tms[b]
+          const d = (da - db) * dirMul
+          if (Number.isFinite(d) && d !== 0) return d
+          return a - b
+        }
+
+        const ra = dumpCsvRowsRef.current[a]
+        const rb = dumpCsvRowsRef.current[b]
+        const sa = String(ra?.[col] ?? '')
+        const sb = String(rb?.[col] ?? '')
+        const la = sa.toLowerCase()
+        const lb = sb.toLowerCase()
+
+        let d = 0
+        if (numericCol) {
+          const na = Number.parseFloat(sa)
+          const nb = Number.parseFloat(sb)
+          if (Number.isFinite(na) && Number.isFinite(nb)) d = na - nb
+          else d = la.localeCompare(lb)
+        } else {
+          d = la.localeCompare(lb)
+        }
+        if (d) return d * dirMul
+
+        // Always tie-break by t_ms ascending if available.
+        if (tmsCol >= 0) {
+          const ta = tms[a]
+          const tb = tms[b]
+          const td = ta - tb
+          if (Number.isFinite(td) && td !== 0) return td
+        }
+        return a - b
+      }
+
+      base.sort(cmp)
+      dumpCsvViewIndicesRef.current = base
+      setDumpCsvTableRev((v) => v + 1)
+    }, 0)
+  }
+
+  // Rebuild filter matches async whenever the filter changes.
   useEffect(() => {
-    if (!selected?.capture?.hasCsv) {
-      setAtKeys([])
+    dumpCsvFilterRef.current = String(dumpCsvFilterDebounced || '').trim()
+    dumpCsvTermsRef.current = buildDumpCsvTerms(dumpCsvFilterRef.current)
+
+    const terms = dumpCsvTermsRef.current
+    const jobId = ++dumpCsvFilterJobRef.current
+    if (!terms.length) {
+      dumpCsvMatchesRef.current = null
+      scheduleDumpCsvViewBuild(0)
       return
     }
-    const keys = new Set<string>()
-    for (const e of events) {
-      if (e.event !== 'AFTERTOUCH') continue
-      const key = `${e.deviceId}:${e.hid}`
-      keys.add(key)
+
+    dumpCsvMatchesRef.current = []
+    let i = 0
+    const step = () => {
+      if (dumpCsvFilterJobRef.current !== jobId) return
+      const out = dumpCsvMatchesRef.current || []
+      const t0 = performance.now()
+      for (; i < dumpCsvRowsRef.current.length; i++) {
+        if (dumpCsvRowMatches(dumpCsvRowsRef.current[i], terms)) out.push(i)
+        if (performance.now() - t0 > 10) break
+      }
+      dumpCsvMatchesRef.current = out
+      scheduleDumpCsvViewBuild(0)
+      if (i < dumpCsvRowsRef.current.length) setTimeout(step, 0)
     }
-    setAtKeys(Array.from(keys.values()).map((k) => `AT:${k}`))
-  }, [events, selected?.capture?.hasCsv])
+    setTimeout(step, 0)
+  }, [dumpCsvFilterDebounced])
+
+  useEffect(() => {
+    const raw = String(dumpCsvRaw || '')
+    const jobId = ++dumpCsvParseJobRef.current
+
+    dumpCsvHeaderRef.current = null
+    dumpCsvRowsRef.current = []
+    dumpCsvTmsRef.current = []
+    dumpCsvMatchesRef.current = null
+    dumpCsvViewIndicesRef.current = []
+    setDumpCsvParsedCount(0)
+    setDumpCsvTableRev((v) => v + 1)
+    setDumpCsvTableScrollTop(0)
+
+    if (!raw) {
+      setDumpCsvParsing(false)
+      return
+    }
+
+    setDumpCsvParsing(true)
+
+    // Stream line-by-line without raw.split('\n') to keep UI responsive.
+    let pos = 0
+    let header: string[] | null = null
+    let tmsIdx = -1
+
+    const readLine = () => {
+      if (pos >= raw.length) return null
+      let nl = raw.indexOf('\n', pos)
+      if (nl === -1) nl = raw.length
+      const line = raw.slice(pos, nl)
+      pos = nl + 1
+      return line
+    }
+
+    const parseRow = (line: string) => parseCsvRow(line).map((s) => String(s || '').replace(/^"|"$/g, ''))
+
+    const step = () => {
+      if (dumpCsvParseJobRef.current !== jobId) return
+      const t0 = performance.now()
+      const chunkRows: string[][] = []
+      let parsedAny = false
+
+      for (;;) {
+        const line = readLine()
+        if (line === null) break
+        if (!line) continue
+
+        if (!header) {
+          header = parseRow(line)
+          dumpCsvHeaderRef.current = header
+          tmsIdx = header.findIndex((h) => String(h || '').toLowerCase() === 't_ms')
+          if (dumpCsvSortRef.current.col === null) {
+            setDumpCsvSort({ col: tmsIdx >= 0 ? tmsIdx : null, dir: 'asc' })
+          }
+          parsedAny = true
+          continue
+        }
+
+        const r0 = parseRow(line)
+        const r = r0.length < header.length ? [...r0, ...Array(header.length - r0.length).fill('')] : r0
+        chunkRows.push(r)
+        parsedAny = true
+
+        if (performance.now() - t0 > 12) break
+      }
+
+      if (chunkRows.length) {
+        dumpCsvRowsRef.current.push(...chunkRows)
+        // Maintain parallel t_ms cache.
+        const base = dumpCsvTmsRef.current.length
+        for (let i = 0; i < chunkRows.length; i++) {
+          const r = chunkRows[i]
+          const tv = tmsIdx >= 0 ? Number.parseFloat(String(r[tmsIdx] || '')) : NaN
+          dumpCsvTmsRef.current.push(tv)
+        }
+
+        const terms = dumpCsvTermsRef.current
+        if (terms.length) {
+          const matches = dumpCsvMatchesRef.current || []
+          for (let i = 0; i < chunkRows.length; i++) {
+            if (dumpCsvRowMatches(chunkRows[i], terms)) matches.push(base + i)
+          }
+          dumpCsvMatchesRef.current = matches
+        }
+      }
+
+      if (parsedAny) {
+        setDumpCsvParsedCount(dumpCsvRowsRef.current.length)
+        setDumpCsvTableRev((v) => v + 1)
+        scheduleDumpCsvViewBuild()
+      }
+
+      if (pos < raw.length) {
+        setTimeout(step, 0)
+      } else {
+        setDumpCsvParsing(false)
+        scheduleDumpCsvViewBuild(0)
+      }
+    }
+
+    setTimeout(step, 0)
+  }, [dumpCsvRaw])
+
+  const dumpCsvTableInfo = useMemo(() => {
+    // Depends on dumpCsvTableRev so filter-match updates re-render.
+    void dumpCsvTableRev
+    const header = dumpCsvHeaderRef.current
+    const total = dumpCsvParsedCount
+    const viewLen = dumpCsvViewIndicesRef.current.length
+    const filtered = viewLen ? viewLen : dumpCsvMatchesRef.current ? dumpCsvMatchesRef.current.length : total
+    return { header, total, filtered, parsing: dumpCsvParsing }
+  }, [dumpCsvParsedCount, dumpCsvParsing, dumpCsvTableRev])
+
+  // Aftertouch is rendered in a separate chart if present.
 
   const chartOption = useMemo(() => {
     const evByKey = new Map<string, DumpEvent[]>()
@@ -580,73 +938,76 @@ export default function DumpsPage() {
             : undefined,
       })
 
-      if (selected?.capture?.hasCsv) {
-        // Aftertouch markers (scatter), only during capture sessions.
-        const atPts: Array<[number, number]> = []
-        for (const ev of evByKey.get(id) || []) {
-          if (ev.event !== 'AFTERTOUCH') continue
-          if (!Number.isFinite(ev.pressure as number)) continue
-          atPts.push([ev.xMs, (ev.pressure as number) / 127.0])
-        }
-        if (atPts.length) {
-          series.push({
-            name: `AT ${name}`,
-            type: 'scatter',
-            data: atPts,
-            symbolSize: 6,
-            itemStyle: { color, opacity: 0.9 },
-          })
-        }
-      }
+      // Aftertouch series hidden for now (data remains in dump CSV).
     }
 
-    const yLines: any[] = []
-    if (Number.isFinite(cfg.thr as number)) yLines.push({ yAxis: cfg.thr, name: 'thr' })
-    if (Number.isFinite(cfg.thrUp as number)) yLines.push({ yAxis: cfg.thrUp, name: 'thr_up' })
-    if (Number.isFinite(cfg.thrAt as number)) yLines.push({ yAxis: cfg.thrAt, name: 'thr_at' })
-
-    if (yLines.length) {
-      series.push({
-        name: 'thresholds',
-        type: 'line',
-        data: [],
-        silent: true,
-        markLine: {
-          symbol: 'none',
-          lineStyle: { color: 'rgba(255,255,255,0.35)', type: 'dashed', width: 1 },
-          label: { show: true, color: 'rgba(255,255,255,0.65)', fontSize: 11 },
-          data: yLines,
+    const refLines: any[] = []
+    // Thresholds: horizontal reference lines only.
+    if (Number.isFinite(cfg.thr as number)) {
+      refLines.push({
+        yAxis: cfg.thr,
+        name: 'DOWN',
+        lineStyle: { color: 'rgba(255,255,255,0.35)', type: 'dotted', width: 1, opacity: 0.8 },
+        label: {
+          show: true,
+          formatter: 'DOWN',
+          position: 'start',
+          align: 'left',
+          offset: [10, -12],
+          color: 'rgba(255,255,255,0.70)',
+          fontSize: 11,
+          padding: [1, 6, 1, 6],
+          backgroundColor: 'rgba(0,0,0,0.35)',
+          borderRadius: 6,
         },
       })
-      legendSelected['thresholds'] = false
     }
+    if (Number.isFinite(cfg.thrUp as number)) {
+      refLines.push({
+        yAxis: cfg.thrUp,
+        name: 'UP',
+        lineStyle: { color: 'rgba(255,255,255,0.30)', type: 'dotted', width: 2, opacity: 0.85 },
+        label: {
+          show: true,
+          formatter: 'UP',
+          position: 'start',
+          align: 'left',
+          offset: [10, 12],
+          color: 'rgba(255,255,255,0.65)',
+          fontSize: 11,
+          padding: [1, 6, 1, 6],
+          backgroundColor: 'rgba(0,0,0,0.30)',
+          borderRadius: 6,
+        },
+      })
+    }
+    // Note: thr_at is intentionally not rendered as a horizontal reference line.
 
+    // Cursor: vertical reference line only.
     if (cursorX !== null) {
-      series.push({
-        name: 'cursor',
-        type: 'line',
-        data: [],
-        silent: true,
-        markLine: {
-          symbol: 'none',
-          lineStyle: { color: 'rgba(255,255,255,0.55)', type: 'dashed', width: 1 },
-          label: { show: true, color: 'rgba(255,255,255,0.75)', fontSize: 11 },
-          data: [{ xAxis: cursorX, name: `t=${cursorX.toFixed(1)}ms` }],
-        },
+      refLines.push({
+        xAxis: cursorX,
+        name: '',
+        lineStyle: { color: 'rgba(255,255,255,0.55)', type: 'dashed', width: 1, opacity: 0.85 },
+        label: { show: false },
       })
-      legendSelected['cursor'] = false
     }
 
-    return {
-      animation: false,
-      backgroundColor: 'transparent',
-      grid: { left: 58, right: 18, top: 14, bottom: 92 },
+      return {
+        animation: false,
+        backgroundColor: 'transparent',
+        grid: { left: 58, right: 18, top: 14, bottom: 92 },
       legend: {
         type: 'scroll',
         top: 'auto',
         bottom: 34,
         textStyle: { color: 'rgba(255,255,255,0.70)' },
-        selected: legendSelected,
+        selected: { ...legendSelected, ...legendSelectedByName },
+        data: seriesIds.map((id) => {
+          const [dev, ...rest] = String(id).split(':')
+          const hid = rest.join(':')
+          return displayKey(dev, hid)
+        }),
       },
       tooltip: {
         trigger: 'axis',
@@ -694,8 +1055,9 @@ export default function DumpsPage() {
         splitLine: { lineStyle: { color: 'rgba(255,255,255,0.10)' } },
       },
       dataZoom: [
-        { type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseWheel: true, filterMode: 'none' },
+        { id: 'x_in', type: 'inside', xAxisIndex: 0, zoomOnMouseWheel: true, moveOnMouseWheel: true, filterMode: 'none' },
         {
+          id: 'x_sl',
           type: 'slider',
           xAxisIndex: 0,
           height: 26,
@@ -703,10 +1065,196 @@ export default function DumpsPage() {
           filterMode: 'none',
           textStyle: { color: 'rgba(255,255,255,0.65)' },
         },
+        { id: 'y_in', type: 'inside', yAxisIndex: 0, filterMode: 'none' },
+        {
+          id: 'y_sl',
+          type: 'slider',
+          yAxisIndex: 0,
+          orient: 'vertical',
+          left: 8,
+          top: 28,
+          bottom: 104,
+          width: 14,
+          filterMode: 'none',
+          textStyle: { color: 'rgba(255,255,255,0.65)' },
+        },
       ],
-      series,
+        series: refLines.length
+          ? [
+              ...series,
+              {
+                name: 'refs',
+                type: 'line',
+                yAxisIndex: 0,
+                data: [],
+                silent: true,
+                legendHoverLink: false,
+                hoverAnimation: false,
+                markLine: {
+                  symbol: 'none',
+                  precision: -1,
+                  lineStyle: { width: 1, opacity: 1 },
+                  label: { show: true, formatter: '{b}' },
+                  tooltip: { show: false },
+                  emphasis: { disabled: true },
+                  data: refLines,
+                },
+              },
+            ]
+          : series,
+      }
+  }, [seriesIds, viewPairsById, events, cfg, cursorX, selected, boardByDeviceId, xMin, xMax, legendSelectedByName])
+
+  const atOption = useMemo(() => {
+    const atById = new Map<string, Array<[number, number]>>()
+    const noteoffById = new Map<string, number[]>()
+    for (const e of events) {
+      if (e.event !== 'AFTERTOUCH') continue
+      if (!Number.isFinite(e.pressure as number)) continue
+      const id = `${e.deviceId}:${e.hid}`
+      const arr = atById.get(id) || []
+      arr.push([e.xMs, Number(e.pressure)])
+      atById.set(id, arr)
     }
-  }, [seriesIds, viewPairsById, events, cfg, cursorX, selected, boardByDeviceId, xMin, xMax])
+
+    for (const e of events) {
+      const evName = String(e.event || '')
+      const kindName = String(e.kind || '')
+      const isMidi =
+        evName === 'MIDI' ||
+        evName.startsWith('MIDI_') ||
+        (evName.startsWith('MIDI') && (kindName.includes('noteon') || kindName.includes('noteoff')))
+      if (!isMidi) continue
+      if (!kindName.includes('noteoff') && !evName.includes('NOTEOFF')) continue
+      const id = `${e.deviceId}:${e.hid}`
+      if (!Number.isFinite(e.xMs)) continue
+      const arr = noteoffById.get(id) || []
+      arr.push(e.xMs)
+      noteoffById.set(id, arr)
+    }
+
+    if (!atById.size) return null
+
+    const midiLines: any[] = []
+    for (const e of events) {
+      const evName = String(e.event || '')
+      const kindName = String(e.kind || '')
+      const isMidi =
+        evName === 'MIDI' ||
+        evName.startsWith('MIDI_') ||
+        (evName.startsWith('MIDI') && (kindName.includes('noteon') || kindName.includes('noteoff')))
+      if (!isMidi) continue
+      const id = `${e.deviceId}:${e.hid}`
+      const col = hashColor(id)
+      const on = kindName.includes('noteon') || evName.includes('NOTEON')
+      const off = kindName.includes('noteoff') || evName.includes('NOTEOFF')
+      let suffix = ''
+      const ch = Number.isFinite(e.ch as number) ? Number(e.ch) : null
+      const note = Number.isFinite(e.note as number) ? Number(e.note) : null
+      const vel = Number.isFinite(e.vel as number) ? Number(e.vel) : null
+      if (ch !== null && note !== null) {
+        const v = vel !== null ? ` v${vel}` : ''
+        suffix = ` (${ch}-${note}${v})`
+      }
+      const kn = displayKey(e.deviceId, e.hid)
+      midiLines.push({
+        xAxis: e.xMs,
+        name: `${on ? 'MIDI ON' : off ? 'MIDI OFF' : 'MIDI'}${suffix} ${kn}`,
+        lineStyle: { color: col, opacity: 0.55, width: 1, type: 'dashed' },
+        label: { show: false },
+      })
+    }
+
+    const series: any[] = []
+    for (const [id, pts] of atById.entries()) {
+      pts.sort((a, b) => a[0] - b[0])
+
+      // Break the aftertouch line after each noteoff.
+      const offs = (noteoffById.get(id) || []).slice().sort((a, b) => a - b)
+      if (offs.length) {
+        const eps = 0.001
+        for (const t of offs) {
+          pts.push([t + eps, NaN])
+        }
+        pts.sort((a, b) => a[0] - b[0])
+      }
+      const [dev, ...rest] = id.split(':')
+      const hid = rest.join(':')
+      const name = displayKey(dev, hid)
+      series.push({
+        name,
+        type: 'line',
+        step: 'end',
+        showSymbol: false,
+        data: pts.map(([x, y]) => [x, Number.isFinite(y) ? y : null]),
+        lineStyle: { width: 1.4, color: hashColor(id), opacity: 0.95 },
+        emphasis: { disabled: true },
+        legendHoverLink: false,
+        hoverAnimation: false,
+      })
+    }
+
+    const legendData = series.map((s) => String(s.name || '')).filter(Boolean)
+
+    return {
+      animation: false,
+      backgroundColor: 'transparent',
+      grid: { left: 58, right: 18, top: 10, bottom: 18 },
+      legend: { show: false, selected: legendSelectedByName, data: legendData },
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'line', triggerEmphasis: false },
+        confine: true,
+      },
+      xAxis: {
+        type: 'value',
+        min: zoomRange.x0,
+        max: zoomRange.x1,
+        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.25)' } },
+        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.08)' } },
+      },
+      yAxis: {
+        type: 'value',
+        min: 0,
+        max: 127,
+        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.25)' } },
+        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.08)' } },
+      },
+      dataZoom: [
+        { id: 'at_y_in', type: 'inside', yAxisIndex: 0, filterMode: 'none' },
+        {
+          id: 'at_y_sl',
+          type: 'slider',
+          yAxisIndex: 0,
+          orient: 'vertical',
+          left: 8,
+          top: 10,
+          bottom: 20,
+          width: 14,
+          filterMode: 'none',
+          textStyle: { color: 'rgba(255,255,255,0.65)' },
+        },
+      ],
+      series: [
+        {
+          name: 'midi',
+          type: 'line',
+          data: [],
+          silent: true,
+          markLine: {
+            symbol: 'none',
+            precision: -1,
+            lineStyle: { width: 1, type: 'dashed', opacity: 0.55 },
+            label: { show: false },
+            tooltip: { show: true },
+            emphasis: { disabled: true },
+            data: midiLines,
+          },
+        },
+        ...series,
+      ],
+    }
+  }, [events, zoomRange, boardByDeviceId, legendSelectedByName])
 
   const renderTxt = (txt: string) => {
     const parts: any[] = []
@@ -828,6 +1376,33 @@ export default function DumpsPage() {
                   notMerge={false}
                   lazyUpdate
                   onEvents={{
+                    legendselectchanged: (p: any) => {
+                      const sel = p?.selected
+                      if (sel && typeof sel === 'object') setLegendSelectedByName(sel)
+                    },
+                    datazoom: () => {
+                      const inst = chartRef.current?.getEchartsInstance?.()
+                      if (!inst) return
+                      const opt = inst.getOption?.() || {}
+                      const dzArr = Array.isArray(opt.dataZoom) ? opt.dataZoom : []
+                      const dz =
+                        dzArr.find((z: any) => z && (z.id === 'x_in' || z.id === 'x_sl')) ||
+                        (dzArr.length ? dzArr[0] : null)
+                      let x0: number | null = null
+                      let x1: number | null = null
+                      if (dz && Number.isFinite(dz.startValue) && Number.isFinite(dz.endValue)) {
+                        x0 = Number(dz.startValue)
+                        x1 = Number(dz.endValue)
+                      } else if (dz && Number.isFinite(dz.start) && Number.isFinite(dz.end)) {
+                        const a = xMin + ((xMax - xMin) * Number(dz.start)) / 100.0
+                        const z = xMin + ((xMax - xMin) * Number(dz.end)) / 100.0
+                        x0 = a
+                        x1 = z
+                      }
+                      if (x0 !== null && x1 !== null && x1 > x0) {
+                        setZoomRange({ x0, x1 })
+                      }
+                    },
                     mouseover: (p: any) => {
                       if (p?.componentType === 'markLine') {
                         const d = p?.data || {}
@@ -869,15 +1444,37 @@ export default function DumpsPage() {
                   onClick={() => {
                     setCursorX(null)
                     setEventInfo('')
+                    setLegendSelectedByName({})
                     const inst = chartRef.current?.getEchartsInstance?.()
                     if (inst) {
-                      inst.dispatchAction({ type: 'dataZoom', dataZoomIndex: 0, start: 0, end: 100 })
-                      inst.dispatchAction({ type: 'dataZoom', dataZoomIndex: 1, start: 0, end: 100 })
+                      inst.setOption(
+                        {
+                          dataZoom: [
+                            { id: 'x_in', start: 0, end: 100 },
+                            { id: 'x_sl', start: 0, end: 100 },
+                            { id: 'y_in', start: 0, end: 100 },
+                            { id: 'y_sl', start: 0, end: 100 },
+                          ],
+                        },
+                        false,
+                      )
+                      setZoomRange({ x0: xMin, x1: xMax })
 
                       // Reset legend/series visibility.
                       inst.dispatchAction({ type: 'legendAllSelect' })
-                      inst.dispatchAction({ type: 'legendUnSelect', name: 'thresholds' })
-                      inst.dispatchAction({ type: 'legendUnSelect', name: 'cursor' })
+                    }
+
+                    const atInst = atChartRef.current?.getEchartsInstance?.()
+                    if (atInst) {
+                      atInst.setOption(
+                        {
+                          dataZoom: [
+                            { id: 'at_y_in', start: 0, end: 100 },
+                            { id: 'at_y_sl', start: 0, end: 100 },
+                          ],
+                        },
+                        false,
+                      )
                     }
                   }}
                   style={{
@@ -905,6 +1502,15 @@ export default function DumpsPage() {
                 </span>
               </div>
             </div>
+
+            {atOption ? (
+              <div style={{ marginTop: 10 }}>
+                <div className="dpMut" style={{ fontSize: 12, margin: '0 0 6px 2px' }}>
+                  Aftertouch
+                </div>
+                <ReactECharts ref={atChartRef} option={atOption} style={{ height: 340, width: '100%' }} notMerge={false} lazyUpdate />
+              </div>
+            ) : null}
           </div>
 
           <div className="dpTxt">
@@ -922,6 +1528,192 @@ export default function DumpsPage() {
                   dump.txt
                 </div>
                 <div>{renderTxt(dumpTxt)}</div>
+              </>
+            ) : null}
+
+            {dumpCsvTableInfo.header ? (
+              <>
+                <div className="dpMut" style={{ margin: '10px 0 6px 0' }}>
+                  dump.csv
+                  <span className="dpMut" style={{ marginLeft: 8 }}>
+                    rows={dumpCsvTableInfo.total}
+                    {dumpCsvTableInfo.parsing ? ' (parsing...)' : ''}
+                  </span>
+                  {dumpCsvMatchesRef.current ? (
+                    <span className="dpMut" style={{ marginLeft: 8 }}>
+                      filtered={dumpCsvTableInfo.filtered}
+                    </span>
+                  ) : null}
+                </div>
+
+                <div style={{ marginBottom: 8 }}>
+                  <TextField
+                    size="small"
+                    value={dumpCsvFilter}
+                    onChange={(e) => setDumpCsvFilter(e.target.value)}
+                    placeholder="Filter rows (e.g. aft, EDGE, noteon)"
+                    fullWidth
+                    inputProps={{
+                      style: {
+                        color: 'rgba(255,255,255,0.85)',
+                        fontFamily:
+                          "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+                        fontSize: 12,
+                      },
+                    }}
+                    InputLabelProps={{ style: { color: 'rgba(255,255,255,0.55)' } }}
+                    sx={{
+                      '& .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.18)' },
+                      '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.26)' },
+                      '& .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(255,255,255,0.32)' },
+                    }}
+                  />
+                </div>
+
+                <TableContainer
+                  ref={dumpCsvTableWrapRef}
+                  onScroll={(e) => {
+                    const el = e.currentTarget
+                    setDumpCsvTableScrollTop(el.scrollTop)
+                  }}
+                  style={{
+                    maxHeight: 520,
+                    overflow: 'auto',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    borderRadius: 10,
+                    background: 'rgba(0,0,0,0.12)',
+                  }}
+                >
+                  <Table stickyHeader size="small" aria-label="dump csv table">
+                    <TableHead>
+                      <TableRow>
+                        {(() => {
+                          const header = dumpCsvTableInfo.header || []
+                          const tmsCol = header.findIndex((x) => String(x || '').toLowerCase() === 't_ms')
+                          const effCol = dumpCsvSort.col !== null ? dumpCsvSort.col : tmsCol
+                          const dir = dumpCsvSort.dir
+                          return header.map((h, i) => (
+                          <TableCell
+                            key={`h${i}`}
+                            style={{
+                              position: 'sticky',
+                              top: 0,
+                              zIndex: 1,
+                              padding: '6px 8px',
+                              background: 'rgba(12,12,12,0.92)',
+                              color: 'rgba(255,255,255,0.75)',
+                              fontFamily:
+                                "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+                              fontSize: 12,
+                              whiteSpace: 'nowrap',
+                              borderBottom: '1px solid rgba(255,255,255,0.10)',
+                            }}
+                          >
+                            <TableSortLabel
+                              active={effCol === i}
+                              direction={effCol === i ? dir : 'asc'}
+                              onClick={() => {
+                                setDumpCsvSort((prev) => {
+                                  const prevCol = prev.col !== null ? prev.col : tmsCol
+                                  const next =
+                                    prevCol === i
+                                      ? ({ col: i, dir: (prev.dir === 'asc' ? 'desc' : 'asc') as 'asc' | 'desc' } as const)
+                                      : ({ col: i, dir: 'asc' } as const)
+                                  dumpCsvSortRef.current = next
+                                  return next
+                                })
+                                scheduleDumpCsvViewBuild(0)
+                              }}
+                              sx={{
+                                color: 'rgba(255,255,255,0.75)',
+                                '&.Mui-active': { color: 'rgba(255,255,255,0.88)' },
+                                '& .MuiTableSortLabel-icon': { color: 'rgba(255,255,255,0.55) !important' },
+                              }}
+                            >
+                              {h}
+                            </TableSortLabel>
+                          </TableCell>
+                          ))
+                        })()}
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {(() => {
+                        const header = dumpCsvTableInfo.header || []
+                        const view = dumpCsvViewIndicesRef.current
+                        const total = view.length
+                          ? view.length
+                          : dumpCsvMatchesRef.current
+                            ? dumpCsvMatchesRef.current.length
+                            : dumpCsvTableInfo.total
+                        const rowH = 24
+                        const wrapH = dumpCsvTableWrapRef.current?.clientHeight || 520
+                        const buffer = 40
+                        const start = Math.max(0, Math.floor(dumpCsvTableScrollTop / rowH) - buffer)
+                        const end = Math.min(total, start + Math.ceil(wrapH / rowH) + buffer * 2)
+                        const topH = start * rowH
+                        const botH = Math.max(0, (total - end) * rowH)
+                        const makeRow = (idx: number, ri: number) => {
+                          const r = dumpCsvRowsRef.current[idx]
+                          return (
+                            <TableRow
+                              key={`r${idx}`}
+                              hover
+                              style={{
+                                background: ri % 2 ? 'rgba(255,255,255,0.02)' : 'transparent',
+                              }}
+                            >
+                              {header.map((_, ci) => (
+                                <TableCell
+                                  key={`c${idx}_${ci}`}
+                                  style={{
+                                    padding: '4px 8px',
+                                    color: 'rgba(255,255,255,0.84)',
+                                    fontFamily:
+                                      "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+                                    fontSize: 12,
+                                    whiteSpace: 'nowrap',
+                                    borderBottom: '1px solid rgba(255,255,255,0.06)',
+                                  }}
+                                >
+                                  {r?.[ci] ?? ''}
+                                </TableCell>
+                              ))}
+                            </TableRow>
+                          )
+                        }
+
+                        const rows: any[] = []
+                        if (topH) {
+                          rows.push(
+                            <TableRow key="sp_top">
+                              <TableCell colSpan={Math.max(1, header.length)} style={{ padding: 0, height: topH, borderBottom: 'none' }} />
+                            </TableRow>,
+                          )
+                        }
+
+                        for (let i = start; i < end; i++) {
+                          const idx = view.length
+                            ? view[i]
+                            : dumpCsvMatchesRef.current
+                              ? dumpCsvMatchesRef.current[i]
+                              : i
+                          rows.push(makeRow(idx, i))
+                        }
+
+                        if (botH) {
+                          rows.push(
+                            <TableRow key="sp_bot">
+                              <TableCell colSpan={Math.max(1, header.length)} style={{ padding: 0, height: botH, borderBottom: 'none' }} />
+                            </TableRow>,
+                          )
+                        }
+
+                        return rows
+                      })()}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
               </>
             ) : null}
           </div>

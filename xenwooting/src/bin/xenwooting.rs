@@ -3644,28 +3644,83 @@ fn main() -> Result<()> {
                             );
                         }
                     } else {
-                        let ts_ms = unix_time_ms();
-                        match write_manual_dump_files(
-                            &output_dir,
-                            ts_ms,
-                            "dump",
-                            &cfg_line,
-                            &dbg_ring,
-                            rgb_drop_critical,
-                        ) {
-                            Ok((csv_path, txt_path)) => {
-                                dbg_ring.clear();
-                                info!("MANUAL_DUMP saved csv={} txt={}", csv_path, txt_path);
+                        // Dump chord.
+                        // If capture is active, stop+flush the capture pair (capture+dump) and do NOT create a
+                        // separate standalone dump with a new timestamp.
+                        if capture.active.load(Ordering::Relaxed) {
+                            match capture_stop_and_flush(&capture) {
+                                Ok(Some((
+                                    dev_id,
+                                    capture_csv_path,
+                                    capture_txt_path,
+                                    dump_csv_path,
+                                    dump_txt_path,
+                                ))) => {
+                                    capture_indicator_devices.remove(&dev_id);
+                                    let base_rgb = match guide_mode {
+                                        GuideMode::WaitRoot => (0u8, 0u8, 0u8),
+                                        GuideMode::Active => (0u8, 255u8, 0u8),
+                                        GuideMode::Off => control_bar_rgb_for_tm(trainer_mode),
+                                    };
+                                    paint_ctrl_indicator(
+                                        dev_id,
+                                        &rgb_index_by_device_id,
+                                        base_rgb,
+                                        false,
+                                    );
+                                    for m in active_masks_by_device.values() {
+                                        m.clear_all();
+                                    }
+                                    last_aftertouch_pressure_by_key.clear();
+                                    dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!(
+                                            "CAPTURE stop (dump_chord) dev={} capture_csv={} capture_txt={} dump_csv={} dump_txt={}",
+                                            dev_id, capture_csv_path, capture_txt_path, dump_csv_path, dump_txt_path
+                                        ),
+                                    );
+                                    dbg_ring.clear();
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    dbg_push(
+                                        &mut dbg_ring,
+                                        &start_ts,
+                                        format!("CAPTURE stop failed: {e}"),
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                warn!("manual dump save failed: {e}");
+
+                            schedule_midi_ping(
+                                &mut midi_out,
+                                &mut note_on_count,
+                                &mut pending_noteoffs,
+                            );
+                        } else {
+                            let ts_ms = unix_time_ms();
+                            match write_manual_dump_files(
+                                &output_dir,
+                                ts_ms,
+                                "dump",
+                                &cfg_line,
+                                &dbg_ring,
+                                rgb_drop_critical,
+                            ) {
+                                Ok((csv_path, txt_path)) => {
+                                    dbg_ring.clear();
+                                    info!("MANUAL_DUMP saved csv={} txt={}", csv_path, txt_path);
+                                }
+                                Err(e) => {
+                                    warn!("manual dump save failed: {e}");
+                                }
                             }
+                            schedule_midi_ping(
+                                &mut midi_out,
+                                &mut note_on_count,
+                                &mut pending_noteoffs,
+                            );
                         }
-                        schedule_midi_ping(
-                            &mut midi_out,
-                            &mut note_on_count,
-                            &mut pending_noteoffs,
-                        );
                     }
 
                     continue;
@@ -3853,30 +3908,48 @@ fn main() -> Result<()> {
                                 }),
                             );
                         }
+
+                        // If capture mode is active, keep Ctrl indicator solid white.
+                        if (hid == HIDCodes::LeftCtrl || hid == HIDCodes::RightCtrl)
+                            && capture_indicator_devices.contains(&device_id)
+                        {
+                            let base_rgb = control_bar_rgb_for_tm(trainer_mode);
+                            paint_ctrl_indicator(
+                                device_id,
+                                &rgb_index_by_device_id,
+                                base_rgb,
+                                true,
+                            );
+                        }
                     } else if kind == "up" {
                         // Restore the control bar to the current mode colors.
                         // Space's indicator overrides to white when octave-hold is enabled.
                         let base_rgb = control_bar_rgb_for_tm(trainer_mode);
-                        if hid == HIDCodes::Space {
-                            paint_spacebar_indicator(
-                                device_id,
-                                &rgb_index_by_device_id,
-                                base_rgb,
-                                octave_hold_by_device.contains(&device_id),
+                        for &lc in cols {
+                            try_send_drop(
+                                &rgb_tx,
+                                RgbCmd::SetKey(RgbKey {
+                                    device_index: dev_idx,
+                                    row: control_bar_row,
+                                    col: lc,
+                                    rgb: base_rgb,
+                                }),
                             );
-                        } else {
-                            for &lc in cols {
-                                try_send_drop(
-                                    &rgb_tx,
-                                    RgbCmd::SetKey(RgbKey {
-                                        device_index: dev_idx,
-                                        row: control_bar_row,
-                                        col: lc,
-                                        rgb: base_rgb,
-                                    }),
-                                );
-                            }
                         }
+
+                        // Persistent control-bar overlays.
+                        paint_spacebar_indicator(
+                            device_id,
+                            &rgb_index_by_device_id,
+                            base_rgb,
+                            octave_hold_by_device.contains(&device_id),
+                        );
+                        paint_ctrl_indicator(
+                            device_id,
+                            &rgb_index_by_device_id,
+                            base_rgb,
+                            capture_indicator_devices.contains(&device_id),
+                        );
                     }
                 }
             }
