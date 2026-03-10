@@ -2435,8 +2435,9 @@ fn main() -> Result<()> {
     let mut note_on_count: HashMap<(u8, u8), u32> = HashMap::new();
     let mut pending_noteoffs: VecDeque<PendingNoteOff> = VecDeque::new();
 
-    // Last aftertouch pressure sent per key (only logged during capture).
-    let mut last_aftertouch_pressure_by_key: HashMap<(u64, HIDCodes), u8> = HashMap::new();
+    // Last poly-aftertouch pressure sent per key.
+    // We use this to avoid spamming duplicate polytouch values; capture logs reflect sends.
+    let mut last_aftertouch_sent_by_key: HashMap<(u64, HIDCodes), u8> = HashMap::new();
 
     // Live HUD state published for /wtn/live.
     let live_state_path = PathBuf::from(LIVE_STATE_PATH);
@@ -3399,7 +3400,7 @@ fn main() -> Result<()> {
                         for m in active_masks_by_device.values() {
                             m.clear_all();
                         }
-                        last_aftertouch_pressure_by_key.clear();
+                        // Note: do not clear last_aftertouch_sent_by_key here; keys may still be held.
                         dbg_push(
                             &mut dbg_ring,
                             &start_ts,
@@ -3555,7 +3556,7 @@ fn main() -> Result<()> {
                                     for m in active_masks_by_device.values() {
                                         m.clear_all();
                                     }
-                                    last_aftertouch_pressure_by_key.clear();
+                                    // Note: do not clear last_aftertouch_sent_by_key here; keys may still be held.
                                     dbg_push(
                                         &mut dbg_ring,
                                         &start_ts,
@@ -3621,7 +3622,7 @@ fn main() -> Result<()> {
                             }
 
                             capture.active.store(true, Ordering::Relaxed);
-                            last_aftertouch_pressure_by_key.clear();
+                            // Note: do not clear last_aftertouch_sent_by_key here; keys may still be held.
                             capture_indicator_devices.insert(device_id);
                             let base_rgb = match guide_mode {
                                 GuideMode::WaitRoot => (0u8, 0u8, 0u8),
@@ -3671,7 +3672,7 @@ fn main() -> Result<()> {
                                     for m in active_masks_by_device.values() {
                                         m.clear_all();
                                     }
-                                    last_aftertouch_pressure_by_key.clear();
+                                    // Note: do not clear last_aftertouch_sent_by_key here; keys may still be held.
                                     dbg_push(
                                         &mut dbg_ring,
                                         &start_ts,
@@ -4397,6 +4398,9 @@ fn main() -> Result<()> {
                         }
                         let removed = vel_state.remove(&key_id);
 
+                        // Ensure next press can emit polytouch again even if it repeats the same value.
+                        last_aftertouch_sent_by_key.remove(&key_id);
+
                         // Restore LED immediately.
                         if let Some(VelState::Tracking { led: Some(led), .. }) = &removed {
                             rgb_send_critical(
@@ -4514,6 +4518,7 @@ fn main() -> Result<()> {
                                         );
                                         dbg_push(&mut dbg_ring, &start_ts, cfg_line.clone());
                                         midi_out.panic_all();
+                                        last_aftertouch_sent_by_key.clear();
                                         note_by_key.clear();
                                         note_on_count.clear();
                                     }
@@ -4590,6 +4595,7 @@ fn main() -> Result<()> {
                                             ),
                                         );
                                         midi_out.panic_all();
+                                        last_aftertouch_sent_by_key.clear();
                                         note_by_key.clear();
                                         note_on_count.clear();
                                     }
@@ -4738,6 +4744,7 @@ fn main() -> Result<()> {
                                     );
                                     dbg_push(&mut dbg_ring, &start_ts, cfg_line.clone());
                                     midi_out.panic_all();
+                                    last_aftertouch_sent_by_key.clear();
                                     note_by_key.clear();
                                     note_on_count.clear();
                                     sent = true;
@@ -4918,17 +4925,89 @@ fn main() -> Result<()> {
                                     match aftertouch_mode {
                                         AftertouchMode::PeakMapped
                                         | AftertouchMode::SpeedMapped => {
+                                            let last = last_aftertouch_sent_by_key
+                                                .get(&key)
+                                                .copied()
+                                                .unwrap_or(255);
+                                            if pressure != last {
+                                                let ok = midi_out
+                                                    .send_polytouch(out_ch, note, pressure)
+                                                    .is_ok();
+                                                if ok {
+                                                    last_aftertouch_sent_by_key
+                                                        .insert(key.clone(), pressure);
+                                                    if capture.active.load(Ordering::Relaxed) {
+                                                        let t_ms = start_ts
+                                                            .elapsed()
+                                                            .as_millis()
+                                                            .min(u64::MAX as u128)
+                                                            as u64;
+                                                        capture_events_push_row(
+                                                            &capture,
+                                                            [
+                                                                t_ms.to_string(),
+                                                                String::new(),
+                                                                "AFTERTOUCH".to_string(),
+                                                                "polytouch".to_string(),
+                                                                key.0.to_string(),
+                                                                format!("{:?}", key.1),
+                                                                String::new(),
+                                                                String::new(),
+                                                                String::new(),
+                                                                String::new(),
+                                                                String::new(),
+                                                                String::new(),
+                                                                String::new(),
+                                                                out_ch.to_string(),
+                                                                note.to_string(),
+                                                                String::new(),
+                                                                pressure.to_string(),
+                                                                String::new(),
+                                                                String::new(),
+                                                                String::new(),
+                                                                "polytouch".to_string(),
+                                                            ],
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        AftertouchMode::Off => {}
+                                    }
+                                }
+                            }
+
+                            vel_state.insert(
+                                key,
+                                VelState::Tracking {
+                                    started: Instant::now(),
+                                    peak: last_analog,
+                                    last_analog,
+                                    last_analog_ts,
+                                    peak_speed: 0.0,
+                                    at_level,
+                                    out_ch,
+                                    note,
+                                    playing: noteon_ok,
+                                    led,
+                                },
+                            );
+                        } else {
+                            if !no_aftertouch {
+                                match aftertouch_mode {
+                                    AftertouchMode::PeakMapped | AftertouchMode::SpeedMapped => {
+                                        let last = last_aftertouch_sent_by_key
+                                            .get(&key)
+                                            .copied()
+                                            .unwrap_or(255);
+                                        if pressure != last {
                                             let ok = midi_out
                                                 .send_polytouch(out_ch, note, pressure)
                                                 .is_ok();
-                                            if ok && capture.active.load(Ordering::Relaxed) {
-                                                let last = last_aftertouch_pressure_by_key
-                                                    .get(&key)
-                                                    .copied()
-                                                    .unwrap_or(255);
-                                                if pressure != last {
-                                                    last_aftertouch_pressure_by_key
-                                                        .insert(key.clone(), pressure);
+                                            if ok {
+                                                last_aftertouch_sent_by_key
+                                                    .insert(key.clone(), pressure);
+                                                if capture.active.load(Ordering::Relaxed) {
                                                     let t_ms = start_ts
                                                         .elapsed()
                                                         .as_millis()
@@ -4961,73 +5040,6 @@ fn main() -> Result<()> {
                                                         ],
                                                     );
                                                 }
-                                            }
-                                        }
-                                        AftertouchMode::Off => {}
-                                    }
-                                }
-                            }
-
-                            vel_state.insert(
-                                key,
-                                VelState::Tracking {
-                                    started: Instant::now(),
-                                    peak: last_analog,
-                                    last_analog,
-                                    last_analog_ts,
-                                    peak_speed: 0.0,
-                                    at_level,
-                                    out_ch,
-                                    note,
-                                    playing: noteon_ok,
-                                    led,
-                                },
-                            );
-                        } else {
-                            if !no_aftertouch {
-                                match aftertouch_mode {
-                                    AftertouchMode::PeakMapped | AftertouchMode::SpeedMapped => {
-                                        let ok =
-                                            midi_out.send_polytouch(out_ch, note, pressure).is_ok();
-                                        if ok && capture.active.load(Ordering::Relaxed) {
-                                            let last = last_aftertouch_pressure_by_key
-                                                .get(&key)
-                                                .copied()
-                                                .unwrap_or(255);
-                                            if pressure != last {
-                                                last_aftertouch_pressure_by_key
-                                                    .insert(key.clone(), pressure);
-                                                let t_ms = start_ts
-                                                    .elapsed()
-                                                    .as_millis()
-                                                    .min(u64::MAX as u128)
-                                                    as u64;
-                                                capture_events_push_row(
-                                                    &capture,
-                                                    [
-                                                        t_ms.to_string(),
-                                                        String::new(),
-                                                        "AFTERTOUCH".to_string(),
-                                                        "polytouch".to_string(),
-                                                        key.0.to_string(),
-                                                        format!("{:?}", key.1),
-                                                        String::new(),
-                                                        String::new(),
-                                                        String::new(),
-                                                        String::new(),
-                                                        String::new(),
-                                                        String::new(),
-                                                        String::new(),
-                                                        out_ch.to_string(),
-                                                        note.to_string(),
-                                                        String::new(),
-                                                        pressure.to_string(),
-                                                        String::new(),
-                                                        String::new(),
-                                                        String::new(),
-                                                        "polytouch".to_string(),
-                                                    ],
-                                                );
                                             }
                                         }
                                     }
@@ -5164,6 +5176,7 @@ fn main() -> Result<()> {
                         );
                         dbg_push(&mut dbg_ring, &start_ts, cfg_line.clone());
                         midi_out.panic_all();
+                        last_aftertouch_sent_by_key.clear();
                         note_by_key.clear();
                         note_on_count.clear();
                         pending_noteoffs.clear();
