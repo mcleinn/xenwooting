@@ -1,10 +1,11 @@
-type Series = { id: string; xs: number[]; ys: number[] }
+type Series = { id: string; xs: number[]; ys: number[]; head: number }
 
 type State = {
   loadedUrl: string | null
   seriesById: Map<string, Series>
   xMin: number
   xMax: number
+  tailMs: number
 }
 
 const st: State = {
@@ -12,6 +13,7 @@ const st: State = {
   seriesById: new Map(),
   xMin: 0,
   xMax: 0,
+  tailMs: 0,
 }
 
 function lowerBound(xs: number[], x: number) {
@@ -97,12 +99,22 @@ async function loadCaptureCsv(url: string) {
       const id = `${dev}:${hid}`
       let s = st.seriesById.get(id)
       if (!s) {
-        s = { id, xs: [], ys: [] }
+        s = { id, xs: [], ys: [], head: 0 }
         st.seriesById.set(id, s)
       }
       s.xs.push(x)
       s.ys.push(analog)
       if (x > st.xMax) st.xMax = x
+
+      if (st.tailMs > 0 && st.xMax > st.tailMs) {
+        const cutoff = st.xMax - st.tailMs
+        while (s.head < s.xs.length && s.xs[s.head] < cutoff) s.head++
+        if (s.head > 20000 && s.head > (s.xs.length >> 1)) {
+          s.xs = s.xs.slice(s.head)
+          s.ys = s.ys.slice(s.head)
+          s.head = 0
+        }
+      }
     }
   }
 
@@ -120,17 +132,38 @@ async function loadCaptureCsv(url: string) {
         const id = `${dev}:${hid}`
         let s = st.seriesById.get(id)
         if (!s) {
-          s = { id, xs: [], ys: [] }
+          s = { id, xs: [], ys: [], head: 0 }
           st.seriesById.set(id, s)
         }
         s.xs.push(x)
         s.ys.push(analog)
         if (x > st.xMax) st.xMax = x
+
+        if (st.tailMs > 0 && st.xMax > st.tailMs) {
+          const cutoff = st.xMax - st.tailMs
+          while (s.head < s.xs.length && s.xs[s.head] < cutoff) s.head++
+          if (s.head > 20000 && s.head > (s.xs.length >> 1)) {
+            s.xs = s.xs.slice(s.head)
+            s.ys = s.ys.slice(s.head)
+            s.head = 0
+          }
+        }
       }
     }
   }
 
-  st.xMin = 0
+  if (st.tailMs > 0) {
+    st.xMin = Math.max(0, st.xMax - st.tailMs)
+    for (const s of st.seriesById.values()) {
+      if (s.head > 0) {
+        s.xs = s.xs.slice(s.head)
+        s.ys = s.ys.slice(s.head)
+        s.head = 0
+      }
+    }
+  } else {
+    st.xMin = 0
+  }
 }
 
 self.onmessage = async (ev: MessageEvent) => {
@@ -139,6 +172,7 @@ self.onmessage = async (ev: MessageEvent) => {
     if (msg.type === 'loadCapture') {
       const url = String(msg.url || '')
       if (!url) throw new Error('missing url')
+      st.tailMs = Number(msg.tailMs || 0)
       await loadCaptureCsv(url)
       self.postMessage({ type: 'loaded', seriesIds: Array.from(st.seriesById.keys()), xMin: st.xMin, xMax: st.xMax })
       return

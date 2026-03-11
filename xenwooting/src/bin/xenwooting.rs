@@ -12,7 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use wooting_analog_wrapper as sdk;
@@ -101,7 +101,18 @@ fn install_signal_handlers() {
 
 const C0_HZ: f64 = 16.351_597_831_287_414; // A4=440 reference, C0
 
-const LIVE_STATE_PATH: &str = "/tmp/xenwooting-live.json";
+const DEFAULT_RUNTIME_DIR: &str = "/run/xenwooting";
+
+fn env_path_buf(name: &str, default: PathBuf) -> PathBuf {
+    match std::env::var_os(name) {
+        Some(v) if !v.as_os_str().is_empty() => PathBuf::from(v),
+        _ => default,
+    }
+}
+
+fn runtime_dir() -> PathBuf {
+    env_path_buf("XENWTN_RUNTIME_DIR", PathBuf::from(DEFAULT_RUNTIME_DIR))
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct LiveLayout {
@@ -135,6 +146,307 @@ struct LiveState {
     layout_pitches: HashMap<String, Vec<Option<i32>>>,
 }
 
+fn compute_layout_pitches(
+    wtn: &Wtn,
+    edo: i32,
+    pitch_offset: i32,
+    octave_shift: i8,
+) -> HashMap<String, Vec<Option<i32>>> {
+    let mut out: HashMap<String, Vec<Option<i32>>> = HashMap::new();
+    for board in 0..=1u8 {
+        let mut pitches: Vec<Option<i32>> = Vec::with_capacity(56);
+        for idx in 0..56usize {
+            let Some(cell) = wtn.cell(board, idx) else {
+                pitches.push(None);
+                continue;
+            };
+            let base_ch = (cell.chan_1based.saturating_sub(1)) as i16;
+            let shifted = base_ch + (octave_shift as i16);
+            let out_ch = shifted.clamp(0, 15) as i32;
+            let pitch = out_ch * edo + (cell.key as i32) + pitch_offset;
+            pitches.push(Some(pitch));
+        }
+        out.insert(format!("Board{}", board), pitches);
+    }
+    out
+}
+
+struct LivePublisher {
+    seq: u64,
+    last_hash: u64,
+    last_publish_mode: Instant,
+    last_publish_pressed: Instant,
+    dirty_mode: bool,
+    dirty_pressed: bool,
+    layout_key: String,
+    layout_pitches: HashMap<String, Vec<Option<i32>>>,
+    layout_pitches_hash: u64,
+}
+
+struct LiveWriterSlot {
+    gen: u64,
+    pending: Option<LiveState>,
+}
+
+#[derive(Clone)]
+struct LiveWriter {
+    inner: Arc<(Mutex<LiveWriterSlot>, Condvar)>,
+}
+
+impl LiveWriter {
+    fn new(path: PathBuf) -> Self {
+        let inner = Arc::new((
+            Mutex::new(LiveWriterSlot {
+                gen: 0,
+                pending: None,
+            }),
+            Condvar::new(),
+        ));
+        let inner2 = inner.clone();
+
+        // Ensure the parent directory exists (tmpfs); best-effort.
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        std::thread::Builder::new()
+            .name("live-writer".to_string())
+            .spawn(move || {
+                let mut last_gen: u64 = 0;
+                loop {
+                    let st_opt = {
+                        let (lock, cv) = &*inner2;
+                        let mut slot = lock.lock().unwrap();
+                        while slot.gen == last_gen && slot.pending.is_none() {
+                            slot = cv.wait(slot).unwrap();
+                        }
+                        last_gen = slot.gen;
+                        slot.pending.take()
+                    };
+
+                    let Some(st) = st_opt else {
+                        continue;
+                    };
+
+                    let text = match serde_json::to_string(&st) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!("live state json encode failed: {e:?}");
+                            continue;
+                        }
+                    };
+
+                    let t0 = Instant::now();
+                    if let Err(e) = write_file_atomic(&path, &text) {
+                        warn!("live state write failed path={} err={e:?}", path.display());
+                    }
+                    let ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    if ms >= 10 {
+                        info!("LIVE_WRITE_SLOW ms={}", ms);
+                    }
+                }
+            })
+            .ok();
+
+        Self { inner }
+    }
+
+    fn submit(&self, st: LiveState) {
+        let (lock, cv) = &*self.inner;
+        if let Ok(mut slot) = lock.lock() {
+            slot.gen = slot.gen.wrapping_add(1);
+            slot.pending = Some(st);
+            cv.notify_one();
+        }
+    }
+}
+
+impl LivePublisher {
+    fn new() -> Self {
+        Self {
+            seq: 0,
+            last_hash: 0,
+            last_publish_mode: Instant::now() - Duration::from_secs(999),
+            last_publish_pressed: Instant::now() - Duration::from_secs(999),
+            dirty_mode: true,
+            dirty_pressed: true,
+            layout_key: String::new(),
+            layout_pitches: HashMap::new(),
+            layout_pitches_hash: 0,
+        }
+    }
+
+    fn mark_mode_dirty(&mut self) {
+        self.dirty_mode = true;
+    }
+
+    fn mark_layout_dirty(&mut self) {
+        // Force a layout_pitches recompute even if the layout id/shift is unchanged.
+        // Needed when the active WTN mapping changes (preview reload, on-disk reload).
+        self.dirty_mode = true;
+        self.layout_key.clear();
+    }
+
+    fn mark_pressed_dirty(&mut self) {
+        self.dirty_pressed = true;
+    }
+
+    fn maybe_publish(
+        &mut self,
+        live_writer: &LiveWriter,
+        wtn: &Wtn,
+        layouts: &Vec<xenwooting::config::LayoutConfig>,
+        layout_index: usize,
+        press_threshold_bits: &AtomicU32,
+        aftertouch_mode: &AftertouchMode,
+        aftertouch_speed_max: f32,
+        octave_shift: i8,
+        screensaver_active: bool,
+        preview_enabled: bool,
+        guide_mode: GuideMode,
+        guide_chord_key: &Option<String>,
+        guide_root_pc: Option<i32>,
+        pressed0: &HashSet<i32>,
+        pressed1: &HashSet<i32>,
+    ) {
+        if !self.dirty_mode && !self.dirty_pressed {
+            return;
+        }
+
+        // Rate-limit pressed updates (coalesce rapid changes).
+        if self.dirty_pressed && self.last_publish_pressed.elapsed() < Duration::from_millis(33) {
+            return;
+        }
+
+        let layout = match layouts.get(layout_index) {
+            Some(v) => v,
+            None => return,
+        };
+        let edo = layout.edo_divisions;
+        let pitch_offset = layout.pitch_offset;
+
+        // Recompute layout pitch list only when layout/shift changes.
+        let cur_layout_key = format!(
+            "{}:{}:{}:{}",
+            layout.id, layout.edo_divisions, layout.pitch_offset, octave_shift
+        );
+        if cur_layout_key != self.layout_key {
+            self.layout_key = cur_layout_key;
+            self.layout_pitches = compute_layout_pitches(wtn, edo, pitch_offset, octave_shift);
+            let mut hh = std::collections::hash_map::DefaultHasher::new();
+            for k in ["Board0", "Board1"] {
+                hh.write(k.as_bytes());
+                if let Some(v) = self.layout_pitches.get(k) {
+                    for x in v.iter() {
+                        match x {
+                            Some(n) => hh.write_i32(*n),
+                            None => hh.write_i32(i32::MIN),
+                        }
+                    }
+                }
+            }
+            self.layout_pitches_hash = hh.finish();
+            self.dirty_mode = true;
+        }
+
+        let mut v0: Vec<i32> = pressed0.iter().copied().collect();
+        let mut v1: Vec<i32> = pressed1.iter().copied().collect();
+        v0.sort();
+        v1.sort();
+
+        let mut pressed: HashMap<String, Vec<i32>> = HashMap::new();
+        pressed.insert("Board0".to_string(), v0);
+        pressed.insert("Board1".to_string(), v1);
+
+        let press_threshold = f32::from_bits(press_threshold_bits.load(Ordering::Relaxed));
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write(self.layout_key.as_bytes());
+        hasher.write_u64(self.layout_pitches_hash);
+        hasher.write_u32(press_threshold.to_bits());
+        hasher.write(aftertouch_mode.name().as_bytes());
+        hasher.write_u32(aftertouch_speed_max.to_bits());
+        hasher.write_i8(octave_shift);
+        hasher.write_u8(if screensaver_active { 1 } else { 0 });
+        hasher.write_u8(if preview_enabled { 1 } else { 0 });
+        hasher.write_u8(match guide_mode {
+            GuideMode::Off => 0,
+            GuideMode::WaitRoot => 1,
+            GuideMode::Active => 2,
+        });
+        if let Some(k) = guide_chord_key {
+            hasher.write(k.as_bytes());
+        }
+        hasher.write_i32(guide_root_pc.unwrap_or(i32::MIN));
+        for p in pressed.get("Board0").into_iter().flatten() {
+            hasher.write_i32(*p);
+        }
+        hasher.write_u8(0);
+        for p in pressed.get("Board1").into_iter().flatten() {
+            hasher.write_i32(*p);
+        }
+        let h = hasher.finish();
+        if h == self.last_hash {
+            self.dirty_mode = false;
+            self.dirty_pressed = false;
+            return;
+        }
+
+        if self.dirty_mode && self.last_publish_mode.elapsed() < Duration::from_millis(15) {
+            return;
+        }
+
+        if self.dirty_pressed {
+            self.last_publish_pressed = Instant::now();
+        }
+        if self.dirty_mode {
+            self.last_publish_mode = Instant::now();
+        }
+
+        self.last_hash = h;
+        self.seq = self.seq.wrapping_add(1);
+
+        let ts_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let state = LiveState {
+            version: 1,
+            seq: self.seq,
+            ts_ms,
+            layout: LiveLayout {
+                id: layout.id.clone(),
+                name: layout.name.clone(),
+                edo,
+                pitch_offset,
+            },
+            mode: LiveMode {
+                press_threshold,
+                aftertouch: aftertouch_mode.name().to_string(),
+                aftertouch_speed_max,
+                octave_shift,
+                screensaver_active,
+                preview_enabled,
+                guide_mode: match guide_mode {
+                    GuideMode::Off => "off".to_string(),
+                    GuideMode::WaitRoot => "wait_root".to_string(),
+                    GuideMode::Active => "active".to_string(),
+                },
+                guide_chord_key: guide_chord_key.clone(),
+                guide_root_pc,
+            },
+            pressed,
+            layout_pitches: self.layout_pitches.clone(),
+        };
+
+        live_writer.submit(state);
+
+        self.dirty_mode = false;
+        self.dirty_pressed = false;
+    }
+}
+
 fn write_file_atomic(path: &Path, text: &str) -> Result<()> {
     let tmp = PathBuf::from(format!(
         "{}.tmp-{}-{}",
@@ -149,7 +461,7 @@ fn write_file_atomic(path: &Path, text: &str) -> Result<()> {
         let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(text.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
-        let _ = f.sync_all();
+        // Do not fsync for HUD state; it can stall the realtime loop.
     }
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
@@ -344,9 +656,9 @@ struct CaptureSamplesState {
     cfg_line: String,
     out_dir: PathBuf,
 
-    // Fixed-size ring buffer for samples. Each sample is 16 bytes:
-    // [t_us:u32][device_id:u64][hid_u8:u8][pad:u8][analog_q:u16]
-    // Total: 4+8+1+1+2 = 16
+    // Fixed-size ring buffer for samples. Each sample is 20 bytes:
+    // [t_us:u64][device_id:u64][hid_u8:u8][pad:u8][analog_q:u16]
+    // Total: 8+8+1+1+2 = 20
     ring: Vec<u8>,
     write_idx: u32,
     wrapped: bool,
@@ -371,13 +683,14 @@ struct CaptureShared {
     samples: Mutex<Option<CaptureSamplesState>>,
     events: Mutex<Option<CaptureEventsState>>,
     lock_drops: std::sync::atomic::AtomicU64,
+    lag_ms: std::sync::atomic::AtomicU64,
 }
 
-const CAPTURE_REC_BYTES: usize = 16;
+const CAPTURE_REC_BYTES: usize = 20;
 
 fn capture_write_sample(
     st: &mut CaptureSamplesState,
-    t_us: u32,
+    t_us: u64,
     device_id: u64,
     hid: u8,
     analog_q: u16,
@@ -392,11 +705,11 @@ fn capture_write_sample(
     let idx = st.write_idx % cap_recs;
     let off = (idx as usize) * CAPTURE_REC_BYTES;
 
-    st.ring[off..off + 4].copy_from_slice(&t_us.to_le_bytes());
-    st.ring[off + 4..off + 12].copy_from_slice(&device_id.to_le_bytes());
-    st.ring[off + 12] = hid;
-    st.ring[off + 13] = 0u8;
-    st.ring[off + 14..off + 16].copy_from_slice(&analog_q.to_le_bytes());
+    st.ring[off..off + 8].copy_from_slice(&t_us.to_le_bytes());
+    st.ring[off + 8..off + 16].copy_from_slice(&device_id.to_le_bytes());
+    st.ring[off + 16] = hid;
+    st.ring[off + 17] = 0u8;
+    st.ring[off + 18..off + 20].copy_from_slice(&analog_q.to_le_bytes());
 
     st.write_idx = st.write_idx.wrapping_add(1);
     if !st.wrapped && st.write_idx >= cap_recs {
@@ -476,10 +789,10 @@ fn capture_stop_and_flush(
         for i in 0..count {
             let idx = (start_idx + i) % cap_recs;
             let off = idx * CAPTURE_REC_BYTES;
-            let t_us = u32::from_le_bytes(st.ring[off..off + 4].try_into().unwrap());
-            let dev = u64::from_le_bytes(st.ring[off + 4..off + 12].try_into().unwrap());
-            let hid_u8 = st.ring[off + 12];
-            let analog_q = u16::from_le_bytes(st.ring[off + 14..off + 16].try_into().unwrap());
+            let t_us = u64::from_le_bytes(st.ring[off..off + 8].try_into().unwrap());
+            let dev = u64::from_le_bytes(st.ring[off + 8..off + 16].try_into().unwrap());
+            let hid_u8 = st.ring[off + 16];
+            let analog_q = u16::from_le_bytes(st.ring[off + 18..off + 20].try_into().unwrap());
             let analog = (analog_q as f32) / 65535.0;
             let hid = HIDCodes::from_u8(hid_u8)
                 .map(|h| format!("{h:?}"))
@@ -512,7 +825,7 @@ fn capture_stop_and_flush(
             use std::io::Write;
             let mut f = std::io::BufWriter::new(std::fs::File::create(&dump_csv_path)?);
             // Keep manual-dump columns compatible; add t_cap_ms + pressure.
-            writeln!(f, "t_ms,t_cap_ms,event,kind,device_id,hid,analog,age_ms,peak,last,peak_speed,pressed,playing,ch,note,vel,pressure,delta,thr_down,thr_up,msg")?;
+            writeln!(f, "t_ms,t_cap_ms,event,kind,device_id,hid,analog,age_ms,peak,last,peak_speed,pressed,playing,ch,note,vel,pressure,delta,thr_down,thr_up,edge_t_cap_ms,send_delay_ms,lag_ms,msg")?;
             for line in ev.csv_lines {
                 writeln!(f, "{}", line)?;
             }
@@ -790,7 +1103,17 @@ fn csv_escape(s: &str) -> String {
     out
 }
 
-fn capture_events_push_row_at(capture: &Arc<CaptureShared>, when: Instant, mut row: [String; 21]) {
+fn capture_events_push_row_at(capture: &Arc<CaptureShared>, when: Instant, row: [String; 24]) {
+    capture_events_push_row_meta_at(capture, when, None, None, row)
+}
+
+fn capture_events_push_row_meta_at(
+    capture: &Arc<CaptureShared>,
+    when: Instant,
+    edge_when: Option<Instant>,
+    lag_ms: Option<u64>,
+    mut row: [String; 24],
+) {
     if !capture.active.load(Ordering::Relaxed) {
         return;
     }
@@ -811,12 +1134,38 @@ fn capture_events_push_row_at(capture: &Arc<CaptureShared>, when: Instant, mut r
         .min(u64::MAX as u128) as u64;
     row[1] = t_cap_ms.to_string();
 
+    // Optional: associate this row with an edge/scheduled time.
+    if let Some(edge_when) = edge_when {
+        if edge_when >= ev.start {
+            let edge_t_cap_ms = edge_when
+                .duration_since(ev.start)
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            row[20] = edge_t_cap_ms.to_string();
+            if t_cap_ms >= edge_t_cap_ms {
+                row[21] = (t_cap_ms - edge_t_cap_ms).to_string();
+            } else {
+                row[21] = String::new();
+            }
+        }
+    }
+
+    // Always set lag_ms.
+    // Prefer explicit lag; else fall back to send_delay_ms; else use the current capture-wide lag.
+    if let Some(lag_ms) = lag_ms {
+        row[22] = lag_ms.to_string();
+    } else if !row[21].is_empty() {
+        row[22] = row[21].clone();
+    } else {
+        row[22] = capture.lag_ms.load(Ordering::Relaxed).to_string();
+    }
+
     // CSV-escape everything; caller provides numeric strings too.
     let line: Vec<String> = row.iter().map(|s| csv_escape(s)).collect();
     ev.csv_lines.push(line.join(","));
 }
 
-fn capture_events_push_row(capture: &Arc<CaptureShared>, row: [String; 21]) {
+fn capture_events_push_row(capture: &Arc<CaptureShared>, row: [String; 24]) {
     capture_events_push_row_at(capture, Instant::now(), row)
 }
 
@@ -1424,12 +1773,17 @@ fn main() -> Result<()> {
         .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
     let mut last_cfg_check = Instant::now();
 
-    // Webconfigurator preview mode (temporary mapping without saving).
-    let preview_enabled_path = PathBuf::from("/tmp/xenwooting-preview.enabled");
-    let preview_wtn_path = PathBuf::from("/tmp/xenwooting-preview.wtn");
-    let trainer_mode_path = PathBuf::from("/tmp/xenwooting-trainer.mode");
-    let guide_path = PathBuf::from("/tmp/xenwooting-guide.json");
-    let highlight_path = PathBuf::from("/tmp/xenwooting-highlight.txt");
+    // Webconfigurator control plane files (tmpfs).
+    let rt_dir = runtime_dir();
+    let _ = fs::create_dir_all(&rt_dir);
+    let preview_enabled_path = env_path_buf(
+        "XENWTN_PREVIEW_ENABLED_PATH",
+        rt_dir.join("preview.enabled"),
+    );
+    let preview_wtn_path = env_path_buf("XENWTN_PREVIEW_WTN_PATH", rt_dir.join("preview.wtn"));
+    let trainer_mode_path = env_path_buf("XENWTN_TRAINER_MODE_PATH", rt_dir.join("trainer.mode"));
+    let guide_path = env_path_buf("XENWTN_GUIDE_PATH", rt_dir.join("guide.json"));
+    let highlight_path = env_path_buf("XENWTN_HIGHLIGHT_PATH", rt_dir.join("highlight.txt"));
     let mut preview_enabled = false;
     let mut preview_layout_id: Option<String> = None;
 
@@ -1612,6 +1966,7 @@ fn main() -> Result<()> {
         samples: Mutex::new(None),
         events: Mutex::new(None),
         lock_drops: AtomicU64::new(0),
+        lag_ms: AtomicU64::new(0),
     });
     let capture_poll = Arc::clone(&capture);
     std::thread::spawn(move || {
@@ -2026,8 +2381,8 @@ fn main() -> Result<()> {
                                         let t_us = now
                                             .duration_since(st.start)
                                             .as_micros()
-                                            .min(u32::MAX as u128)
-                                            as u32;
+                                            .min(u64::MAX as u128)
+                                            as u64;
 
                                         let mut analog_by_code: [f32; 256] = [0.0; 256];
                                         for (code_u16, analog) in data.iter() {
@@ -2611,6 +2966,11 @@ fn main() -> Result<()> {
     // Peak-tracked velocity state per key (device_id + HID).
     let mut vel_state: HashMap<(u64, HIDCodes), VelState> = HashMap::new();
 
+    // Pressed/playing pitches per key for the HUD. Updated incrementally on MIDI note on/off.
+    let mut hud_pitch_by_key: HashMap<(u64, HIDCodes), i32> = HashMap::new();
+    let mut hud_pressed0: HashSet<i32> = HashSet::new();
+    let mut hud_pressed1: HashSet<i32> = HashSet::new();
+
     // Robust note tracking so NoteOff does not depend on vel_state being present.
     let mut note_by_key: HashMap<(u64, HIDCodes), (u8, u8)> = HashMap::new();
     let mut note_on_count: HashMap<(u8, u8), u32> = HashMap::new();
@@ -2621,190 +2981,9 @@ fn main() -> Result<()> {
     let mut last_aftertouch_sent_by_key: HashMap<(u64, HIDCodes), u8> = HashMap::new();
 
     // Live HUD state published for /wtn/live.
-    let live_state_path = PathBuf::from(LIVE_STATE_PATH);
-    let mut live_seq: u64 = 0;
-    let mut live_last_ts_ms: u64 = 0;
-    let mut live_last_publish = Instant::now();
-    let mut live_last_hash: u64 = 0;
-    let mut live_layout_key: String = String::new();
-    let mut live_layout_pitches: HashMap<String, Vec<Option<i32>>> = HashMap::new();
-    let mut live_layout_pitches_hash: u64 = 0;
-
-    let compute_layout_pitches = |wtn: &Wtn,
-                                  edo: i32,
-                                  pitch_offset: i32,
-                                  octave_shift: i8|
-     -> HashMap<String, Vec<Option<i32>>> {
-        let mut out: HashMap<String, Vec<Option<i32>>> = HashMap::new();
-        for board in 0..=1u8 {
-            let mut pitches: Vec<Option<i32>> = Vec::with_capacity(56);
-            for idx in 0..56usize {
-                let Some(cell) = wtn.cell(board, idx) else {
-                    pitches.push(None);
-                    continue;
-                };
-                let base_ch = (cell.chan_1based.saturating_sub(1)) as i16;
-                let shifted = base_ch + (octave_shift as i16);
-                let out_ch = shifted.clamp(0, 15) as i32;
-                let pitch = out_ch * edo + (cell.key as i32) + pitch_offset;
-                pitches.push(Some(pitch));
-            }
-            out.insert(format!("Board{}", board), pitches);
-        }
-        out
-    };
-
-    let mut publish_live =
-        |wtn: &Wtn,
-         layouts: &Vec<xenwooting::config::LayoutConfig>,
-         layout_index: usize,
-         press_threshold_bits: &AtomicU32,
-         aftertouch_mode: &AftertouchMode,
-         aftertouch_speed_max: f32,
-         octave_shift: i8,
-         screensaver_active: bool,
-         preview_enabled: bool,
-         guide_mode: GuideMode,
-         guide_chord_key: &Option<String>,
-         guide_root_pc: Option<i32>,
-         board_by_device: &HashMap<u64, xenwooting::config::BoardConfig>,
-         vel_state: &HashMap<(u64, HIDCodes), VelState>| {
-            let layout = match layouts.get(layout_index) {
-                Some(v) => v,
-                None => return,
-            };
-            let edo = layout.edo_divisions;
-            let pitch_offset = layout.pitch_offset;
-
-            // Recompute layout pitch list only when layout/shift changes.
-            let cur_layout_key = format!(
-                "{}:{}:{}:{}",
-                layout.id, layout.edo_divisions, layout.pitch_offset, octave_shift
-            );
-            if cur_layout_key != live_layout_key {
-                live_layout_key = cur_layout_key;
-                live_layout_pitches = compute_layout_pitches(wtn, edo, pitch_offset, octave_shift);
-                let mut hh = std::collections::hash_map::DefaultHasher::new();
-                for k in ["Board0", "Board1"] {
-                    hh.write(k.as_bytes());
-                    if let Some(v) = live_layout_pitches.get(k) {
-                        for x in v.iter() {
-                            match x {
-                                Some(n) => hh.write_i32(*n),
-                                None => hh.write_i32(i32::MIN),
-                            }
-                        }
-                    }
-                }
-                live_layout_pitches_hash = hh.finish();
-            }
-
-            let mut pressed0: HashSet<i32> = HashSet::new();
-            let mut pressed1: HashSet<i32> = HashSet::new();
-            for ((device_id, _hid), st) in vel_state.iter() {
-                let Some(bcfg) = board_by_device.get(device_id) else {
-                    continue;
-                };
-                let (out_ch, note) = match st {
-                    VelState::Tracking { out_ch, note, .. } => (*out_ch, *note),
-                };
-                let pitch = (out_ch as i32) * edo + (note as i32) + pitch_offset;
-                if bcfg.wtn_board == 0 {
-                    pressed0.insert(pitch);
-                } else if bcfg.wtn_board == 1 {
-                    pressed1.insert(pitch);
-                }
-            }
-
-            let mut v0: Vec<i32> = pressed0.into_iter().collect();
-            let mut v1: Vec<i32> = pressed1.into_iter().collect();
-            v0.sort();
-            v1.sort();
-
-            let mut pressed: HashMap<String, Vec<i32>> = HashMap::new();
-            pressed.insert("Board0".to_string(), v0);
-            pressed.insert("Board1".to_string(), v1);
-
-            let press_threshold = f32::from_bits(press_threshold_bits.load(Ordering::Relaxed));
-
-            // Hash only the meaningful content; ts_ms/seq should not cause spurious updates.
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            hasher.write(live_layout_key.as_bytes());
-            hasher.write_u64(live_layout_pitches_hash);
-            hasher.write_u32(press_threshold.to_bits());
-            hasher.write(aftertouch_mode.name().as_bytes());
-            hasher.write_u32(aftertouch_speed_max.to_bits());
-            hasher.write_i8(octave_shift);
-            hasher.write_u8(if screensaver_active { 1 } else { 0 });
-            hasher.write_u8(if preview_enabled { 1 } else { 0 });
-            hasher.write_u8(match guide_mode {
-                GuideMode::Off => 0,
-                GuideMode::WaitRoot => 1,
-                GuideMode::Active => 2,
-            });
-            if let Some(k) = guide_chord_key {
-                hasher.write(k.as_bytes());
-            }
-            hasher.write_i32(guide_root_pc.unwrap_or(i32::MIN));
-            for p in pressed.get("Board0").into_iter().flatten() {
-                hasher.write_i32(*p);
-            }
-            hasher.write_u8(0);
-            for p in pressed.get("Board1").into_iter().flatten() {
-                hasher.write_i32(*p);
-            }
-            let h = hasher.finish();
-            if h == live_last_hash {
-                return;
-            }
-
-            // Don't write too frequently if something is oscillating.
-            if live_last_publish.elapsed() < Duration::from_millis(15) {
-                return;
-            }
-            live_last_publish = Instant::now();
-            live_last_hash = h;
-            live_seq = live_seq.wrapping_add(1);
-            live_last_ts_ms = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            let state = LiveState {
-                version: 1,
-                seq: live_seq,
-                ts_ms: live_last_ts_ms,
-                layout: LiveLayout {
-                    id: layout.id.clone(),
-                    name: layout.name.clone(),
-                    edo,
-                    pitch_offset,
-                },
-                mode: LiveMode {
-                    press_threshold,
-                    aftertouch: aftertouch_mode.name().to_string(),
-                    aftertouch_speed_max,
-                    octave_shift,
-                    screensaver_active,
-                    preview_enabled,
-                    guide_mode: match guide_mode {
-                        GuideMode::Off => "off".to_string(),
-                        GuideMode::WaitRoot => "wait_root".to_string(),
-                        GuideMode::Active => "active".to_string(),
-                    },
-                    guide_chord_key: guide_chord_key.clone(),
-                    guide_root_pc,
-                },
-                pressed,
-                layout_pitches: live_layout_pitches.clone(),
-            };
-
-            let text = match serde_json::to_string(&state) {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            let _ = write_file_atomic(&live_state_path, &text);
-        };
+    let live_state_path = env_path_buf("XENWTN_LIVE_STATE_PATH", rt_dir.join("live.json"));
+    let live_writer = LiveWriter::new(live_state_path.clone());
+    let mut live_pub = LivePublisher::new();
 
     // RGB screensaver: blank LEDs after inactivity; wake on next key-down.
     // The wake key-down is ignored (no MIDI, no action binding).
@@ -2907,7 +3086,8 @@ fn main() -> Result<()> {
     };
 
     // Publish an initial live state so /wtn/live can load immediately.
-    publish_live(
+    live_pub.maybe_publish(
+        &live_writer,
         &wtn,
         &layouts,
         layout_index,
@@ -2920,12 +3100,18 @@ fn main() -> Result<()> {
         guide_mode,
         &guide_chord_key,
         guide_root_pc,
-        &board_by_device,
-        &vel_state,
+        &hud_pressed0,
+        &hud_pressed1,
     );
 
+    // Rate-limit lag logging to avoid adding load.
+    let mut last_lag_log = Instant::now() - Duration::from_secs(999);
+
     while RUNNING.load(Ordering::SeqCst) {
-        publish_live(
+        // Publish live HUD only when dirty.
+        let live_t0 = Instant::now();
+        live_pub.maybe_publish(
+            &live_writer,
             &wtn,
             &layouts,
             layout_index,
@@ -2938,9 +3124,13 @@ fn main() -> Result<()> {
             guide_mode,
             &guide_chord_key,
             guide_root_pc,
-            &board_by_device,
-            &vel_state,
+            &hud_pressed0,
+            &hud_pressed1,
         );
+        let live_ms = live_t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if live_ms >= 10 {
+            info!("LIVE_SLOW ms={}", live_ms);
+        }
         // If a keyboard is plugged/unplugged, RGB device indices become available/change.
         // Repaint the base LEDs so newly connected boards immediately show the current layout.
         if rgb_enabled && last_rgb_check.elapsed() >= Duration::from_millis(250) {
@@ -2965,7 +3155,13 @@ fn main() -> Result<()> {
 
         if last_cfg_dev_check.elapsed() >= Duration::from_millis(500) {
             last_cfg_dev_check = Instant::now();
-            if let Ok(devs) = sdk::get_connected_devices_info(32).0 {
+            let t0 = Instant::now();
+            let devs_res = sdk::get_connected_devices_info(32).0;
+            let ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            if ms >= 10 {
+                info!("CFG_DEV_SLOW ms={}", ms);
+            }
+            if let Ok(devs) = devs_res {
                 let now: HashSet<u64> = devs
                     .iter()
                     .map(|d| d.device_id)
@@ -2992,15 +3188,28 @@ fn main() -> Result<()> {
         // Reload layout list when config.toml changes (no service restart).
         if last_cfg_check.elapsed() >= Duration::from_millis(500) {
             last_cfg_check = Instant::now();
-            if let Ok(meta) = fs::metadata(&cfg_path) {
+            let t0 = Instant::now();
+            let meta_res = fs::metadata(&cfg_path);
+            let meta_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            if meta_ms >= 10 {
+                info!("CFG_META_SLOW ms={}", meta_ms);
+            }
+            if let Ok(meta) = meta_res {
                 let modified = meta.modified().ok();
                 let sig_now = modified.map(|t| (t, meta.len()));
                 let changed = sig_now.is_some() && sig_now != cfg_sig;
                 if changed {
                     cfg_sig = sig_now;
                     let cur_id = layouts.get(layout_index).map(|l| l.id.clone());
-                    match load_config() {
+                    let t1 = Instant::now();
+                    let cfg_res = load_config();
+                    let cfg_ms = t1.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    if cfg_ms >= 10 {
+                        info!("CFG_LOAD_SLOW ms={}", cfg_ms);
+                    }
+                    match cfg_res {
                         Ok(new_cfg) => {
+                            live_pub.mark_mode_dirty();
                             if new_cfg.layouts.is_empty() {
                                 eprintln!(
                                     "config reload: layouts empty; keeping previous layout list"
@@ -3044,15 +3253,32 @@ fn main() -> Result<()> {
                                     // Apply changes without crashing the daemon.
                                     let mut ok = true;
 
-                                    if let Err(e) = set_mts_table(&master, &new_layouts[new_index])
-                                    {
+                                    let t_set = Instant::now();
+                                    let set_res = set_mts_table(&master, &new_layouts[new_index]);
+                                    let set_ms =
+                                        t_set.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                                    if set_ms >= 10 {
+                                        info!("CFG_SETMTS_SLOW ms={}", set_ms);
+                                    }
+                                    if let Err(e) = set_res {
                                         eprintln!("config reload: set_mts_table failed: {e}");
                                         ok = false;
                                     }
 
                                     let new_wtn_path =
                                         resolve_path(&new_layouts[new_index].wtn_path);
-                                    let new_base = match Wtn::load(&new_wtn_path) {
+                                    let t_load = Instant::now();
+                                    let load_res = Wtn::load(&new_wtn_path);
+                                    let load_ms =
+                                        t_load.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                                    if load_ms >= 10 {
+                                        info!(
+                                            "CFG_WTNLOAD_SLOW ms={} path={}",
+                                            load_ms,
+                                            new_wtn_path.display()
+                                        );
+                                    }
+                                    let new_base = match load_res {
                                         Ok(v) => v,
                                         Err(e) => {
                                             eprintln!(
@@ -3073,6 +3299,7 @@ fn main() -> Result<()> {
                                             fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
                                         wtn_mtime = base_wtn_mtime;
                                         wtn = base_wtn.clone();
+                                        live_pub.mark_layout_dirty();
                                         let edo = layouts[layout_index].edo_divisions;
                                         let pitch_offset = layouts[layout_index].pitch_offset;
                                         refresh_vel_led_bases(
@@ -3111,7 +3338,7 @@ fn main() -> Result<()> {
         // Preview mode and .wtn reloading.
         //
         // - Base (on-disk) wtn is always reloaded into `base_wtn`.
-        // - If preview is enabled, `wtn` is loaded from /tmp/xenwooting-preview.wtn.
+        // - If preview is enabled, `wtn` is loaded from the preview file on tmpfs.
         // - Leaving preview restores `wtn = base_wtn`.
         if last_wtn_check.elapsed() >= Duration::from_millis(200) {
             last_wtn_check = Instant::now();
@@ -3183,6 +3410,7 @@ fn main() -> Result<()> {
                                         base_wtn_mtime =
                                             fs::metadata(&wtn_path).and_then(|m| m.modified()).ok();
                                         wtn = base_wtn.clone();
+                                        live_pub.mark_layout_dirty();
                                         refresh_vel_led_bases(
                                             &wtn,
                                             &mut vel_state,
@@ -3203,6 +3431,7 @@ fn main() -> Result<()> {
                                 info!("RGB screensaver: wake (guide enabled)");
                                 screensaver_active = false;
                             }
+                            live_pub.mark_mode_dirty();
                             paint_guide(
                                 &wtn,
                                 &rgb_index_by_device_id,
@@ -3231,6 +3460,7 @@ fn main() -> Result<()> {
                             guide_pcs_root.clear();
                             guide_pcs_abs.clear();
                             guide_root_pc = None;
+                            live_pub.mark_mode_dirty();
                             if !screensaver_active {
                                 paint_base(
                                     &wtn,
@@ -3254,6 +3484,7 @@ fn main() -> Result<()> {
                             guide_pcs_root.clear();
                             guide_pcs_abs.clear();
                             guide_root_pc = None;
+                            live_pub.mark_mode_dirty();
                             if !screensaver_active {
                                 paint_base(
                                     &wtn,
@@ -3287,6 +3518,7 @@ fn main() -> Result<()> {
                             if !preview_enabled {
                                 wtn = base_wtn.clone();
                                 wtn_mtime = base_wtn_mtime;
+                                live_pub.mark_layout_dirty();
                                 let edo = layouts[layout_index].edo_divisions;
                                 let pitch_offset = layouts[layout_index].pitch_offset;
                                 refresh_vel_led_bases(
@@ -3333,6 +3565,7 @@ fn main() -> Result<()> {
             if enabled_now != preview_enabled || layout_now != preview_layout_id {
                 preview_enabled = enabled_now;
                 preview_layout_id = layout_now.clone();
+                live_pub.mark_mode_dirty();
 
                 if preview_enabled {
                     // Treat preview as activity (prevents screensaver from immediately blanking).
@@ -3369,6 +3602,7 @@ fn main() -> Result<()> {
                     wtn = base_wtn.clone();
                     wtn_mtime = base_wtn_mtime;
                     preview_wtn_mtime = None;
+                    live_pub.mark_layout_dirty();
                     let edo = layouts[layout_index].edo_divisions;
                     let pitch_offset = layouts[layout_index].pitch_offset;
                     refresh_vel_led_bases(
@@ -3408,6 +3642,7 @@ fn main() -> Result<()> {
                             Ok(new_wtn) => {
                                 wtn = new_wtn;
                                 preview_wtn_mtime = Some(modified);
+                                live_pub.mark_layout_dirty();
                                 // Treat preview updates as activity.
                                 last_activity = Instant::now();
                                 if screensaver_active {
@@ -3615,6 +3850,19 @@ fn main() -> Result<()> {
             }
         }
 
+        // Lag monitoring (rate-limited): how far behind we are processing edges.
+        let mut edge_lag_max_ms: u64 = 0;
+        let mut edge_lag_over_50ms: u64 = 0;
+        let mut edge_lag_over_200ms: u64 = 0;
+        let mut edge_cnt: u64 = 0;
+        let mut edge_cnt_updates: u64 = 0;
+        let mut edge_cnt_downup: u64 = 0;
+
+        // Capture dump row counters (helps identify lag sources without heavy profiling).
+        let mut cap_rows_edge: u64 = 0;
+        let mut cap_rows_midi: u64 = 0;
+        let mut cap_rows_aftertouch: u64 = 0;
+
         let thr_down =
             f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
         let thr_up = (thr_down - CAPTURE_RELEASE_HYSTERESIS).clamp(0.0, 0.99);
@@ -3634,6 +3882,8 @@ fn main() -> Result<()> {
             cfg.rgb.screensaver_timeout_sec
         );
 
+        let edge_t0 = Instant::now();
+        let loop_now = edge_t0;
         for edge in edges {
             let (device_id, hid, analog, kind, ts) = match edge {
                 KeyEdge::Down {
@@ -3657,6 +3907,29 @@ fn main() -> Result<()> {
             };
 
             let key_id = (device_id, hid.clone());
+
+            // Track processing lag relative to the edge timestamp.
+            edge_cnt += 1;
+            if kind == "update" {
+                edge_cnt_updates += 1;
+            } else {
+                edge_cnt_downup += 1;
+            }
+            if loop_now > ts {
+                let lag_ms = loop_now
+                    .duration_since(ts)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                if lag_ms > edge_lag_max_ms {
+                    edge_lag_max_ms = lag_ms;
+                }
+                if lag_ms >= 50 {
+                    edge_lag_over_50ms += 1;
+                }
+                if lag_ms >= 200 {
+                    edge_lag_over_200ms += 1;
+                }
+            }
 
             // Count only down/up as inactivity-resetting activity.
             // Update edges can be noisy due to analog jitter and should not prevent blanking.
@@ -3685,6 +3958,7 @@ fn main() -> Result<()> {
                     &aftertouch_mode,
                 );
                 screensaver_active = false;
+                live_pub.mark_mode_dirty();
                 suppressed_keys.insert(key_id.clone());
                 dbg_push(
                     &mut dbg_ring,
@@ -4040,6 +4314,7 @@ fn main() -> Result<()> {
                                 .clamp(1.0, 1000.0);
                             info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
                         }
+                        live_pub.mark_mode_dirty();
                         continue;
                     }
                     HIDCodes::RightCtrl => {
@@ -4056,6 +4331,7 @@ fn main() -> Result<()> {
                                 .clamp(1.0, 1000.0);
                             info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
                         }
+                        live_pub.mark_mode_dirty();
                         continue;
                     }
                     HIDCodes::LeftAlt => {
@@ -4064,6 +4340,7 @@ fn main() -> Result<()> {
                             "velocity_profile now {}",
                             velocity_profiles[velocity_profile_idx].name()
                         );
+                        live_pub.mark_mode_dirty();
                         continue;
                     }
                     HIDCodes::RightAlt => {
@@ -4112,6 +4389,7 @@ fn main() -> Result<()> {
                             AftertouchMode::PeakMapped => AftertouchMode::Off,
                             AftertouchMode::Off => AftertouchMode::SpeedMapped,
                         };
+                        live_pub.mark_mode_dirty();
                         if matches!(aftertouch_mode, AftertouchMode::Off) {
                             press_threshold_bits
                                 .store(manual_press_threshold.to_bits(), Ordering::Relaxed);
@@ -4332,6 +4610,7 @@ fn main() -> Result<()> {
                             wtn_mtime = base_wtn_mtime;
                             if !preview_enabled {
                                 wtn = base_wtn.clone();
+                                live_pub.mark_layout_dirty();
                                 let edo = layouts[layout_index].edo_divisions;
                                 let pitch_offset = layouts[layout_index].pitch_offset;
                                 refresh_vel_led_bases(
@@ -4353,6 +4632,7 @@ fn main() -> Result<()> {
                                     &aftertouch_mode,
                                 );
                             }
+                            live_pub.mark_mode_dirty();
                         }
                         "layout_prev" => {
                             if preview_enabled {
@@ -4400,6 +4680,7 @@ fn main() -> Result<()> {
                             wtn_mtime = base_wtn_mtime;
                             if !preview_enabled {
                                 wtn = base_wtn.clone();
+                                live_pub.mark_layout_dirty();
                                 let edo = layouts[layout_index].edo_divisions;
                                 let pitch_offset = layouts[layout_index].pitch_offset;
                                 refresh_vel_led_bases(
@@ -4421,14 +4702,17 @@ fn main() -> Result<()> {
                                     &aftertouch_mode,
                                 );
                             }
+                            live_pub.mark_mode_dirty();
                         }
                         "octave_up" => {
                             octave_shift = (octave_shift + 1).min(15);
                             info!("octave_shift now {}", octave_shift);
+                            live_pub.mark_mode_dirty();
                         }
                         "octave_down" => {
                             octave_shift = (octave_shift - 1).max(-15);
                             info!("octave_shift now {}", octave_shift);
+                            live_pub.mark_mode_dirty();
                         }
                         _ => {}
                     }
@@ -4515,6 +4799,7 @@ fn main() -> Result<()> {
                             &guide_pcs_abs,
                             guide_dim,
                         );
+                        live_pub.mark_mode_dirty();
                     }
 
                     // Maintain per-key velocity state.
@@ -4536,9 +4821,19 @@ fn main() -> Result<()> {
                                     .clamp(0.0, 0.99);
                             let thr_up_now =
                                 (thr_down_now - CAPTURE_RELEASE_HYSTERESIS).clamp(0.0, 0.99);
-                            capture_events_push_row_at(
+                            let lag_ms = if loop_now > ts {
+                                loop_now
+                                    .duration_since(ts)
+                                    .as_millis()
+                                    .min(u64::MAX as u128) as u64
+                            } else {
+                                0
+                            };
+                            capture_events_push_row_meta_at(
                                 &capture,
                                 ts,
+                                None,
+                                Some(lag_ms),
                                 [
                                     t_ms.to_string(),
                                     String::new(),
@@ -4561,8 +4856,12 @@ fn main() -> Result<()> {
                                     format!("{thr_down_now:.6}"),
                                     format!("{thr_up_now:.6}"),
                                     String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
                                 ],
                             );
+                            cap_rows_edge += 1;
                         }
                         let already_playing = note_by_key.contains_key(&key_id);
 
@@ -4635,9 +4934,19 @@ fn main() -> Result<()> {
 
                         if capture.active.load(Ordering::Relaxed) {
                             let t_ms = start_ts.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                            capture_events_push_row_at(
+                            let lag_ms = if loop_now > ts {
+                                loop_now
+                                    .duration_since(ts)
+                                    .as_millis()
+                                    .min(u64::MAX as u128) as u64
+                            } else {
+                                0
+                            };
+                            capture_events_push_row_meta_at(
                                 &capture,
                                 ts,
+                                None,
+                                Some(lag_ms),
                                 [
                                     t_ms.to_string(),
                                     String::new(),
@@ -4660,8 +4969,12 @@ fn main() -> Result<()> {
                                     String::new(),
                                     String::new(),
                                     String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
                                 ],
                             );
+                            cap_rows_edge += 1;
                         }
 
                         if let Some(st) = vel_state.get_mut(&key_id) {
@@ -4706,9 +5019,19 @@ fn main() -> Result<()> {
                                     .clamp(0.0, 0.99);
                             let thr_up_now =
                                 (thr_down_now - CAPTURE_RELEASE_HYSTERESIS).clamp(0.0, 0.99);
-                            capture_events_push_row_at(
+                            let lag_ms = if loop_now > ts {
+                                loop_now
+                                    .duration_since(ts)
+                                    .as_millis()
+                                    .min(u64::MAX as u128) as u64
+                            } else {
+                                0
+                            };
+                            capture_events_push_row_meta_at(
                                 &capture,
                                 ts,
+                                None,
+                                Some(lag_ms),
                                 [
                                     t_ms.to_string(),
                                     String::new(),
@@ -4731,13 +5054,27 @@ fn main() -> Result<()> {
                                     format!("{thr_down_now:.6}"),
                                     format!("{thr_up_now:.6}"),
                                     String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
                                 ],
                             );
+                            cap_rows_edge += 1;
                         }
                         let removed = vel_state.remove(&key_id);
 
                         // Ensure next press can emit polytouch again even if it repeats the same value.
                         last_aftertouch_sent_by_key.remove(&key_id);
+
+                        // HUD: remove pitch if this key had an active note.
+                        if let Some(pitch) = hud_pitch_by_key.remove(&key_id) {
+                            if wtn_board == 0 {
+                                hud_pressed0.remove(&pitch);
+                            } else if wtn_board == 1 {
+                                hud_pressed1.remove(&pitch);
+                            }
+                            live_pub.mark_pressed_dirty();
+                        }
 
                         // Restore LED immediately.
                         if let Some(VelState::Tracking { led: Some(led), .. }) = &removed {
@@ -4808,13 +5145,17 @@ fn main() -> Result<()> {
                                         );
 
                                         if capture.active.load(Ordering::Relaxed) {
-                                            let t_ms = start_ts
-                                                .elapsed()
+                                            let when = Instant::now();
+                                            let t_ms = when
+                                                .duration_since(start_ts)
                                                 .as_millis()
                                                 .min(u64::MAX as u128)
                                                 as u64;
-                                            capture_events_push_row(
+                                            capture_events_push_row_meta_at(
                                                 &capture,
+                                                when,
+                                                Some(ts),
+                                                None,
                                                 [
                                                     t_ms.to_string(),
                                                     String::new(),
@@ -4836,9 +5177,13 @@ fn main() -> Result<()> {
                                                     String::new(),
                                                     String::new(),
                                                     String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
                                                     "noteoff".to_string(),
                                                 ],
                                             );
+                                            cap_rows_midi += 1;
                                         }
                                     }
                                     Err(e) => {
@@ -4859,6 +5204,10 @@ fn main() -> Result<()> {
                                         last_aftertouch_sent_by_key.clear();
                                         note_by_key.clear();
                                         note_on_count.clear();
+                                        hud_pitch_by_key.clear();
+                                        hud_pressed0.clear();
+                                        hud_pressed1.clear();
+                                        live_pub.mark_pressed_dirty();
                                     }
                                 }
                             }
@@ -4883,13 +5232,17 @@ fn main() -> Result<()> {
                                     );
 
                                         if capture.active.load(Ordering::Relaxed) {
-                                            let t_ms = start_ts
-                                                .elapsed()
+                                            let when = Instant::now();
+                                            let t_ms = when
+                                                .duration_since(start_ts)
                                                 .as_millis()
                                                 .min(u64::MAX as u128)
                                                 as u64;
-                                            capture_events_push_row(
+                                            capture_events_push_row_meta_at(
                                                 &capture,
+                                                when,
+                                                Some(ts),
+                                                None,
                                                 [
                                                     t_ms.to_string(),
                                                     String::new(),
@@ -4911,9 +5264,13 @@ fn main() -> Result<()> {
                                                     String::new(),
                                                     String::new(),
                                                     String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
                                                     "noteoff_fallback".to_string(),
                                                 ],
                                             );
+                                            cap_rows_midi += 1;
                                         }
                                     }
                                     Err(e) => {
@@ -4936,6 +5293,10 @@ fn main() -> Result<()> {
                                         last_aftertouch_sent_by_key.clear();
                                         note_by_key.clear();
                                         note_on_count.clear();
+                                        hud_pitch_by_key.clear();
+                                        hud_pressed0.clear();
+                                        hud_pressed1.clear();
+                                        live_pub.mark_pressed_dirty();
                                     }
                                 }
                                 sent = true;
@@ -5003,13 +5364,17 @@ fn main() -> Result<()> {
                                             );
 
                                             if capture.active.load(Ordering::Relaxed) {
-                                                let t_ms = start_ts
-                                                    .elapsed()
+                                                let when = Instant::now();
+                                                let t_ms = when
+                                                    .duration_since(start_ts)
                                                     .as_millis()
                                                     .min(u64::MAX as u128)
                                                     as u64;
-                                                capture_events_push_row(
+                                                capture_events_push_row_meta_at(
                                                     &capture,
+                                                    when,
+                                                    Some(ts),
+                                                    None,
                                                     [
                                                         t_ms.to_string(),
                                                         String::new(),
@@ -5031,12 +5396,28 @@ fn main() -> Result<()> {
                                                         String::new(),
                                                         String::new(),
                                                         String::new(),
+                                                        String::new(),
+                                                        String::new(),
+                                                        String::new(),
                                                         "noteon_tap".to_string(),
                                                     ],
                                                 );
+                                                cap_rows_midi += 1;
                                             }
                                             *note_on_count.entry((*out_ch, *note)).or_insert(0) +=
                                                 1;
+
+                                            // HUD pressed chord updates.
+                                            let pitch = (*out_ch as i32) * edo
+                                                + (*note as i32)
+                                                + pitch_offset;
+                                            hud_pitch_by_key.insert(key_id.clone(), pitch);
+                                            if wtn_board == 0 {
+                                                hud_pressed0.insert(pitch);
+                                            } else if wtn_board == 1 {
+                                                hud_pressed1.insert(pitch);
+                                            }
+                                            live_pub.mark_pressed_dirty();
                                             pending_noteoffs.push_back(PendingNoteOff {
                                                 due: Instant::now()
                                                     + Duration::from_millis(TAP_NOTE_OFF_MS),
@@ -5085,6 +5466,10 @@ fn main() -> Result<()> {
                                     last_aftertouch_sent_by_key.clear();
                                     note_by_key.clear();
                                     note_on_count.clear();
+                                    hud_pitch_by_key.clear();
+                                    hud_pressed0.clear();
+                                    hud_pressed1.clear();
+                                    live_pub.mark_pressed_dirty();
                                     sent = true;
                                 }
                             }
@@ -5106,8 +5491,20 @@ fn main() -> Result<()> {
             // End per-edge processing.
         }
 
+        let edge_us = edge_t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+
+        // Publish the latest observed lag so any event rows can carry it.
+        capture.lag_ms.store(edge_lag_max_ms, Ordering::Relaxed);
+
+        // Timings around top-of-loop calls (slow-path only): these are prime suspects for stalls.
+        // Live HUD writes are timed in LivePublisher (LIVE_SLOW/LIVE_WRITE_SLOW).
+
+        let cur_lag_ms = edge_lag_max_ms;
+        let mut tick_us: u64 = 0;
+
         // Timer tick: fire peak-tracked NoteOn and periodic aftertouch.
         {
+            let tick_t0 = Instant::now();
             let peak_track = Duration::from_millis(cfg.velocity_peak_track_ms.max(1) as u64);
             let threshold =
                 f32::from_bits(press_threshold_bits.load(Ordering::Relaxed)).clamp(0.0, 0.99);
@@ -5227,10 +5624,17 @@ fn main() -> Result<()> {
                                 );
 
                                 if capture.active.load(Ordering::Relaxed) {
-                                    let t_ms =
-                                        start_ts.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                                    capture_events_push_row(
+                                    let when = Instant::now();
+                                    let t_ms = when
+                                        .duration_since(start_ts)
+                                        .as_millis()
+                                        .min(u64::MAX as u128)
+                                        as u64;
+                                    capture_events_push_row_meta_at(
                                         &capture,
+                                        when,
+                                        None,
+                                        Some(cur_lag_ms),
                                         [
                                             t_ms.to_string(),
                                             String::new(),
@@ -5252,12 +5656,35 @@ fn main() -> Result<()> {
                                             String::new(),
                                             String::new(),
                                             String::new(),
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
                                             "noteon".to_string(),
                                         ],
                                     );
+                                    cap_rows_midi += 1;
                                 }
                                 note_by_key.insert(key.clone(), (out_ch, note));
                                 *note_on_count.entry((out_ch, note)).or_insert(0) += 1;
+
+                                // HUD pressed chord updates.
+                                if let Some(layout) = layouts.get(layout_index) {
+                                    let edo = layout.edo_divisions;
+                                    let pitch_offset = layout.pitch_offset;
+                                    let pitch =
+                                        (out_ch as i32) * edo + (note as i32) + pitch_offset;
+                                    hud_pitch_by_key.insert(key.clone(), pitch);
+                                    let hud_board = board_by_device
+                                        .get(&key.0)
+                                        .map(|b| b.wtn_board)
+                                        .unwrap_or(0u8);
+                                    if hud_board == 0 {
+                                        hud_pressed0.insert(pitch);
+                                    } else if hud_board == 1 {
+                                        hud_pressed1.insert(pitch);
+                                    }
+                                    live_pub.mark_pressed_dirty();
+                                }
 
                                 if !no_aftertouch {
                                     match aftertouch_mode {
@@ -5275,13 +5702,17 @@ fn main() -> Result<()> {
                                                     last_aftertouch_sent_by_key
                                                         .insert(key.clone(), pressure);
                                                     if capture.active.load(Ordering::Relaxed) {
-                                                        let t_ms = start_ts
-                                                            .elapsed()
+                                                        let when = Instant::now();
+                                                        let t_ms = when
+                                                            .duration_since(start_ts)
                                                             .as_millis()
                                                             .min(u64::MAX as u128)
                                                             as u64;
-                                                        capture_events_push_row(
+                                                        capture_events_push_row_meta_at(
                                                             &capture,
+                                                            when,
+                                                            None,
+                                                            Some(cur_lag_ms),
                                                             [
                                                                 t_ms.to_string(),
                                                                 String::new(),
@@ -5303,9 +5734,13 @@ fn main() -> Result<()> {
                                                                 String::new(),
                                                                 String::new(),
                                                                 String::new(),
+                                                                String::new(),
+                                                                String::new(),
+                                                                String::new(),
                                                                 "polytouch".to_string(),
                                                             ],
                                                         );
+                                                        cap_rows_aftertouch += 1;
                                                     }
                                                 }
                                             }
@@ -5346,13 +5781,17 @@ fn main() -> Result<()> {
                                                 last_aftertouch_sent_by_key
                                                     .insert(key.clone(), pressure);
                                                 if capture.active.load(Ordering::Relaxed) {
-                                                    let t_ms = start_ts
-                                                        .elapsed()
+                                                    let when = Instant::now();
+                                                    let t_ms = when
+                                                        .duration_since(start_ts)
                                                         .as_millis()
                                                         .min(u64::MAX as u128)
                                                         as u64;
-                                                    capture_events_push_row(
+                                                    capture_events_push_row_meta_at(
                                                         &capture,
+                                                        when,
+                                                        None,
+                                                        Some(cur_lag_ms),
                                                         [
                                                             t_ms.to_string(),
                                                             String::new(),
@@ -5374,9 +5813,13 @@ fn main() -> Result<()> {
                                                             String::new(),
                                                             String::new(),
                                                             String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
                                                             "polytouch".to_string(),
                                                         ],
                                                     );
+                                                    cap_rows_aftertouch += 1;
                                                 }
                                             }
                                         }
@@ -5404,6 +5847,8 @@ fn main() -> Result<()> {
                     }
                 }
             }
+
+            tick_us = tick_t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
         }
 
         // Idle tick: possibly activate screensaver.
@@ -5432,6 +5877,7 @@ fn main() -> Result<()> {
             guide_root_pc = None;
             paint_off(&rgb_index_by_device_id);
             screensaver_active = true;
+            live_pub.mark_mode_dirty();
         }
 
         // Scheduled NoteOffs for tap notes.
@@ -5462,6 +5908,9 @@ fn main() -> Result<()> {
                 note_on_count.remove(&k);
                 match midi_out.send_note(false, p.ch, p.note, 0) {
                     Ok(()) => {
+                        let orig_dev = p.origin_device_id;
+                        let orig_hid = p.origin_hid.clone();
+
                         dbg_push(
                             &mut dbg_ring,
                             &start_ts,
@@ -5469,11 +5918,18 @@ fn main() -> Result<()> {
                         );
 
                         if capture.active.load(Ordering::Relaxed) {
-                            if let (Some(dev), Some(hid)) = (p.origin_device_id, p.origin_hid) {
-                                let t_ms =
-                                    start_ts.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                                capture_events_push_row(
+                            if let (Some(dev), Some(hid)) = (orig_dev, orig_hid.clone()) {
+                                let when = Instant::now();
+                                let t_ms = when
+                                    .duration_since(start_ts)
+                                    .as_millis()
+                                    .min(u64::MAX as u128)
+                                    as u64;
+                                capture_events_push_row_meta_at(
                                     &capture,
+                                    when,
+                                    Some(p.due),
+                                    None,
                                     [
                                         t_ms.to_string(),
                                         String::new(),
@@ -5495,9 +5951,28 @@ fn main() -> Result<()> {
                                         String::new(),
                                         String::new(),
                                         String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
                                         "noteoff_scheduled".to_string(),
                                     ],
                                 );
+                                cap_rows_midi += 1;
+                            }
+                        }
+
+                        // HUD: scheduled noteoff ends the tap note.
+                        if let (Some(dev), Some(hid)) = (orig_dev, orig_hid) {
+                            let key_id = (dev, hid);
+                            if let Some(bcfg) = board_by_device.get(&dev) {
+                                if let Some(pitch) = hud_pitch_by_key.remove(&key_id) {
+                                    if bcfg.wtn_board == 0 {
+                                        hud_pressed0.remove(&pitch);
+                                    } else if bcfg.wtn_board == 1 {
+                                        hud_pressed1.remove(&pitch);
+                                    }
+                                    live_pub.mark_pressed_dirty();
+                                }
                             }
                         }
                     }
@@ -5518,8 +5993,38 @@ fn main() -> Result<()> {
                         note_by_key.clear();
                         note_on_count.clear();
                         pending_noteoffs.clear();
+                        hud_pitch_by_key.clear();
+                        hud_pressed0.clear();
+                        hud_pressed1.clear();
+                        live_pub.mark_pressed_dirty();
                     }
                 }
+            }
+        }
+
+        // Rate-limited lag log: include basic timing breakdown.
+        if edge_cnt > 0 && edge_lag_max_ms >= 50 {
+            if edge_lag_max_ms >= 500 || last_lag_log.elapsed() >= Duration::from_secs(2) {
+                last_lag_log = Instant::now();
+                let lock_drops = capture.lock_drops.load(Ordering::Relaxed);
+                let msg = format!(
+                    "LAG edges={} max_ms={} over50={} over200={} downup={} update={} vel_state={} lock_drops={} edge_us={} tick_us={} cap_edge={} cap_midi={} cap_at={}",
+                    edge_cnt,
+                    edge_lag_max_ms,
+                    edge_lag_over_50ms,
+                    edge_lag_over_200ms,
+                    edge_cnt_downup,
+                    edge_cnt_updates,
+                    vel_state.len(),
+                    lock_drops,
+                    edge_us,
+                    tick_us,
+                    cap_rows_edge,
+                    cap_rows_midi,
+                    cap_rows_aftertouch,
+                );
+                dbg_push(&mut dbg_ring, &start_ts, msg.clone());
+                info!("{}", msg);
             }
         }
     }

@@ -36,6 +36,8 @@ type DumpEvent = {
 
 type CurvePoint = { x: number; last: number; peak?: number }
 
+const DEFAULT_TAIL_MS = 30_000
+
 type DumpCsvTerm =
   | { kind: 'exact'; needle: string }
   | { kind: 're'; re: RegExp }
@@ -116,59 +118,6 @@ function parseCsvRow(line: string) {
   return line.split(',')
 }
 
-function parseDumpCurves(dumpCsv: string, preferCapMs: boolean) {
-  const lines = (dumpCsv || '').split('\n').filter(Boolean)
-  if (!lines.length) return { pts: new Map<string, CurvePoint[]>(), xMin: 0, xMax: 1 }
-  const header = parseCsvRow(lines[0])
-  const idx = new Map<string, number>()
-  for (let i = 0; i < header.length; i++) idx.set(header[i], i)
-
-  const gi = (name: string) => idx.get(name)
-  const iTms = gi('t_ms')
-  const iCap = gi('t_cap_ms')
-  const iEvent = gi('event')
-  const iDev = gi('device_id')
-  const iHid = gi('hid')
-  const iLast = gi('last')
-  const iPeak = gi('peak')
-
-  const pts = new Map<string, CurvePoint[]>()
-  let xMin = Infinity
-  let xMax = -Infinity
-
-  for (let li = 1; li < lines.length; li++) {
-    const row = parseCsvRow(lines[li])
-    const ev = iEvent !== undefined ? (row[iEvent] || '') : ''
-    if (ev !== 'NOTEON_TICK') continue
-
-    const xRaw = preferCapMs && iCap !== undefined ? row[iCap] : iTms !== undefined ? row[iTms] : ''
-    const x = Number.parseFloat(String(xRaw || ''))
-    if (!Number.isFinite(x)) continue
-    const dev = iDev !== undefined ? String(row[iDev] || '') : ''
-    const hid = iHid !== undefined ? String(row[iHid] || '') : ''
-    const id = `${dev}:${hid.replace(/^"|"$/g, '')}`
-
-    const yLast = iLast !== undefined ? Number.parseFloat(String(row[iLast] || '')) : NaN
-    const yPeak = iPeak !== undefined ? Number.parseFloat(String(row[iPeak] || '')) : NaN
-
-    if (Number.isFinite(yLast)) {
-      const a = pts.get(id) || []
-      const cp: CurvePoint = { x, last: yLast }
-      if (Number.isFinite(yPeak)) cp.peak = yPeak
-      a.push(cp)
-      pts.set(id, a)
-      xMin = Math.min(xMin, x)
-      xMax = Math.max(xMax, x)
-    }
-  }
-
-  if (!Number.isFinite(xMin) || !Number.isFinite(xMax) || xMax <= xMin) {
-    xMin = 0
-    xMax = 1
-  }
-  return { pts, xMin, xMax }
-}
-
 function downsampleBucketLast(pts: CurvePoint[], x0: number, x1: number, buckets: number) {
   if (!pts.length) return [] as Array<[number, number, number?]>
   const span = Math.max(0.0001, x1 - x0)
@@ -190,78 +139,6 @@ function downsampleBucketLast(pts: CurvePoint[], x0: number, x1: number, buckets
   return out
 }
 
-function parseDumpEvents(dumpCsv: string, preferCapMs: boolean): DumpEvent[] {
-  const raw = String(dumpCsv || '')
-  if (!raw) return []
-
-  // Stream parse line-by-line to avoid allocating a huge `split('\n')` array.
-  let pos = 0
-  const readLine = () => {
-    if (pos >= raw.length) return null
-    let nl = raw.indexOf('\n', pos)
-    if (nl === -1) nl = raw.length
-    const line = raw.slice(pos, nl)
-    pos = nl + 1
-    return line
-  }
-
-  const headerLine = readLine()
-  if (!headerLine) return []
-  const header = parseCsvRow(headerLine)
-  const idx = new Map<string, number>()
-  for (let i = 0; i < header.length; i++) idx.set(header[i], i)
-
-  const gi = (name: string) => idx.get(name)
-  const iTms = gi('t_ms')
-  const iCap = gi('t_cap_ms')
-  const iEvent = gi('event')
-  const iKind = gi('kind')
-  const iDev = gi('device_id')
-  const iHid = gi('hid')
-  const iCh = gi('ch')
-  const iNote = gi('note')
-  const iVel = gi('vel')
-  const iPressure = gi('pressure')
-  const iAnalog = gi('analog')
-
-  const out: DumpEvent[] = []
-
-  for (;;) {
-    const line = readLine()
-    if (line === null) break
-    if (!line) continue
-
-    const row = parseCsvRow(line)
-    const ev = iEvent !== undefined ? (row[iEvent] || '') : ''
-    const kind = iKind !== undefined ? (row[iKind] || '') : ''
-    if (!ev) continue
-
-    // Keep only events we actually visualize (reduces work massively).
-    if (ev === 'NOTEON_TICK') continue
-    if (ev === 'EDGE' && kind !== 'down' && kind !== 'up') continue
-    if (ev === 'MIDI' && !String(kind).includes('noteon') && !String(kind).includes('noteoff')) continue
-    if (ev !== 'EDGE' && ev !== 'MIDI' && ev !== 'AFTERTOUCH') continue
-
-    const xRaw = preferCapMs && iCap !== undefined ? row[iCap] : iTms !== undefined ? row[iTms] : ''
-    const xMs = Number.parseFloat(String(xRaw || ''))
-    if (!Number.isFinite(xMs)) continue
-    const deviceId = iDev !== undefined ? String(row[iDev] || '') : ''
-    const hid = iHid !== undefined ? String(row[iHid] || '') : ''
-    const hid2 = hid.replace(/^"|"$/g, '')
-    const e: DumpEvent = { xMs, event: ev, kind, deviceId, hid: hid2 }
-    if (iAnalog !== undefined && row[iAnalog]) {
-      const a = Number.parseFloat(row[iAnalog])
-      if (Number.isFinite(a)) e.analog = a
-    }
-    if (iCh !== undefined && row[iCh]) e.ch = Number.parseInt(row[iCh], 10)
-    if (iNote !== undefined && row[iNote]) e.note = Number.parseInt(row[iNote], 10)
-    if (iVel !== undefined && row[iVel]) e.vel = Number.parseInt(row[iVel], 10)
-    if (iPressure !== undefined && row[iPressure]) e.pressure = Number.parseInt(row[iPressure], 10)
-    out.push(e)
-  }
-  return out
-}
-
 // (legacy helper removed; ECharts uses [x,y] pairs directly)
 
 export default function DumpsPage() {
@@ -272,7 +149,6 @@ export default function DumpsPage() {
 
   const [captureTxt, setCaptureTxt] = useState<string>('')
   const [dumpTxt, setDumpTxt] = useState<string>('')
-  const [dumpCsvRaw, setDumpCsvRaw] = useState<string>('')
   const [dumpCsvFilter, setDumpCsvFilter] = useState<string>('')
   const [dumpCsvFilterDebounced, setDumpCsvFilterDebounced] = useState<string>('')
   const [dumpCsvSort, setDumpCsvSort] = useState<{ col: number | null; dir: 'asc' | 'desc' }>({ col: null, dir: 'asc' })
@@ -286,6 +162,7 @@ export default function DumpsPage() {
   const [xMax, setXMax] = useState<number>(1)
   const [viewPairsById, setViewPairsById] = useState<Map<string, Array<[number, number, number?]>>>(new Map())
   const [events, setEvents] = useState<DumpEvent[]>([])
+  const [lagPts, setLagPts] = useState<Array<[number, number]>>([])
   const [cursorX, setCursorX] = useState<number | null>(null)
   const [boards, setBoards] = useState<DumpBoard[]>([])
   const [eventInfo, setEventInfo] = useState<string>('')
@@ -296,6 +173,8 @@ export default function DumpsPage() {
   const dumpCsvHeaderRef = useRef<string[] | null>(null)
   const dumpCsvRowsRef = useRef<string[][]>([])
   const dumpCsvTmsRef = useRef<number[]>([])
+  const dumpCsvXmsRef = useRef<number[]>([])
+  const dumpCsvHeadRef = useRef<number>(0)
   const dumpCsvMatchesRef = useRef<number[] | null>(null) // null means "no filter" (identity)
   const dumpCsvViewIndicesRef = useRef<number[]>([]) // indices into dumpCsvRowsRef, after filter+sort
   const dumpCsvParseJobRef = useRef<number>(0)
@@ -491,11 +370,11 @@ export default function DumpsPage() {
     setStatus('Loading session...')
     setCaptureTxt('')
     setDumpTxt('')
-    setDumpCsvRaw('')
     setDumpCsvFilter('')
     setDumpCsvFilterDebounced('')
     setCfg({})
     setEvents([])
+    setLagPts([])
     setCursorX(null)
     setEventInfo('')
     setZoomRange({ x0: xMin, x1: xMax })
@@ -508,6 +387,8 @@ export default function DumpsPage() {
     dumpCsvHeaderRef.current = null
     dumpCsvRowsRef.current = []
     dumpCsvTmsRef.current = []
+    dumpCsvXmsRef.current = []
+    dumpCsvHeadRef.current = 0
     dumpCsvMatchesRef.current = null
     dumpCsvViewIndicesRef.current = []
     dumpCsvTermsRef.current = []
@@ -526,40 +407,292 @@ export default function DumpsPage() {
       setCfg(parseCfg(`${capTxt}\n${dTxt}`))
     }
 
-    const loadDumpEvents = async () => {
+    const loadDumpCsvTail = async () => {
       if (!selected.dump?.hasCsv) {
         setEvents([])
-        setDumpCsvRaw('')
         return
       }
-      const dumpCsv = await fetchDumpFileText(ts, 'dump', 'csv')
-      setDumpCsvRaw(dumpCsv)
+
+      const jobId = ++dumpCsvParseJobRef.current
+      const url = apiUrl(`api/dumps/${encodeURIComponent(String(ts))}/dump.csv`)
+
+      dumpCsvHeaderRef.current = null
+      dumpCsvRowsRef.current = []
+      dumpCsvTmsRef.current = []
+      dumpCsvXmsRef.current = []
+      dumpCsvHeadRef.current = 0
+      dumpCsvMatchesRef.current = null
+      dumpCsvViewIndicesRef.current = []
+      setDumpCsvParsedCount(0)
+      setDumpCsvTableRev((v) => v + 1)
+      setDumpCsvTableScrollTop(0)
+      setDumpCsvParsing(true)
+
+      const res = await fetch(url)
+      if (!res.ok) throw new Error(`fetch failed: ${res.status}`)
+      if (!res.body) throw new Error('no body')
+
+      const reader = res.body.getReader()
+      const dec = new TextDecoder('utf-8')
+      let buf = ''
+      let header: string[] | null = null
+
+      let iTms = -1
+      let iCap = -1
+      let iEvent = -1
+      let iKind = -1
+      let iDev = -1
+      let iHid = -1
+      let iLast = -1
+      let iPeak = -1
+      let iAnalog = -1
+      let iCh = -1
+      let iNote = -1
+      let iVel = -1
+      let iPressure = -1
+      let iLag = -1
+
       const preferCap = Boolean(selected.capture?.hasCsv)
-      setEvents(parseDumpEvents(dumpCsv, preferCap))
+      let useCap = false
+
+      let xMax = -Infinity
+      let cutoff = -Infinity
+      const eventsTail: DumpEvent[] = []
+      const lagTail: Array<[number, number]> = []
+
+      const curvePts = new Map<string, CurvePoint[]>()
+      const curveHeads = new Map<string, number>()
+      let rowCounter = 0
+
+      const pruneCurves = () => {
+        if (!Number.isFinite(cutoff)) return
+        for (const [id, pts] of curvePts.entries()) {
+          let h = curveHeads.get(id) || 0
+          while (h < pts.length && pts[h].x < cutoff) h++
+          curveHeads.set(id, h)
+          if (h > 4000 && h > (pts.length >> 1)) {
+            curvePts.set(id, pts.slice(h))
+            curveHeads.set(id, 0)
+          }
+        }
+      }
+
+      const compactTable = () => {
+        const head = dumpCsvHeadRef.current
+        if (head <= 0) return
+        if (head < 10000 && head < (dumpCsvRowsRef.current.length >> 1)) return
+
+        dumpCsvRowsRef.current = dumpCsvRowsRef.current.slice(head)
+        dumpCsvTmsRef.current = dumpCsvTmsRef.current.slice(head)
+        dumpCsvXmsRef.current = dumpCsvXmsRef.current.slice(head)
+        dumpCsvHeadRef.current = 0
+        dumpCsvMatchesRef.current = null
+        dumpCsvViewIndicesRef.current = []
+        dumpCsvFilterJobRef.current++
+        dumpCsvViewJobRef.current++
+      }
+
+      for (;;) {
+        if (dumpCsvParseJobRef.current !== jobId) return
+        const { value, done } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+
+        for (;;) {
+          const nl = buf.indexOf('\n')
+          if (nl < 0) break
+          const line = buf.slice(0, nl).trimEnd()
+          buf = buf.slice(nl + 1)
+          if (!line) continue
+
+          const row = parseCsvRow(line).map((s) => String(s || '').replace(/^"|"$/g, ''))
+          if (!header) {
+            header = row
+            dumpCsvHeaderRef.current = header
+            iTms = header.findIndex((h) => String(h || '').toLowerCase() === 't_ms')
+            iCap = header.findIndex((h) => String(h || '').toLowerCase() === 't_cap_ms')
+            iEvent = header.findIndex((h) => String(h || '').toLowerCase() === 'event')
+            iKind = header.findIndex((h) => String(h || '').toLowerCase() === 'kind')
+            iDev = header.findIndex((h) => String(h || '').toLowerCase() === 'device_id')
+            iHid = header.findIndex((h) => String(h || '').toLowerCase() === 'hid')
+            iLast = header.findIndex((h) => String(h || '').toLowerCase() === 'last')
+            iPeak = header.findIndex((h) => String(h || '').toLowerCase() === 'peak')
+            iAnalog = header.findIndex((h) => String(h || '').toLowerCase() === 'analog')
+            iCh = header.findIndex((h) => String(h || '').toLowerCase() === 'ch')
+            iNote = header.findIndex((h) => String(h || '').toLowerCase() === 'note')
+            iVel = header.findIndex((h) => String(h || '').toLowerCase() === 'vel')
+            iPressure = header.findIndex((h) => String(h || '').toLowerCase() === 'pressure')
+            iLag = header.findIndex((h) => String(h || '').toLowerCase() === 'lag_ms')
+            useCap = preferCap && iCap >= 0
+            if (dumpCsvSortRef.current.col === null && iTms >= 0) {
+              setDumpCsvSort({ col: iTms, dir: 'asc' })
+            }
+            continue
+          }
+
+          // parse xMs (t_cap_ms preferred if capture exists)
+          const xRaw = useCap && iCap >= 0 ? row[iCap] : iTms >= 0 ? row[iTms] : ''
+          const xMs = Number.parseFloat(String(xRaw || ''))
+          if (Number.isFinite(xMs)) {
+            if (xMs > xMax) {
+              xMax = xMs
+              cutoff = xMax - DEFAULT_TAIL_MS
+            }
+          }
+
+          if (Number.isFinite(xMs) && iLag >= 0) {
+            const lag = Number.parseFloat(String(row[iLag] || ''))
+            if (Number.isFinite(lag) && (!Number.isFinite(cutoff) || xMs >= cutoff)) {
+              lagTail.push([xMs, lag])
+            }
+          }
+
+          // Track table rows (kept to sliding window).
+          dumpCsvRowsRef.current.push(row)
+          const tms = iTms >= 0 ? Number.parseFloat(String(row[iTms] || '')) : NaN
+          dumpCsvTmsRef.current.push(tms)
+          dumpCsvXmsRef.current.push(Number.isFinite(xMs) ? xMs : NaN)
+
+          // Slide the window forward.
+          if (Number.isFinite(cutoff)) {
+            let head = dumpCsvHeadRef.current
+            while (
+              head < dumpCsvXmsRef.current.length &&
+              Number.isFinite(dumpCsvXmsRef.current[head]) &&
+              dumpCsvXmsRef.current[head] < cutoff
+            ) {
+              head++
+            }
+            dumpCsvHeadRef.current = head
+          }
+
+          // Parse events (kept to sliding window).
+          const ev = iEvent >= 0 ? String(row[iEvent] || '') : ''
+          const kind = iKind >= 0 ? String(row[iKind] || '') : ''
+          if (ev) {
+            if (ev === 'EDGE' && kind !== 'down' && kind !== 'up') {
+              // ignore
+            } else if (ev === 'MIDI' && !kind.includes('noteon') && !kind.includes('noteoff')) {
+              // ignore
+            } else if (ev === 'NOTEON_TICK') {
+              // Curves for dump-only sessions.
+              if (!preferCap && Number.isFinite(xMs) && iDev >= 0 && iHid >= 0 && iLast >= 0) {
+                const dev = String(row[iDev] || '')
+                const hid = String(row[iHid] || '')
+                const id = `${dev}:${hid.replace(/^"|"$/g, '')}`
+                const yLast = Number.parseFloat(String(row[iLast] || ''))
+                const yPeak = iPeak >= 0 ? Number.parseFloat(String(row[iPeak] || '')) : NaN
+                if (Number.isFinite(yLast)) {
+                  const a = curvePts.get(id) || []
+                  const cp: CurvePoint = { x: xMs, last: yLast }
+                  if (Number.isFinite(yPeak)) cp.peak = yPeak
+                  a.push(cp)
+                  curvePts.set(id, a)
+                }
+              }
+            } else if (ev === 'EDGE' || ev === 'MIDI' || ev === 'AFTERTOUCH') {
+              if (Number.isFinite(xMs) && (!Number.isFinite(cutoff) || xMs >= cutoff)) {
+                const deviceId = iDev >= 0 ? String(row[iDev] || '') : ''
+                const hid = iHid >= 0 ? String(row[iHid] || '') : ''
+                const e: DumpEvent = {
+                  xMs,
+                  event: ev,
+                  kind,
+                  deviceId,
+                  hid: hid.replace(/^"|"$/g, ''),
+                }
+                if (ev === 'EDGE' && iAnalog >= 0) {
+                  const v = Number.parseFloat(String(row[iAnalog] || ''))
+                  if (Number.isFinite(v)) e.analog = v
+                }
+                if (ev === 'MIDI') {
+                  if (iCh >= 0) {
+                    const v = Number.parseInt(String(row[iCh] || ''), 10)
+                    if (Number.isFinite(v)) e.ch = v
+                  }
+                  if (iNote >= 0) {
+                    const v = Number.parseInt(String(row[iNote] || ''), 10)
+                    if (Number.isFinite(v)) e.note = v
+                  }
+                  if (iVel >= 0) {
+                    const v = Number.parseInt(String(row[iVel] || ''), 10)
+                    if (Number.isFinite(v)) e.vel = v
+                  }
+                }
+                if (ev === 'AFTERTOUCH' && iPressure >= 0) {
+                  const v = Number.parseInt(String(row[iPressure] || ''), 10)
+                  if (Number.isFinite(v)) e.pressure = v
+                }
+                eventsTail.push(e)
+              }
+            }
+          }
+
+          if (Number.isFinite(cutoff)) {
+            while (eventsTail.length && eventsTail[0].xMs < cutoff) eventsTail.shift()
+            while (lagTail.length && lagTail[0][0] < cutoff) lagTail.shift()
+          }
+
+          rowCounter++
+          if (rowCounter % 5000 === 0) {
+            pruneCurves()
+            compactTable()
+            setDumpCsvParsedCount(dumpCsvRowsRef.current.length - dumpCsvHeadRef.current)
+            setDumpCsvTableRev((v) => v + 1)
+            scheduleDumpCsvViewBuild(0)
+            setLagPts(lagTail.slice())
+          }
+        }
+      }
+
+      // Flush remaining buffer (best-effort).
+      buf = buf.trim()
+      if (buf && dumpCsvParseJobRef.current === jobId) {
+        const row = parseCsvRow(buf).map((s) => String(s || '').replace(/^"|"$/g, ''))
+        if (header) {
+          dumpCsvRowsRef.current.push(row)
+          const tms = iTms >= 0 ? Number.parseFloat(String(row[iTms] || '')) : NaN
+          dumpCsvTmsRef.current.push(tms)
+          const xRaw = useCap && iCap >= 0 ? row[iCap] : iTms >= 0 ? row[iTms] : ''
+          const xMs = Number.parseFloat(String(xRaw || ''))
+          dumpCsvXmsRef.current.push(Number.isFinite(xMs) ? xMs : NaN)
+        }
+      }
+
+      if (dumpCsvParseJobRef.current !== jobId) return
+      if (Number.isFinite(xMax) && DEFAULT_TAIL_MS > 0) {
+        const xMin = Math.max(0, xMax - DEFAULT_TAIL_MS)
+        // Dump-only: finalize curves + x-range.
+        if (!preferCap) {
+          const ids = Array.from(curvePts.keys())
+          setSeriesIds(ids)
+          setXMin(xMin)
+          setXMax(xMax)
+          setZoomRange({ x0: xMin, x1: xMax })
+          const m = new Map<string, Array<[number, number, number?]>>()
+          for (const id of ids) {
+            const pts = (curvePts.get(id) || []).filter((p) => p.x >= xMin)
+            m.set(id, downsampleBucketLast(pts, xMin, xMax, buckets))
+          }
+          setViewPairsById(m)
+        }
+      }
+
+      setEvents(eventsTail)
+      setLagPts(lagTail)
+      setDumpCsvParsing(false)
+      setDumpCsvParsedCount(dumpCsvRowsRef.current.length - dumpCsvHeadRef.current)
+      setDumpCsvTableRev((v) => v + 1)
+      scheduleDumpCsvViewBuild(0)
     }
 
     const loadChart = async () => {
       if (selected.capture?.hasCsv) {
         const url = apiUrl(`api/dumps/${encodeURIComponent(String(ts))}/capture.csv`)
-        workerRef.current?.postMessage({ type: 'loadCapture', url })
+        workerRef.current?.postMessage({ type: 'loadCapture', url, tailMs: DEFAULT_TAIL_MS })
       } else if (selected.dump?.hasCsv) {
-        // Dump-only: render curves from NOTEON_TICK.last (and peak as secondary).
-        const dumpCsv = await fetchDumpFileText(ts, 'dump', 'csv')
-        const curves = parseDumpCurves(dumpCsv, false)
-        const ids = Array.from(curves.pts.keys())
-        setSeriesIds(ids)
-        setXMin(curves.xMin)
-        setXMax(curves.xMax)
-        setZoomRange({ x0: curves.xMin, x1: curves.xMax })
-
-        // Build initial view pairs.
-        const x0 = curves.xMin
-        const x1 = curves.xMax
-        const m = new Map<string, Array<[number, number, number?]>>()
-        for (const id of ids) {
-          m.set(id, downsampleBucketLast(curves.pts.get(id) || [], x0, x1, buckets))
-        }
-        setViewPairsById(m)
+        // Dump-only chart is produced from dump.csv tail parsing.
+        return
       } else {
         setSeriesIds([])
         setViewPairsById(new Map())
@@ -567,7 +700,7 @@ export default function DumpsPage() {
       }
     }
 
-    Promise.all([loadTxt(), loadDumpEvents(), loadChart()])
+    Promise.all([loadTxt(), loadDumpCsvTail(), loadChart()])
       .then(() => setStatus(''))
       .catch((e) => {
         setErr(String(e?.message || e))
@@ -585,13 +718,15 @@ export default function DumpsPage() {
       if (dumpCsvViewJobRef.current !== jobId) return
       const header = dumpCsvHeaderRef.current || []
       const rowsLen = dumpCsvRowsRef.current.length
+      const head = dumpCsvHeadRef.current
       const matches = dumpCsvMatchesRef.current
 
       let base: number[]
       if (matches) {
-        base = matches.slice()
+        base = matches.filter((i) => i >= head)
       } else {
-        base = Array.from({ length: rowsLen }, (_, i) => i)
+        const n = Math.max(0, rowsLen - head)
+        base = Array.from({ length: n }, (_, i) => head + i)
       }
 
       const tmsCol = header.findIndex((h) => String(h || '').toLowerCase() === 't_ms')
@@ -663,11 +798,13 @@ export default function DumpsPage() {
     }
 
     dumpCsvMatchesRef.current = []
-    let i = 0
+    let i = dumpCsvHeadRef.current
     const step = () => {
       if (dumpCsvFilterJobRef.current !== jobId) return
       const out = dumpCsvMatchesRef.current || []
       const t0 = performance.now()
+      const head = dumpCsvHeadRef.current
+      if (i < head) i = head
       for (; i < dumpCsvRowsRef.current.length; i++) {
         if (dumpCsvRowMatches(dumpCsvRowsRef.current[i], terms)) out.push(i)
         if (performance.now() - t0 > 10) break
@@ -678,109 +815,6 @@ export default function DumpsPage() {
     }
     setTimeout(step, 0)
   }, [dumpCsvFilterDebounced])
-
-  useEffect(() => {
-    const raw = String(dumpCsvRaw || '')
-    const jobId = ++dumpCsvParseJobRef.current
-
-    dumpCsvHeaderRef.current = null
-    dumpCsvRowsRef.current = []
-    dumpCsvTmsRef.current = []
-    dumpCsvMatchesRef.current = null
-    dumpCsvViewIndicesRef.current = []
-    setDumpCsvParsedCount(0)
-    setDumpCsvTableRev((v) => v + 1)
-    setDumpCsvTableScrollTop(0)
-
-    if (!raw) {
-      setDumpCsvParsing(false)
-      return
-    }
-
-    setDumpCsvParsing(true)
-
-    // Stream line-by-line without raw.split('\n') to keep UI responsive.
-    let pos = 0
-    let header: string[] | null = null
-    let tmsIdx = -1
-
-    const readLine = () => {
-      if (pos >= raw.length) return null
-      let nl = raw.indexOf('\n', pos)
-      if (nl === -1) nl = raw.length
-      const line = raw.slice(pos, nl)
-      pos = nl + 1
-      return line
-    }
-
-    const parseRow = (line: string) => parseCsvRow(line).map((s) => String(s || '').replace(/^"|"$/g, ''))
-
-    const step = () => {
-      if (dumpCsvParseJobRef.current !== jobId) return
-      const t0 = performance.now()
-      const chunkRows: string[][] = []
-      let parsedAny = false
-
-      for (;;) {
-        const line = readLine()
-        if (line === null) break
-        if (!line) continue
-
-        if (!header) {
-          header = parseRow(line)
-          dumpCsvHeaderRef.current = header
-          tmsIdx = header.findIndex((h) => String(h || '').toLowerCase() === 't_ms')
-          if (dumpCsvSortRef.current.col === null) {
-            setDumpCsvSort({ col: tmsIdx >= 0 ? tmsIdx : null, dir: 'asc' })
-          }
-          parsedAny = true
-          continue
-        }
-
-        const r0 = parseRow(line)
-        const r = r0.length < header.length ? [...r0, ...Array(header.length - r0.length).fill('')] : r0
-        chunkRows.push(r)
-        parsedAny = true
-
-        if (performance.now() - t0 > 12) break
-      }
-
-      if (chunkRows.length) {
-        dumpCsvRowsRef.current.push(...chunkRows)
-        // Maintain parallel t_ms cache.
-        const base = dumpCsvTmsRef.current.length
-        for (let i = 0; i < chunkRows.length; i++) {
-          const r = chunkRows[i]
-          const tv = tmsIdx >= 0 ? Number.parseFloat(String(r[tmsIdx] || '')) : NaN
-          dumpCsvTmsRef.current.push(tv)
-        }
-
-        const terms = dumpCsvTermsRef.current
-        if (terms.length) {
-          const matches = dumpCsvMatchesRef.current || []
-          for (let i = 0; i < chunkRows.length; i++) {
-            if (dumpCsvRowMatches(chunkRows[i], terms)) matches.push(base + i)
-          }
-          dumpCsvMatchesRef.current = matches
-        }
-      }
-
-      if (parsedAny) {
-        setDumpCsvParsedCount(dumpCsvRowsRef.current.length)
-        setDumpCsvTableRev((v) => v + 1)
-        scheduleDumpCsvViewBuild()
-      }
-
-      if (pos < raw.length) {
-        setTimeout(step, 0)
-      } else {
-        setDumpCsvParsing(false)
-        scheduleDumpCsvViewBuild(0)
-      }
-    }
-
-    setTimeout(step, 0)
-  }, [dumpCsvRaw])
 
   const dumpCsvTableInfo = useMemo(() => {
     // Depends on dumpCsvTableRev so filter-match updates re-render.
@@ -796,7 +830,7 @@ export default function DumpsPage() {
 
   const chartOption = useMemo(() => {
     const evByKey = new Map<string, DumpEvent[]>()
-    for (const e of events) {
+      for (const e of events) {
       const key = `${e.deviceId}:${e.hid}`
       const arr = evByKey.get(key) || []
       arr.push(e)
@@ -865,9 +899,16 @@ export default function DumpsPage() {
         if (isEdge) {
           title = ev.kind === 'down' ? 'DOWN' : 'UP'
         } else {
-          const on = kindName.includes('noteon') || evName.includes('NOTEON')
-          const off = kindName.includes('noteoff') || evName.includes('NOTEOFF')
-          title = on ? 'MIDI ON' : off ? 'MIDI OFF' : 'MIDI'
+          const kn = kindName.toLowerCase()
+          if (kn.includes('noteon')) {
+            title = kn.includes('tap') ? 'MIDI ON (tap)' : 'MIDI ON'
+          } else if (kn.includes('noteoff')) {
+            if (kn.includes('scheduled')) title = 'MIDI OFF (scheduled)'
+            else if (kn.includes('fallback')) title = 'MIDI OFF (fallback)'
+            else title = 'MIDI OFF'
+          } else {
+            title = 'MIDI'
+          }
         }
 
         let detailStr = ''
@@ -983,6 +1024,44 @@ export default function DumpsPage() {
     }
     // Note: thr_at is intentionally not rendered as a horizontal reference line.
 
+    // MIDI reference lines.
+    const midiLines: any[] = []
+    for (const e of events) {
+      const evName = String(e.event || '')
+      const kindName = String(e.kind || '').toLowerCase()
+      const isMidi = evName === 'MIDI' || evName.startsWith('MIDI_')
+      if (!isMidi) continue
+      if (!kindName.includes('noteon') && !kindName.includes('noteoff')) continue
+      if (!Number.isFinite(e.xMs)) continue
+
+      let title = 'MIDI'
+      if (kindName.includes('noteon')) {
+        title = kindName.includes('tap') ? 'MIDI ON (tap)' : 'MIDI ON'
+      } else if (kindName.includes('noteoff')) {
+        if (kindName.includes('scheduled')) title = 'MIDI OFF (scheduled)'
+        else if (kindName.includes('fallback')) title = 'MIDI OFF (fallback)'
+        else title = 'MIDI OFF'
+      }
+
+      let suffix = ''
+      const ch = Number.isFinite(e.ch as number) ? Number(e.ch) : null
+      const note = Number.isFinite(e.note as number) ? Number(e.note) : null
+      const vel = Number.isFinite(e.vel as number) ? Number(e.vel) : null
+      if (ch !== null && note !== null) {
+        const v = vel !== null ? ` v${vel}` : ''
+        suffix = ` (${ch}-${note}${v})`
+      }
+      const kn = displayKey(e.deviceId, e.hid)
+      const id = `${e.deviceId}:${e.hid}`
+      const col = hashColor(id)
+      midiLines.push({
+        xAxis: e.xMs,
+        name: `${title}${suffix} ${kn}`,
+        lineStyle: { color: col, opacity: 0.55, width: 1, type: 'dashed' },
+        label: { show: false },
+      })
+    }
+
     // Cursor: vertical reference line only.
     if (cursorX !== null) {
       refLines.push({
@@ -992,6 +1071,28 @@ export default function DumpsPage() {
         label: { show: false },
       })
     }
+
+      const extras: any[] = []
+      if (midiLines.length) {
+        extras.push({
+          name: 'midi',
+          type: 'line',
+          yAxisIndex: 0,
+          data: [],
+          silent: true,
+          legendHoverLink: false,
+          hoverAnimation: false,
+          markLine: {
+            symbol: 'none',
+            precision: -1,
+            lineStyle: { width: 1, type: 'dashed', opacity: 0.55 },
+            label: { show: false },
+            tooltip: { show: true },
+            emphasis: { disabled: true },
+            data: midiLines,
+          },
+        })
+      }
 
       return {
         animation: false,
@@ -1079,29 +1180,32 @@ export default function DumpsPage() {
           textStyle: { color: 'rgba(255,255,255,0.65)' },
         },
       ],
-        series: refLines.length
-          ? [
-              ...series,
-              {
-                name: 'refs',
-                type: 'line',
-                yAxisIndex: 0,
-                data: [],
-                silent: true,
-                legendHoverLink: false,
-                hoverAnimation: false,
-                markLine: {
-                  symbol: 'none',
-                  precision: -1,
-                  lineStyle: { width: 1, opacity: 1 },
-                  label: { show: true, formatter: '{b}' },
-                  tooltip: { show: false },
-                  emphasis: { disabled: true },
-                  data: refLines,
+        series: [
+          ...series,
+          ...extras,
+          ...(refLines.length
+            ? [
+                {
+                  name: 'refs',
+                  type: 'line',
+                  yAxisIndex: 0,
+                  data: [],
+                  silent: true,
+                  legendHoverLink: false,
+                  hoverAnimation: false,
+                  markLine: {
+                    symbol: 'none',
+                    precision: -1,
+                    lineStyle: { width: 1, opacity: 1 },
+                    label: { show: true, formatter: '{b}' },
+                    tooltip: { show: false },
+                    emphasis: { disabled: true },
+                    data: refLines,
+                  },
                 },
-              },
-            ]
-          : series,
+              ]
+            : []),
+        ],
       }
   }, [seriesIds, viewPairsById, events, cfg, cursorX, selected, boardByDeviceId, xMin, xMax, legendSelectedByName])
 
@@ -1144,10 +1248,18 @@ export default function DumpsPage() {
         evName.startsWith('MIDI_') ||
         (evName.startsWith('MIDI') && (kindName.includes('noteon') || kindName.includes('noteoff')))
       if (!isMidi) continue
-      const id = `${e.deviceId}:${e.hid}`
-      const col = hashColor(id)
-      const on = kindName.includes('noteon') || evName.includes('NOTEON')
-      const off = kindName.includes('noteoff') || evName.includes('NOTEOFF')
+      if (!Number.isFinite(e.xMs)) continue
+
+      const knLower = kindName.toLowerCase()
+      let title = 'MIDI'
+      if (knLower.includes('noteon')) {
+        title = knLower.includes('tap') ? 'MIDI ON (tap)' : 'MIDI ON'
+      } else if (knLower.includes('noteoff')) {
+        if (knLower.includes('scheduled')) title = 'MIDI OFF (scheduled)'
+        else if (knLower.includes('fallback')) title = 'MIDI OFF (fallback)'
+        else title = 'MIDI OFF'
+      }
+
       let suffix = ''
       const ch = Number.isFinite(e.ch as number) ? Number(e.ch) : null
       const note = Number.isFinite(e.note as number) ? Number(e.note) : null
@@ -1156,10 +1268,13 @@ export default function DumpsPage() {
         const v = vel !== null ? ` v${vel}` : ''
         suffix = ` (${ch}-${note}${v})`
       }
+
+      const id = `${e.deviceId}:${e.hid}`
+      const col = hashColor(id)
       const kn = displayKey(e.deviceId, e.hid)
       midiLines.push({
         xAxis: e.xMs,
-        name: `${on ? 'MIDI ON' : off ? 'MIDI OFF' : 'MIDI'}${suffix} ${kn}`,
+        name: `${title}${suffix} ${kn}`,
         lineStyle: { color: col, opacity: 0.55, width: 1, type: 'dashed' },
         label: { show: false },
       })
@@ -1255,6 +1370,59 @@ export default function DumpsPage() {
       ],
     }
   }, [events, zoomRange, boardByDeviceId, legendSelectedByName])
+
+  const lagOption = useMemo(() => {
+    if (!lagPts.length) return null
+    const pts = lagPts.slice().filter(([x, y]) => Number.isFinite(x) && Number.isFinite(y))
+    if (!pts.length) return null
+    pts.sort((a, b) => a[0] - b[0])
+    const maxLag = pts.reduce((m, p) => Math.max(m, p[1]), 0)
+    const yMax = Math.max(5, Math.min(5000, Math.ceil(maxLag * 1.2)))
+    return {
+      animation: false,
+      backgroundColor: 'transparent',
+      grid: { left: 58, right: 18, top: 10, bottom: 18 },
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'line', triggerEmphasis: false },
+        confine: true,
+        formatter: (params: any) => {
+          const p = Array.isArray(params) ? params[0] : params
+          const x = Number(p?.value?.[0])
+          const y = Number(p?.value?.[1])
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return ''
+          return `<div style="font-size:12px"><div style="opacity:.85;margin-bottom:4px">t=${x.toFixed(1)}ms</div><div>lag: <b>${y.toFixed(0)}ms</b></div></div>`
+        },
+      },
+      xAxis: {
+        type: 'value',
+        min: zoomRange.x0,
+        max: zoomRange.x1,
+        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.25)' } },
+        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.08)' } },
+      },
+      yAxis: {
+        type: 'value',
+        min: 0,
+        max: yMax,
+        axisLabel: { color: 'rgba(255,255,255,0.65)' },
+        axisLine: { lineStyle: { color: 'rgba(255,255,255,0.25)' } },
+        splitLine: { lineStyle: { color: 'rgba(255,255,255,0.08)' } },
+      },
+      series: [
+        {
+          name: 'lag',
+          type: 'line',
+          showSymbol: false,
+          data: pts.map(([x, y]) => [x, y]),
+          lineStyle: { width: 1.2, color: 'rgba(255,180,80,0.95)', opacity: 0.95 },
+          emphasis: { disabled: true },
+          legendHoverLink: false,
+          hoverAnimation: false,
+        },
+      ],
+    }
+  }, [lagPts, zoomRange])
 
   const renderTxt = (txt: string) => {
     const parts: any[] = []
@@ -1503,6 +1671,15 @@ export default function DumpsPage() {
               </div>
             </div>
 
+            {lagOption ? (
+              <div style={{ marginTop: 10 }}>
+                <div className="dpMut" style={{ fontSize: 12, margin: '0 0 6px 2px' }}>
+                  Lag
+                </div>
+                <ReactECharts option={lagOption} style={{ height: 140, width: '100%' }} notMerge={false} lazyUpdate />
+              </div>
+            ) : null}
+
             {atOption ? (
               <div style={{ marginTop: 10 }}>
                 <div className="dpMut" style={{ fontSize: 12, margin: '0 0 6px 2px' }}>
@@ -1538,6 +1715,9 @@ export default function DumpsPage() {
                   <span className="dpMut" style={{ marginLeft: 8 }}>
                     rows={dumpCsvTableInfo.total}
                     {dumpCsvTableInfo.parsing ? ' (parsing...)' : ''}
+                  </span>
+                  <span className="dpMut" style={{ marginLeft: 8 }}>
+                    window=30s
                   </span>
                   {dumpCsvMatchesRef.current ? (
                     <span className="dpMut" style={{ marginLeft: 8 }}>
