@@ -236,17 +236,73 @@ app.get(`${API_BASE}/dumps/:ts/:kind.:ext`, async (req, res) => {
   const outDir = await resolveOutputDir()
   const name = `${ts}_${kind}.${ext}`
   const fp = path.join(outDir, name)
+  let st = null
   try {
-    const st = await fs.stat(fp)
+    st = await fs.stat(fp)
     if (!st.isFile()) throw new Error('not file')
   } catch {
     res.status(404).send('Not found')
     return
   }
 
+  const total = Number(st.size || 0)
+  const range = String(req.headers.range || '')
+  let start = 0
+  let end = Math.max(0, total - 1)
+  let partial = false
+
+  if (range) {
+    const m = range.match(/^bytes=(\d*)-(\d*)$/)
+    if (!m) {
+      res.status(416).setHeader('Content-Range', `bytes */${total}`).end()
+      return
+    }
+    const a = m[1]
+    const b = m[2]
+    if (a === '' && b === '') {
+      res.status(416).setHeader('Content-Range', `bytes */${total}`).end()
+      return
+    }
+
+    if (a === '') {
+      // suffix: last N bytes
+      const n = Number.parseInt(b, 10)
+      if (!Number.isFinite(n) || n <= 0) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`).end()
+        return
+      }
+      start = Math.max(0, total - n)
+      end = Math.max(0, total - 1)
+    } else {
+      start = Number.parseInt(a, 10)
+      end = b === '' ? Math.max(0, total - 1) : Number.parseInt(b, 10)
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`).end()
+        return
+      }
+      if (start >= total) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`).end()
+        return
+      }
+      end = Math.min(end, Math.max(0, total - 1))
+    }
+    partial = true
+  }
+
+  const contentLen = Math.max(0, end - start + 1)
+  res.setHeader('Accept-Ranges', 'bytes')
+  if (partial) {
+    res.status(206)
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`)
+    res.setHeader('Content-Length', String(contentLen))
+  } else {
+    res.setHeader('Content-Length', String(total))
+  }
+
   res.setHeader('Cache-Control', 'no-store')
   res.setHeader('Content-Type', ext === 'csv' ? 'text/csv; charset=utf-8' : 'text/plain; charset=utf-8')
-  const stream = fsSync.createReadStream(fp)
+
+  const stream = fsSync.createReadStream(fp, { start, end: partial ? end : undefined })
   stream.on('error', () => {
     res.status(500).end('Read error')
   })

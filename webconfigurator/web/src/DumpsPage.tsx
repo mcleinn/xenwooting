@@ -36,7 +36,9 @@ type DumpEvent = {
 
 type CurvePoint = { x: number; last: number; peak?: number }
 
-const DEFAULT_TAIL_MS = 30_000
+type SeriesPoint = [number, number | null, number?]
+
+const DEFAULT_TAIL_MS = 15_000
 
 type DumpCsvTerm =
   | { kind: 'exact'; needle: string }
@@ -160,12 +162,18 @@ export default function DumpsPage() {
   const [seriesIds, setSeriesIds] = useState<string[]>([])
   const [xMin, setXMin] = useState<number>(0)
   const [xMax, setXMax] = useState<number>(1)
-  const [viewPairsById, setViewPairsById] = useState<Map<string, Array<[number, number, number?]>>>(new Map())
+  const [viewPairsById, setViewPairsById] = useState<Map<string, SeriesPoint[]>>(new Map())
   const [events, setEvents] = useState<DumpEvent[]>([])
   const [lagPts, setLagPts] = useState<Array<[number, number]>>([])
   const [cursorX, setCursorX] = useState<number | null>(null)
   const [boards, setBoards] = useState<DumpBoard[]>([])
   const [eventInfo, setEventInfo] = useState<string>('')
+
+  const [showAllKeys, setShowAllKeys] = useState<boolean>(false)
+  const [activeKeyIds, setActiveKeyIds] = useState<string[]>([])
+
+  const [dumpLoad, setDumpLoad] = useState<{ active: boolean; loaded: number; total: number }>({ active: false, loaded: 0, total: 0 })
+  const [capLoad, setCapLoad] = useState<{ active: boolean; loaded: number; total: number }>({ active: false, loaded: 0, total: 0 })
   const [zoomRange, setZoomRange] = useState<{ x0: number; x1: number }>({ x0: 0, x1: 1 })
   const [legendSelectedByName, setLegendSelectedByName] = useState<Record<string, boolean>>({})
 
@@ -191,8 +199,17 @@ export default function DumpsPage() {
   const dumpCsvSortRef = useRef<{ col: number | null; dir: 'asc' | 'desc' }>(dumpCsvSort)
 
   const lastSessionTsRef = useRef<number | null>(null)
+  const lastCaptureLoadKeyRef = useRef<string>('')
+  const viewReqTimerRef = useRef<number | null>(null)
 
-  const buckets = 1800
+  const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x))
+
+  const chooseBuckets = (spanMs: number) => {
+    const span = Math.max(1, Number(spanMs) || 1)
+    // Heuristic: keep bucket width a few ms for large windows, sub-ms for small zoom ranges.
+    const targetMs = span > 8000 ? 2.5 : span > 3000 ? 1.5 : span > 1200 ? 1.0 : span > 400 ? 0.5 : 0.25
+    return clamp(Math.ceil(span / targetMs), 600, 6000)
+  }
 
   useEffect(() => {
     const w = new Worker(new URL('./dumpsWorker.ts', import.meta.url), { type: 'module' })
@@ -203,6 +220,15 @@ export default function DumpsPage() {
         setErr(String(msg.error || 'worker error'))
         return
       }
+      if (msg.type === 'progress') {
+        const phase = String(msg.phase || '')
+        const loaded = Number(msg.loadedBytes || 0)
+        const total = Number(msg.totalBytes || 0)
+        if (phase === 'capture') {
+          setCapLoad({ active: true, loaded, total })
+        }
+        return
+      }
       if (msg.type === 'loaded') {
         const ids = Array.isArray(msg.seriesIds) ? msg.seriesIds : []
         setSeriesIds(ids)
@@ -210,27 +236,36 @@ export default function DumpsPage() {
         setXMax(Number(msg.xMax || 0) || 1)
         setZoomRange({ x0: Number(msg.xMin || 0), x1: Number(msg.xMax || 0) || 1 })
         // Request full-range view (downsampled); ECharts handles zoom/pan.
-        w.postMessage({ type: 'view', xMin: Number(msg.xMin || 0), xMax: Number(msg.xMax || 0), buckets })
+        const x0 = Number(msg.xMin || 0)
+        const x1 = Number(msg.xMax || 0)
+        w.postMessage({ type: 'view', xMin: x0, xMax: x1, buckets: chooseBuckets(x1 - x0), ids })
         return
       }
       if (msg.type === 'viewData') {
         const xa = Array.isArray(msg.xAxis) ? msg.xAxis : []
         const series = Array.isArray(msg.series) ? msg.series : []
-        const m = new Map<string, Array<[number, number]>>()
+        const m = new Map<string, SeriesPoint[]>()
         for (const s of series) {
           const id = String(s.id || '')
           const data = Array.isArray(s.data) ? s.data : []
-          const pairs: Array<[number, number]> = []
+          const pairs: SeriesPoint[] = []
           for (let i = 0; i < xa.length && i < data.length; i++) {
             const y = data[i]
+            const x = Number(xa[i])
+            if (!Number.isFinite(x)) continue
+
+            // Note: gaps between presses are enforced by EDGE up/down masking + explicit break points.
+            // Do not treat "no sample in this bucket" as a signal gap; that makes held presses look dashed.
             if (y === null || y === undefined) continue
+
             const yy = Number(y)
             if (!Number.isFinite(yy)) continue
-            pairs.push([Number(xa[i]), yy])
+            pairs.push([x, yy])
           }
           if (pairs.length) m.set(id, pairs)
         }
         setViewPairsById(m)
+        setCapLoad((v) => ({ ...v, active: false }))
         return
       }
     }
@@ -379,6 +414,7 @@ export default function DumpsPage() {
     setEventInfo('')
     setZoomRange({ x0: xMin, x1: xMax })
     setLegendSelectedByName({})
+    setActiveKeyIds([])
 
     // reset dump.csv parsing state
     dumpCsvParseJobRef.current++
@@ -407,10 +443,11 @@ export default function DumpsPage() {
       setCfg(parseCfg(`${capTxt}\n${dTxt}`))
     }
 
-    const loadDumpCsvTail = async () => {
+    const loadDumpCsvTail = async (): Promise<string[]> => {
       if (!selected.dump?.hasCsv) {
         setEvents([])
-        return
+        setActiveKeyIds([])
+        return []
       }
 
       const jobId = ++dumpCsvParseJobRef.current
@@ -428,14 +465,29 @@ export default function DumpsPage() {
       setDumpCsvTableScrollTop(0)
       setDumpCsvParsing(true)
 
-      const res = await fetch(url)
+      const headRes = await fetch(url, { headers: { Range: 'bytes=0-4095' } })
+      const headText = headRes.ok ? await headRes.text().catch(() => '') : ''
+      const headerLine = String(headText || '').split('\n')[0] || ''
+
+      const sizeHint = Number(selected.dump?.sizeCsv || 0)
+      const tailBytes = Math.max(256 * 1024, Math.min(sizeHint || 0, 4 * 1024 * 1024) || 2 * 1024 * 1024)
+      setDumpLoad({ active: true, loaded: 0, total: tailBytes })
+
+      const res = await fetch(url, { headers: { Range: `bytes=-${tailBytes}` } })
       if (!res.ok) throw new Error(`fetch failed: ${res.status}`)
       if (!res.body) throw new Error('no body')
 
+      const totalBytes = Number.parseInt(String(res.headers.get('content-length') || ''), 10) || tailBytes
+      setDumpLoad({ active: true, loaded: 0, total: totalBytes })
+
       const reader = res.body.getReader()
       const dec = new TextDecoder('utf-8')
-      let buf = ''
+      let buf = headerLine ? `${headerLine.trimEnd()}\n` : ''
       let header: string[] | null = null
+
+      let skipPartialFirstLine = Boolean(headerLine)
+      let bytesRead = 0
+      let lastProgressAt = 0
 
       let iTms = -1
       let iCap = -1
@@ -493,10 +545,17 @@ export default function DumpsPage() {
       }
 
       for (;;) {
-        if (dumpCsvParseJobRef.current !== jobId) return
+        if (dumpCsvParseJobRef.current !== jobId) return []
         const { value, done } = await reader.read()
         if (done) break
+        bytesRead += value?.byteLength || 0
         buf += dec.decode(value, { stream: true })
+
+        const now = performance.now()
+        if (now - lastProgressAt > 60) {
+          lastProgressAt = now
+          setDumpLoad({ active: true, loaded: bytesRead, total: totalBytes })
+        }
 
         for (;;) {
           const nl = buf.indexOf('\n')
@@ -504,6 +563,12 @@ export default function DumpsPage() {
           const line = buf.slice(0, nl).trimEnd()
           buf = buf.slice(nl + 1)
           if (!line) continue
+
+          if (header && skipPartialFirstLine) {
+            // Range reads often start mid-line; drop the first fragment.
+            skipPartialFirstLine = false
+            continue
+          }
 
           const row = parseCsvRow(line).map((s) => String(s || '').replace(/^"|"$/g, ''))
           if (!header) {
@@ -659,7 +724,7 @@ export default function DumpsPage() {
         }
       }
 
-      if (dumpCsvParseJobRef.current !== jobId) return
+      if (dumpCsvParseJobRef.current !== jobId) return []
       if (Number.isFinite(xMax) && DEFAULT_TAIL_MS > 0) {
         const xMin = Math.max(0, xMax - DEFAULT_TAIL_MS)
         // Dump-only: finalize curves + x-range.
@@ -670,9 +735,10 @@ export default function DumpsPage() {
           setXMax(xMax)
           setZoomRange({ x0: xMin, x1: xMax })
           const m = new Map<string, Array<[number, number, number?]>>()
+          const nb = chooseBuckets(xMax - xMin)
           for (const id of ids) {
             const pts = (curvePts.get(id) || []).filter((p) => p.x >= xMin)
-            m.set(id, downsampleBucketLast(pts, xMin, xMax, buckets))
+            m.set(id, downsampleBucketLast(pts, xMin, xMax, nb))
           }
           setViewPairsById(m)
         }
@@ -680,16 +746,33 @@ export default function DumpsPage() {
 
       setEvents(eventsTail)
       setLagPts(lagTail)
+      const active = new Set<string>()
+      for (const e of eventsTail) {
+        if (e.event === 'EDGE' && (e.kind === 'down' || e.kind === 'up')) {
+          active.add(`${e.deviceId}:${e.hid}`)
+        }
+      }
+      const activeList = Array.from(active.values()).sort()
+      setActiveKeyIds(activeList)
       setDumpCsvParsing(false)
+      setDumpLoad({ active: false, loaded: totalBytes, total: totalBytes })
       setDumpCsvParsedCount(dumpCsvRowsRef.current.length - dumpCsvHeadRef.current)
       setDumpCsvTableRev((v) => v + 1)
       scheduleDumpCsvViewBuild(0)
+
+      return activeList
     }
 
-    const loadChart = async () => {
+    const loadChart = async (activeIds: string[]) => {
       if (selected.capture?.hasCsv) {
         const url = apiUrl(`api/dumps/${encodeURIComponent(String(ts))}/capture.csv`)
-        workerRef.current?.postMessage({ type: 'loadCapture', url, tailMs: DEFAULT_TAIL_MS })
+        const sizeHint = Number(selected.capture?.sizeCsv || 0)
+        const tailBytes = Math.max(256 * 1024, Math.min(sizeHint || 0, 4 * 1024 * 1024) || 2 * 1024 * 1024)
+        const wantedIds = showAllKeys ? [] : activeIds
+        const modeKey = `${ts}:${showAllKeys ? 'all' : 'active'}:${wantedIds.length}:${tailBytes}`
+        lastCaptureLoadKeyRef.current = modeKey
+        setCapLoad({ active: true, loaded: 0, total: tailBytes })
+        workerRef.current?.postMessage({ type: 'loadCapture', url, tailMs: DEFAULT_TAIL_MS, tailBytes, wantedIds })
       } else if (selected.dump?.hasCsv) {
         // Dump-only chart is produced from dump.csv tail parsing.
         return
@@ -700,13 +783,61 @@ export default function DumpsPage() {
       }
     }
 
-    Promise.all([loadTxt(), loadDumpCsvTail(), loadChart()])
-      .then(() => setStatus(''))
-      .catch((e) => {
+    ;(async () => {
+      try {
+        await loadTxt()
+        const activeIds = await loadDumpCsvTail()
+        await loadChart(activeIds)
+        setStatus('')
+      } catch (e: any) {
         setErr(String(e?.message || e))
         setStatus('')
-      })
+      }
+    })()
   }, [selected])
+
+  // Reload capture parsing when toggling "show all keys".
+  useEffect(() => {
+    if (!selected?.capture?.hasCsv) return
+    if (!showAllKeys && activeKeyIds.length === 0) return
+    const ts = selected.tsMs
+    const url = apiUrl(`api/dumps/${encodeURIComponent(String(ts))}/capture.csv`)
+    const sizeHint = Number(selected.capture?.sizeCsv || 0)
+    const tailBytes = Math.max(256 * 1024, Math.min(sizeHint || 0, 4 * 1024 * 1024) || 2 * 1024 * 1024)
+    const wantedIds = showAllKeys ? [] : activeKeyIds
+
+    const modeKey = `${ts}:${showAllKeys ? 'all' : 'active'}:${wantedIds.length}:${tailBytes}`
+    if (modeKey === lastCaptureLoadKeyRef.current) return
+    lastCaptureLoadKeyRef.current = modeKey
+
+    setCapLoad({ active: true, loaded: 0, total: tailBytes })
+    workerRef.current?.postMessage({ type: 'loadCapture', url, tailMs: DEFAULT_TAIL_MS, tailBytes, wantedIds })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showAllKeys, selected?.tsMs, activeKeyIds.join(',')])
+
+  // Recompute capture downsampling when zoom changes (keeps presses smooth).
+  useEffect(() => {
+    if (!selected?.capture?.hasCsv) return
+    const w = workerRef.current
+    if (!w) return
+    if (!seriesIds.length) return
+
+    if (viewReqTimerRef.current !== null) {
+      window.clearTimeout(viewReqTimerRef.current)
+      viewReqTimerRef.current = null
+    }
+
+    const x0 = Number(zoomRange.x0)
+    const x1 = Number(zoomRange.x1)
+    if (!Number.isFinite(x0) || !Number.isFinite(x1) || x1 <= x0) return
+    const span = x1 - x0
+    const buckets = chooseBuckets(span)
+
+    viewReqTimerRef.current = window.setTimeout(() => {
+      viewReqTimerRef.current = null
+      w.postMessage({ type: 'view', xMin: x0, xMax: x1, buckets, ids: seriesIds })
+    }, 80)
+  }, [zoomRange.x0, zoomRange.x1, selected?.tsMs, seriesIds.join(',')])
 
   const scheduleDumpCsvViewBuild = (throttleMs = 120) => {
     const now = performance.now()
@@ -721,12 +852,34 @@ export default function DumpsPage() {
       const head = dumpCsvHeadRef.current
       const matches = dumpCsvMatchesRef.current
 
+      const zx0 = Number(zoomRange.x0)
+      const zx1 = Number(zoomRange.x1)
+      const useZoom = Number.isFinite(zx0) && Number.isFinite(zx1) && zx1 > zx0
+      const xms = dumpCsvXmsRef.current
+
       let base: number[]
       if (matches) {
-        base = matches.filter((i) => i >= head)
+        base = matches.filter((i) => {
+          if (i < head) return false
+          if (!useZoom) return true
+          const x = xms[i]
+          return Number.isFinite(x) && x >= zx0 && x <= zx1
+        })
       } else {
-        const n = Math.max(0, rowsLen - head)
-        base = Array.from({ length: n }, (_, i) => head + i)
+        if (!useZoom) {
+          const n = Math.max(0, rowsLen - head)
+          base = Array.from({ length: n }, (_, i) => head + i)
+        } else {
+          // Times are in file order; scan only the visible window.
+          base = []
+          for (let i = head; i < rowsLen; i++) {
+            const x = xms[i]
+            if (!Number.isFinite(x)) continue
+            if (x < zx0) continue
+            if (x > zx1) continue
+            base.push(i)
+          }
+        }
       }
 
       const tmsCol = header.findIndex((h) => String(h || '').toLowerCase() === 't_ms')
@@ -816,13 +969,20 @@ export default function DumpsPage() {
     setTimeout(step, 0)
   }, [dumpCsvFilterDebounced])
 
+  // Keep the table time window synced to the chart zoom/pan.
+  useEffect(() => {
+    scheduleDumpCsvViewBuild(120)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoomRange.x0, zoomRange.x1])
+
   const dumpCsvTableInfo = useMemo(() => {
     // Depends on dumpCsvTableRev so filter-match updates re-render.
     void dumpCsvTableRev
     const header = dumpCsvHeaderRef.current
     const total = dumpCsvParsedCount
     const viewLen = dumpCsvViewIndicesRef.current.length
-    const filtered = viewLen ? viewLen : dumpCsvMatchesRef.current ? dumpCsvMatchesRef.current.length : total
+    // viewIndices is the authoritative view after search + time window + sort.
+    const filtered = header ? viewLen : dumpCsvMatchesRef.current ? dumpCsvMatchesRef.current.length : total
     return { header, total, filtered, parsing: dumpCsvParsing }
   }, [dumpCsvParsedCount, dumpCsvParsing, dumpCsvTableRev])
 
@@ -830,7 +990,7 @@ export default function DumpsPage() {
 
   const chartOption = useMemo(() => {
     const evByKey = new Map<string, DumpEvent[]>()
-      for (const e of events) {
+    for (const e of events) {
       const key = `${e.deviceId}:${e.hid}`
       const arr = evByKey.get(key) || []
       arr.push(e)
@@ -841,12 +1001,18 @@ export default function DumpsPage() {
 
     const series: any[] = []
     const edgePointsById = new Map<string, Array<any>>()
-    const breaksById = new Map<string, Array<[number, null, null]>>()
+    const breaksById = new Map<string, SeriesPoint[]>()
+    const edgeEventsById = new Map<string, Array<{ xMs: number; kind: 'down' | 'up' }>>()
     for (const e of events) {
       if (e.event !== 'EDGE') continue
       if (e.kind !== 'down' && e.kind !== 'up') continue
       if (!Number.isFinite(e.analog as number)) continue
       const id = `${e.deviceId}:${e.hid}`
+
+      const ee = edgeEventsById.get(id) || []
+      ee.push({ xMs: e.xMs, kind: e.kind })
+      edgeEventsById.set(id, ee)
+
       const arr = edgePointsById.get(id) || []
       const title = e.kind === 'down' ? 'DOWN' : 'UP'
       arr.push({
@@ -872,9 +1038,38 @@ export default function DumpsPage() {
       // Ensure the line breaks after UP so separate presses don't connect.
       if (e.kind === 'up') {
         const b = breaksById.get(id) || []
-        b.push([e.xMs + 0.001, null, null])
+        b.push([e.xMs + 0.001, null])
         breaksById.set(id, b)
       }
+    }
+
+    for (const [id, ee] of edgeEventsById.entries()) {
+      ee.sort((a, b) => a.xMs - b.xMs)
+      edgeEventsById.set(id, ee)
+    }
+
+    const useEdgeMask = Boolean(selected?.capture?.hasCsv)
+
+    const filterToPressed = (id: string, base: SeriesPoint[]) => {
+      if (!useEdgeMask) return base
+      const ee = edgeEventsById.get(id) || []
+      if (!ee.length) return [] as SeriesPoint[]
+
+      // If the first edge we see is an UP, assume the key was pressed at the window start.
+      let pressed = ee[0].kind === 'up'
+      let j = 0
+
+      const out: SeriesPoint[] = []
+      for (const p of base) {
+        const x = p[0]
+        while (j < ee.length && ee[j].xMs <= x) {
+          pressed = ee[j].kind === 'down'
+          j++
+        }
+        if (!pressed) continue
+        out.push(p)
+      }
+      return out
     }
 
     for (const id of seriesIds) {
@@ -882,7 +1077,8 @@ export default function DumpsPage() {
       const hid = rest.join(':')
       const name = displayKey(dev, hid)
       const color = hashColor(id)
-      const data = viewPairsById.get(id) || []
+      const data0 = viewPairsById.get(id) || []
+      const data = filterToPressed(id, data0)
 
       const marks: any[] = []
       for (const ev of evByKey.get(id) || []) {
@@ -945,6 +1141,7 @@ export default function DumpsPage() {
         name,
         type: 'line',
         showSymbol: false,
+        connectNulls: false,
         data: [...data, ...(edgePointsById.get(id) || []), ...(breaksById.get(id) || [])].sort((a: any, b: any) => {
           const ax = Array.isArray(a) ? a[0] : Array.isArray(a?.value) ? a.value[0] : 0
           const bx = Array.isArray(b) ? b[0] : Array.isArray(b?.value) ? b.value[0] : 0
@@ -1424,6 +1621,20 @@ export default function DumpsPage() {
     }
   }, [lagPts, zoomRange])
 
+  const overlay = useMemo(() => {
+    const active = dumpLoad.active || capLoad.active || dumpCsvParsing
+    if (!active) return { active: false, title: '', pct: null as number | null, detail: '' }
+
+    const useCap = capLoad.active
+    const title = useCap ? 'Loading capture (high-res)...' : dumpLoad.active || dumpCsvParsing ? 'Loading dump events...' : 'Loading...'
+    const loaded = useCap ? capLoad.loaded : dumpLoad.loaded
+    const total = useCap ? capLoad.total : dumpLoad.total
+    const pct = total > 0 && loaded >= 0 ? Math.max(0, Math.min(1, loaded / total)) : null
+    const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)}MiB`
+    const detail = total > 0 ? `${mb(loaded)} / ${mb(total)}` : ''
+    return { active: true, title, pct, detail }
+  }, [dumpLoad, capLoad, dumpCsvParsing])
+
   const renderTxt = (txt: string) => {
     const parts: any[] = []
     const re = /\b(\d+)ms\b/g
@@ -1532,7 +1743,7 @@ export default function DumpsPage() {
             <small className="dpMut"></small>
           </div>
 
-          <div className="dpChartWrap">
+          <div className="dpChartWrap" style={{ position: 'relative' }}>
             <div
               style={{ overflow: 'hidden' }}
             >
@@ -1606,6 +1817,54 @@ export default function DumpsPage() {
               )}
             </div>
 
+            {overlay.active ? (
+              <div
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  zIndex: 8,
+                  background: 'rgba(0,0,0,0.62)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  pointerEvents: 'auto',
+                }}
+              >
+                <div
+                  style={{
+                    width: 'min(560px, 92%)',
+                    padding: '16px 16px 14px 16px',
+                    borderRadius: 14,
+                    background: 'rgba(18,18,18,0.92)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    boxShadow: '0 18px 60px rgba(0,0,0,0.45)',
+                  }}
+                >
+                  <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>{overlay.title}</div>
+                  <div style={{ height: 10, borderRadius: 999, background: 'rgba(255,255,255,0.10)', overflow: 'hidden' }}>
+                    <div
+                      style={{
+                        height: '100%',
+                        width: `${overlay.pct !== null ? (overlay.pct * 100).toFixed(1) : 20}%`,
+                        background:
+                          overlay.pct !== null
+                            ? 'linear-gradient(90deg, rgba(120,220,255,0.95), rgba(255,210,120,0.95))'
+                            : 'linear-gradient(90deg, rgba(255,255,255,0.25), rgba(255,255,255,0.10))',
+                        transition: 'width 120ms linear',
+                      }}
+                    />
+                  </div>
+                  <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', fontSize: 12 }}>
+                    <div className="dpMut">{overlay.detail}</div>
+                    <div className="dpMut">{overlay.pct !== null ? `${Math.round(overlay.pct * 100)}%` : ''}</div>
+                  </div>
+                  <div className="dpMut" style={{ marginTop: 10, fontSize: 12 }}>
+                    Parsing is streaming; the chart appears as soon as enough data is ready.
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
             <div className="dpControls">
               <div className="dpControlsLeft">
                 <button
@@ -1656,6 +1915,17 @@ export default function DumpsPage() {
                 >
                   Reset
                 </button>
+
+                {selected?.capture?.hasCsv ? (
+                  <label className="dpMut" style={{ display: 'inline-flex', alignItems: 'center', gap: 8, marginLeft: 12, userSelect: 'none' }}>
+                    <input
+                      type="checkbox"
+                      checked={showAllKeys}
+                      onChange={(e) => setShowAllKeys(Boolean(e.target.checked))}
+                    />
+                    show all keys
+                  </label>
+                ) : null}
               </div>
               <div className="dpMut" style={{ fontSize: 12 }}>
                 {selected?.capture?.hasCsv ? `series=${seriesIds.length}` : ''}
@@ -1717,7 +1987,7 @@ export default function DumpsPage() {
                     {dumpCsvTableInfo.parsing ? ' (parsing...)' : ''}
                   </span>
                   <span className="dpMut" style={{ marginLeft: 8 }}>
-                    window=30s
+                    window=15s
                   </span>
                   {dumpCsvMatchesRef.current ? (
                     <span className="dpMut" style={{ marginLeft: 8 }}>
@@ -1731,7 +2001,7 @@ export default function DumpsPage() {
                     size="small"
                     value={dumpCsvFilter}
                     onChange={(e) => setDumpCsvFilter(e.target.value)}
-                    placeholder="Filter rows (e.g. aft, EDGE, noteon)"
+                    placeholder="Filter rows (e.g. aft*, EDGE, noteon)"
                     fullWidth
                     inputProps={{
                       style: {
@@ -1822,10 +2092,6 @@ export default function DumpsPage() {
                         const header = dumpCsvTableInfo.header || []
                         const view = dumpCsvViewIndicesRef.current
                         const total = view.length
-                          ? view.length
-                          : dumpCsvMatchesRef.current
-                            ? dumpCsvMatchesRef.current.length
-                            : dumpCsvTableInfo.total
                         const rowH = 24
                         const wrapH = dumpCsvTableWrapRef.current?.clientHeight || 520
                         const buffer = 40
@@ -1864,6 +2130,18 @@ export default function DumpsPage() {
                         }
 
                         const rows: any[] = []
+
+                        if (!total) {
+                          rows.push(
+                            <TableRow key="empty">
+                              <TableCell colSpan={Math.max(1, header.length)} style={{ padding: '10px 8px', borderBottom: 'none' }}>
+                                <span className="dpMut">No rows in the current time window / filter.</span>
+                              </TableCell>
+                            </TableRow>,
+                          )
+                          return rows
+                        }
+
                         if (topH) {
                           rows.push(
                             <TableRow key="sp_top">
@@ -1873,11 +2151,7 @@ export default function DumpsPage() {
                         }
 
                         for (let i = start; i < end; i++) {
-                          const idx = view.length
-                            ? view[i]
-                            : dumpCsvMatchesRef.current
-                              ? dumpCsvMatchesRef.current[i]
-                              : i
+                          const idx = view[i]
                           rows.push(makeRow(idx, i))
                         }
 

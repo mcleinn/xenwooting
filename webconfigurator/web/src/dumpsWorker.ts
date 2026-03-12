@@ -16,6 +16,14 @@ const st: State = {
   tailMs: 0,
 }
 
+function parseTotalBytesFromContentRange(v: string | null): number | null {
+  const s = String(v || '')
+  const m = s.match(/\/(\d+)\s*$/)
+  if (!m) return null
+  const n = Number.parseInt(m[1] || '', 10)
+  return Number.isFinite(n) ? n : null
+}
+
 function lowerBound(xs: number[], x: number) {
   let lo = 0
   let hi = xs.length
@@ -56,8 +64,11 @@ function downsampleBucketLast(xs: number[], ys: number[], xStarts: number[], xEn
   return out
 }
 
-async function loadCaptureCsv(url: string) {
-  const res = await fetch(url)
+async function loadCaptureCsv(url: string, opts: { tailBytes: number; wantedIds: Set<string> | null }) {
+  const headers: Record<string, string> = {}
+  if (opts.tailBytes > 0) headers.Range = `bytes=-${opts.tailBytes}`
+
+  const res = await fetch(url, { headers })
   if (!res.ok) throw new Error(`fetch failed: ${res.status}`)
   if (!res.body) throw new Error('no body')
 
@@ -69,12 +80,27 @@ async function loadCaptureCsv(url: string) {
   const reader = res.body.getReader()
   const dec = new TextDecoder('utf-8')
   let buf = ''
-  let isFirstLine = true
+  // capture.csv has a one-line header; if we read a tail range it won't be present.
+  let isFirstLine = opts.tailBytes <= 0
+  let skipPartialFirstLine = opts.tailBytes > 0
+
+  const totalBytes =
+    parseTotalBytesFromContentRange(res.headers.get('content-range')) ??
+    (Number.parseInt(String(res.headers.get('content-length') || ''), 10) || 0)
+  let bytesRead = 0
+  let lastProgressAt = 0
 
   for (;;) {
     const { value, done } = await reader.read()
     if (done) break
+    bytesRead += value?.byteLength || 0
     buf += dec.decode(value, { stream: true })
+
+    const now = Date.now()
+    if (now - lastProgressAt > 60) {
+      lastProgressAt = now
+      self.postMessage({ type: 'progress', phase: 'capture', loadedBytes: bytesRead, totalBytes })
+    }
 
     for (;;) {
       const nl = buf.indexOf('\n')
@@ -82,6 +108,13 @@ async function loadCaptureCsv(url: string) {
       const line = buf.slice(0, nl).trimEnd()
       buf = buf.slice(nl + 1)
       if (!line) continue
+
+      if (skipPartialFirstLine) {
+        skipPartialFirstLine = false
+        // Range reads often start mid-line; drop the first fragment.
+        continue
+      }
+
       if (isFirstLine) {
         isFirstLine = false
         continue
@@ -97,6 +130,7 @@ async function loadCaptureCsv(url: string) {
       if (!Number.isFinite(tUs) || !Number.isFinite(analog)) continue
       const x = tUs / 1000.0
       const id = `${dev}:${hid}`
+      if (opts.wantedIds && !opts.wantedIds.has(id)) continue
       let s = st.seriesById.get(id)
       if (!s) {
         s = { id, xs: [], ys: [], head: 0 }
@@ -120,7 +154,7 @@ async function loadCaptureCsv(url: string) {
 
   // flush last line
   buf = buf.trim()
-  if (buf && !isFirstLine) {
+  if (buf && !isFirstLine && !skipPartialFirstLine) {
     const parts = buf.split(',')
     if (parts.length >= 4) {
       const tUs = Number.parseInt(parts[0] || '', 10)
@@ -130,22 +164,24 @@ async function loadCaptureCsv(url: string) {
       if (Number.isFinite(tUs) && Number.isFinite(analog)) {
         const x = tUs / 1000.0
         const id = `${dev}:${hid}`
-        let s = st.seriesById.get(id)
-        if (!s) {
-          s = { id, xs: [], ys: [], head: 0 }
-          st.seriesById.set(id, s)
-        }
-        s.xs.push(x)
-        s.ys.push(analog)
-        if (x > st.xMax) st.xMax = x
+        if (!opts.wantedIds || opts.wantedIds.has(id)) {
+          let s = st.seriesById.get(id)
+          if (!s) {
+            s = { id, xs: [], ys: [], head: 0 }
+            st.seriesById.set(id, s)
+          }
+          s.xs.push(x)
+          s.ys.push(analog)
+          if (x > st.xMax) st.xMax = x
 
-        if (st.tailMs > 0 && st.xMax > st.tailMs) {
-          const cutoff = st.xMax - st.tailMs
-          while (s.head < s.xs.length && s.xs[s.head] < cutoff) s.head++
-          if (s.head > 20000 && s.head > (s.xs.length >> 1)) {
-            s.xs = s.xs.slice(s.head)
-            s.ys = s.ys.slice(s.head)
-            s.head = 0
+          if (st.tailMs > 0 && st.xMax > st.tailMs) {
+            const cutoff = st.xMax - st.tailMs
+            while (s.head < s.xs.length && s.xs[s.head] < cutoff) s.head++
+            if (s.head > 20000 && s.head > (s.xs.length >> 1)) {
+              s.xs = s.xs.slice(s.head)
+              s.ys = s.ys.slice(s.head)
+              s.head = 0
+            }
           }
         }
       }
@@ -173,7 +209,11 @@ self.onmessage = async (ev: MessageEvent) => {
       const url = String(msg.url || '')
       if (!url) throw new Error('missing url')
       st.tailMs = Number(msg.tailMs || 0)
-      await loadCaptureCsv(url)
+      const tailBytes = Math.max(0, Number(msg.tailBytes || 0))
+      const wantedIdsArr = Array.isArray(msg.wantedIds) ? msg.wantedIds.map((x: any) => String(x || '')).filter(Boolean) : []
+      const wantedIds: Set<string> | null = wantedIdsArr.length ? new Set<string>(wantedIdsArr) : null
+      await loadCaptureCsv(url, { tailBytes, wantedIds })
+      self.postMessage({ type: 'progress', phase: 'capture', loadedBytes: 1, totalBytes: 1 })
       self.postMessage({ type: 'loaded', seriesIds: Array.from(st.seriesById.keys()), xMin: st.xMin, xMax: st.xMax })
       return
     }
@@ -182,6 +222,9 @@ self.onmessage = async (ev: MessageEvent) => {
       const xMin = Number(msg.xMin)
       const xMax = Number(msg.xMax)
       const buckets = Math.max(10, Math.min(6000, Number(msg.buckets || 1400)))
+
+      const idsRaw = Array.isArray(msg.ids) ? msg.ids.map((x: any) => String(x || '')).filter(Boolean) : null
+      const ids = idsRaw && idsRaw.length ? idsRaw : null
 
       const span = Math.max(0.0001, xMax - xMin)
       const xStarts: number[] = []
@@ -196,7 +239,10 @@ self.onmessage = async (ev: MessageEvent) => {
       }
 
       const out = [] as Array<{ id: string; data: Array<number | null> }>
-      for (const s of st.seriesById.values()) {
+      const it = ids ? ids : Array.from(st.seriesById.keys())
+      for (const id of it) {
+        const s = st.seriesById.get(id)
+        if (!s) continue
         // Only compute within range slice for speed.
         const i0 = lowerBound(s.xs, xMin)
         const i1 = upperBound(s.xs, xMax)
