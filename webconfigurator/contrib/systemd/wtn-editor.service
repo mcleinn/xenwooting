@@ -12,6 +12,15 @@ WorkingDirectory=/home/patch/wooting-xen/webconfigurator/server
 # Default is 3174; override with an EnvironmentFile or drop-in if needed.
 Environment=PORT=3174
 
+# Keep the web UI control-plane on tmpfs (/run). Xenwooting writes these files.
+Environment=XENWTN_RUNTIME_DIR=/run/xenwooting
+Environment=XENWTN_LIVE_STATE_PATH=/run/xenwooting/live.json
+Environment=XENWTN_PREVIEW_ENABLED_PATH=/run/xenwooting/preview.enabled
+Environment=XENWTN_PREVIEW_WTN_PATH=/run/xenwooting/preview.wtn
+Environment=XENWTN_TRAINER_MODE_PATH=/run/xenwooting/trainer.mode
+Environment=XENWTN_GUIDE_PATH=/run/xenwooting/guide.json
+Environment=XENWTN_HIGHLIGHT_PATH=/run/xenwooting/highlight.txt
+
 ExecStart=/usr/bin/node /home/patch/wooting-xen/webconfigurator/server/server.js
 Restart=always
 RestartSec=1

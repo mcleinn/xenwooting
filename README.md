@@ -59,6 +59,69 @@ xenwtn.local {
 
 Then use: `http://xenwtn.local/wtn/`
 
+## Setup: RAM Folder For Live HUD + Control Plane
+
+The web UI and the daemon exchange a few small state files (live HUD JSON, preview mapping, guide config, highlight requests).
+If those files live on an SD card / slow disk, occasional multi-second filesystem stalls can block the daemon's realtime loop and cause delayed MIDI NoteOffs ("stuck notes").
+
+To avoid that, XenWTN uses a tmpfs-backed folder (RAM) under `/run`:
+
+- Default runtime dir: `/run/xenwooting`
+- Live HUD file: `/run/xenwooting/live.json`
+
+### Recommended (systemd tmpfiles)
+
+Install the tmpfiles rule and create the folder:
+
+```bash
+sudo install -m 0644 xenwooting/contrib/tmpfiles.d/xenwooting.conf /etc/tmpfiles.d/xenwooting.conf
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/xenwooting.conf
+```
+
+This makes `/run/xenwooting` appear automatically on every boot.
+
+### Systemd Service Environment
+
+Both services should point at the same runtime dir (these are already set in the provided unit files):
+
+```ini
+Environment=XENWTN_RUNTIME_DIR=/run/xenwooting
+Environment=XENWTN_LIVE_STATE_PATH=/run/xenwooting/live.json
+Environment=XENWTN_PREVIEW_ENABLED_PATH=/run/xenwooting/preview.enabled
+Environment=XENWTN_PREVIEW_WTN_PATH=/run/xenwooting/preview.wtn
+Environment=XENWTN_TRAINER_MODE_PATH=/run/xenwooting/trainer.mode
+Environment=XENWTN_GUIDE_PATH=/run/xenwooting/guide.json
+Environment=XENWTN_HIGHLIGHT_PATH=/run/xenwooting/highlight.txt
+```
+
+Example: override just the runtime dir in a drop-in:
+
+```bash
+sudo systemctl edit xenwooting.service
+```
+
+```ini
+[Service]
+Environment=XENWTN_RUNTIME_DIR=/run/xenwooting
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart xenwooting.service wtn-editor.service
+```
+
+### Quick Test (no persistence)
+
+If you just want to test without installing tmpfiles:
+
+```bash
+sudo install -d -m 0755 -o patch -g patch /run/xenwooting
+```
+
+Note: this does not persist across reboot.
+
 ## Installation (High Level)
 
 This project is typically installed as three services:

@@ -12,6 +12,12 @@ sudo install -m 0755 "$ROOT_DIR/target/release/xenwooting" /usr/local/bin/xenwoo
 echo "Installing systemd unit"
 sudo install -m 0644 "$ROOT_DIR/contrib/systemd/xenwooting.service" /etc/systemd/system/xenwooting.service
 
+echo "Installing tmpfiles.d config for /run/xenwooting"
+sudo install -m 0644 "$ROOT_DIR/contrib/tmpfiles.d/xenwooting.conf" /etc/tmpfiles.d/xenwooting.conf
+
+echo "Creating /run/xenwooting via systemd-tmpfiles"
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/xenwooting.conf
+
 echo "Reloading systemd"
 sudo systemctl daemon-reload
 
