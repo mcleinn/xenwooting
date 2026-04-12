@@ -127,6 +127,7 @@ struct LiveMode {
     press_threshold: f32,
     aftertouch: String,
     aftertouch_speed_max: f32,
+    velocity_profile: String,
     octave_shift: i8,
     screensaver_active: bool,
     preview_enabled: bool,
@@ -300,6 +301,7 @@ impl LivePublisher {
         press_threshold_bits: &AtomicU32,
         aftertouch_mode: &AftertouchMode,
         aftertouch_speed_max: f32,
+        velocity_profile: &str,
         octave_shift: i8,
         screensaver_active: bool,
         preview_enabled: bool,
@@ -366,6 +368,7 @@ impl LivePublisher {
         hasher.write_u32(press_threshold.to_bits());
         hasher.write(aftertouch_mode.name().as_bytes());
         hasher.write_u32(aftertouch_speed_max.to_bits());
+        hasher.write(velocity_profile.as_bytes());
         hasher.write_i8(octave_shift);
         hasher.write_u8(if screensaver_active { 1 } else { 0 });
         hasher.write_u8(if preview_enabled { 1 } else { 0 });
@@ -425,6 +428,7 @@ impl LivePublisher {
                 press_threshold,
                 aftertouch: aftertouch_mode.name().to_string(),
                 aftertouch_speed_max,
+                velocity_profile: velocity_profile.to_string(),
                 octave_shift,
                 screensaver_active,
                 preview_enabled,
@@ -1033,6 +1037,22 @@ impl AlsaMidiOut {
         Ok(())
     }
 
+    fn send_pitchbend(&mut self, ch: u8, bend: i32) -> Result<()> {
+        let ev = EvCtrl {
+            channel: ch,
+            param: 0,
+            value: bend.clamp(-8192, 8191),
+        };
+        let mut e = Event::new(EventType::Pitchbend, &ev);
+        e.set_source(self.port);
+        e.set_subs();
+        e.set_direct();
+        self.seq
+            .event_output_direct(&mut e)
+            .context("Failed to output ALSA pitchbend event")?;
+        Ok(())
+    }
+
     fn panic_all(&mut self) {
         for ch in 0..16u8 {
             // Sustain off
@@ -1042,6 +1062,15 @@ impl AlsaMidiOut {
             // All notes off
             let _ = self.send_cc(ch, 123, 0);
         }
+    }
+}
+
+fn bend_from_amounts(up_amt: f32, down_amt: f32) -> i32 {
+    let x = (up_amt - down_amt).clamp(-1.0, 1.0);
+    if x >= 0.0 {
+        (x * 8191.0).round().clamp(0.0, 8191.0) as i32
+    } else {
+        (x * 8192.0).round().clamp(-8192.0, 0.0) as i32
     }
 }
 
@@ -1748,6 +1777,15 @@ fn main() -> Result<()> {
     }
     for h in actions_by_hid.keys() {
         capture_skip_hids.insert(h.clone());
+    }
+    // Some keyboards emit arrows on an Fn layer for control-bar keys.
+    // Treat these as non-musical as well.
+    for h in [
+        HIDCodes::ArrowLeft,
+        HIDCodes::ArrowDown,
+        HIDCodes::ArrowRight,
+    ] {
+        capture_skip_hids.insert(h);
     }
 
     let highlight_rgb = parse_hex_rgb(&cfg.rgb.highlight_hex).unwrap_or((255, 255, 255));
@@ -2980,6 +3018,12 @@ fn main() -> Result<()> {
     // We use this to avoid spamming duplicate polytouch values; capture logs reflect sends.
     let mut last_aftertouch_sent_by_key: HashMap<(u64, HIDCodes), u8> = HashMap::new();
 
+    // Per-device pitchbend keys (control bar). These use the analog travel of the pitchbend keys
+    // to drive channel pitchbend, scoped to channels used by that device's board.
+    let mut bend_up_amt_by_device: HashMap<u64, f32> = HashMap::new();
+    let mut bend_down_amt_by_device: HashMap<u64, f32> = HashMap::new();
+    let mut last_pb_by_dev_ch: HashMap<(u64, u8), i32> = HashMap::new();
+
     // Live HUD state published for /wtn/live.
     let live_state_path = env_path_buf("XENWTN_LIVE_STATE_PATH", rt_dir.join("live.json"));
     let live_writer = LiveWriter::new(live_state_path.clone());
@@ -3086,6 +3130,7 @@ fn main() -> Result<()> {
     };
 
     // Publish an initial live state so /wtn/live can load immediately.
+    let vel_name0 = velocity_profiles[velocity_profile_idx].name();
     live_pub.maybe_publish(
         &live_writer,
         &wtn,
@@ -3094,6 +3139,7 @@ fn main() -> Result<()> {
         press_threshold_bits.as_ref(),
         &aftertouch_mode,
         aftertouch_speed_max,
+        &vel_name0,
         octave_shift,
         screensaver_active,
         preview_enabled,
@@ -3110,6 +3156,7 @@ fn main() -> Result<()> {
     while RUNNING.load(Ordering::SeqCst) {
         // Publish live HUD only when dirty.
         let live_t0 = Instant::now();
+        let vel_name = velocity_profiles[velocity_profile_idx].name();
         live_pub.maybe_publish(
             &live_writer,
             &wtn,
@@ -3118,6 +3165,7 @@ fn main() -> Result<()> {
             press_threshold_bits.as_ref(),
             &aftertouch_mode,
             aftertouch_speed_max,
+            &vel_name,
             octave_shift,
             screensaver_active,
             preview_enabled,
@@ -3908,6 +3956,8 @@ fn main() -> Result<()> {
 
             let key_id = (device_id, hid.clone());
 
+            // No-op: pitchbend keys are digital (control bar).
+
             // Track processing lag relative to the edge timestamp.
             edge_cnt += 1;
             if kind == "update" {
@@ -4294,13 +4344,82 @@ fn main() -> Result<()> {
             let wtn_board = bcfg.wtn_board;
             let rotation = bcfg.rotation_deg;
 
-            let is_control_bar = control_bar_cols_by_hid.contains_key(&hid);
+            // Some Fn-layer keys emit arrow HID codes; treat those as control-bar keys and map
+            // their LED flash to the right-side control bar keys.
+            let (is_control_bar, control_bar_led_hid, control_bar_flash_rgb) = match hid {
+                HIDCodes::ArrowLeft => (true, Some(HIDCodes::RightAlt), Some((0, 255, 255))),
+                HIDCodes::ArrowDown => (true, Some(HIDCodes::ContextMenu), Some((0, 255, 255))),
+                HIDCodes::ArrowRight => (true, Some(HIDCodes::RightCtrl), Some((0, 255, 255))),
+                _ => {
+                    if control_bar_cols_by_hid.contains_key(&hid) {
+                        (true, Some(hid.clone()), None)
+                    } else {
+                        (false, None, None)
+                    }
+                }
+            };
 
-            // Runtime press threshold can be adjusted with control-bar keys.
+            // Pitchbend keys:
+            // LeftCtrl = bend up, LeftAlt = bend down.
+            // Use analog position (including update edges) for continuous bend.
+            if hid == HIDCodes::LeftCtrl || hid == HIDCodes::LeftAlt {
+                let is_up = hid == HIDCodes::LeftCtrl;
+                if kind == "down" || kind == "update" {
+                    let a = analog.clamp(0.0, 1.0);
+                    if is_up {
+                        bend_up_amt_by_device.insert(device_id, a);
+                    } else {
+                        bend_down_amt_by_device.insert(device_id, a);
+                    }
+                } else if kind == "up" {
+                    if is_up {
+                        bend_up_amt_by_device.remove(&device_id);
+                    } else {
+                        bend_down_amt_by_device.remove(&device_id);
+                    }
+                }
+
+                // Apply bend to all channels used by this board.
+                // This assumes boards use disjoint MIDI channels if you want per-board isolation.
+                let up_amt = bend_up_amt_by_device
+                    .get(&device_id)
+                    .copied()
+                    .unwrap_or(0.0);
+                let down_amt = bend_down_amt_by_device
+                    .get(&device_id)
+                    .copied()
+                    .unwrap_or(0.0);
+                let bend = bend_from_amounts(up_amt, down_amt);
+
+                let hold_i16 = if octave_hold_by_device.contains(&device_id) {
+                    1i16
+                } else {
+                    0i16
+                };
+                let mut chans: HashSet<u8> = HashSet::new();
+                for idx in 0..(4u8 * 14u8) {
+                    if let Some(cell) = wtn.cell(wtn_board, idx as usize) {
+                        let base_ch = cell.chan_1based.saturating_sub(1);
+                        let shifted = (base_ch as i16) + (octave_shift as i16) + hold_i16;
+                        chans.insert(shifted.clamp(0, 15) as u8);
+                    }
+                }
+
+                for ch in chans {
+                    let k = (device_id, ch);
+                    let last = last_pb_by_dev_ch.get(&k).copied().unwrap_or(i32::MIN);
+                    if last != bend {
+                        let _ = midi_out.send_pitchbend(ch, bend);
+                        last_pb_by_dev_ch.insert(k, bend);
+                    }
+                }
+            }
+
+            // Runtime press threshold can be adjusted with Fn-layer arrow keys.
             // These keys never generate notes.
             if kind == "down" {
                 match hid {
-                    HIDCodes::LeftCtrl => {
+                    HIDCodes::ArrowLeft => {
                         if matches!(aftertouch_mode, AftertouchMode::Off) {
                             manual_press_threshold = (manual_press_threshold
                                 - cfg.press_threshold_step)
@@ -4315,9 +4434,9 @@ fn main() -> Result<()> {
                             info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
                         }
                         live_pub.mark_mode_dirty();
-                        continue;
+                        // Fall through to control-bar LED feedback.
                     }
-                    HIDCodes::RightCtrl => {
+                    HIDCodes::ArrowRight => {
                         if matches!(aftertouch_mode, AftertouchMode::Off) {
                             manual_press_threshold = (manual_press_threshold
                                 + cfg.press_threshold_step)
@@ -4332,16 +4451,16 @@ fn main() -> Result<()> {
                             info!("aftertouch_speed_max now {:.2}", aftertouch_speed_max);
                         }
                         live_pub.mark_mode_dirty();
-                        continue;
+                        // Fall through to control-bar LED feedback.
                     }
-                    HIDCodes::LeftAlt => {
+                    HIDCodes::ArrowDown => {
                         velocity_profile_idx = (velocity_profile_idx + 1) % velocity_profiles.len();
                         info!(
                             "velocity_profile now {}",
                             velocity_profiles[velocity_profile_idx].name()
                         );
                         live_pub.mark_mode_dirty();
-                        continue;
+                        // Fall through to control-bar LED feedback.
                     }
                     HIDCodes::RightAlt => {
                         // Debounce: ignore rapid re-triggers (common due to analog threshold bounce).
@@ -4449,8 +4568,8 @@ fn main() -> Result<()> {
                 .unwrap_or(255);
             let mut lrow_dbg: Option<u8> = None;
             let mut lcol_dbg: Option<String> = None;
-            if is_control_bar {
-                if let Some(cs) = control_bar_cols_by_hid.get(&hid) {
+            if let Some(led_hid) = control_bar_led_hid.as_ref() {
+                if let Some(cs) = control_bar_cols_by_hid.get(led_hid) {
                     lrow_dbg = Some(control_bar_row);
                     lcol_dbg = Some(
                         cs.iter()
@@ -4500,8 +4619,12 @@ fn main() -> Result<()> {
                 let Some(&dev_idx) = rgb_index_by_device_id.get(&device_id) else {
                     continue;
                 };
-                if let Some(cols) = control_bar_cols_by_hid.get(&hid) {
+                let Some(led_hid) = control_bar_led_hid.as_ref() else {
+                    continue;
+                };
+                if let Some(cols) = control_bar_cols_by_hid.get(led_hid) {
                     if kind == "down" {
+                        let flash_rgb = control_bar_flash_rgb.unwrap_or(highlight_rgb);
                         for &lc in cols {
                             try_send_drop(
                                 &rgb_tx,
@@ -4509,7 +4632,7 @@ fn main() -> Result<()> {
                                     device_index: dev_idx,
                                     row: control_bar_row,
                                     col: lc,
-                                    rgb: highlight_rgb,
+                                    rgb: flash_rgb,
                                 }),
                             );
                         }
@@ -4920,6 +5043,8 @@ fn main() -> Result<()> {
                                 led,
                             },
                         );
+
+                        // NoteOn pitchbend is applied in the NoteOn tick (below).
                     } else if kind == "update" {
                         if log_edges {
                             dbg_push(
@@ -5133,6 +5258,7 @@ fn main() -> Result<()> {
                                 *cnt -= 1;
                             } else {
                                 note_on_count.remove(&(ch, note0));
+
                                 match midi_out.send_note(false, ch, note0, 0) {
                                     Ok(()) => {
                                         dbg_push(
@@ -5592,7 +5718,21 @@ fn main() -> Result<()> {
                             AftertouchMode::Off => 0,
                         };
 
+                        // No continuous per-key pitchbend: pitchbend is driven by dedicated control keys.
+
                         if !playing {
+                            // Apply current per-device channel pitchbend before NoteOn.
+                            let up_amt = bend_up_amt_by_device.get(&key.0).copied().unwrap_or(0.0);
+                            let down_amt =
+                                bend_down_amt_by_device.get(&key.0).copied().unwrap_or(0.0);
+                            let bend: i32 = bend_from_amounts(up_amt, down_amt);
+                            let kpb = (key.0, out_ch);
+                            let last = last_pb_by_dev_ch.get(&kpb).copied().unwrap_or(i32::MIN);
+                            if last != bend {
+                                let _ = midi_out.send_pitchbend(out_ch, bend);
+                                last_pb_by_dev_ch.insert(kpb, bend);
+                            }
+
                             let noteon_ok = match midi_out.send_note(true, out_ch, note, vel) {
                                 Ok(()) => true,
                                 Err(e) => {
