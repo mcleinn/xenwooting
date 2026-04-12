@@ -1440,6 +1440,8 @@ fn write_default_config(path: &Path) -> Result<()> {
                 mirror_cols: false,
                 meta_x: 0,
                 meta_y: 5,
+                cc_analog_hid: None,
+                cc_analog_cc: None,
             },
             xenwooting::config::BoardConfig {
                 device_id: None,
@@ -1448,6 +1450,8 @@ fn write_default_config(path: &Path) -> Result<()> {
                 mirror_cols: false,
                 meta_x: 2,
                 meta_y: 0,
+                cc_analog_hid: None,
+                cc_analog_cc: None,
             },
         ],
         layouts: vec![],
@@ -1763,6 +1767,20 @@ fn main() -> Result<()> {
         actions_by_hid.insert(hid, action.clone());
     }
 
+    // Per-board analog-CC key: device_id -> (HID code, CC number).
+    // Defaults come from BoardConfig::cc_analog(): wtn_board 0 -> CC#4, 1 -> CC#3.
+    let mut cc_analog_by_device: HashMap<u64, (HIDCodes, u8)> = HashMap::new();
+    for bcfg in cfg.boards.iter() {
+        let Some((hid_name, cc)) = bcfg.cc_analog() else {
+            continue;
+        };
+        let Some(dev_id) = bcfg.device_id_u64()? else {
+            continue;
+        };
+        let hid = parse_hid_name(&hid_name)?;
+        cc_analog_by_device.insert(dev_id, (hid, cc));
+    }
+
     let control_bar_row = cfg.control_bar.row;
     let mut control_bar_cols_by_hid: HashMap<HIDCodes, Vec<u8>> = HashMap::new();
     for (hid_name, cols) in cfg.control_bar.led_cols_by_hid.iter() {
@@ -1776,6 +1794,9 @@ fn main() -> Result<()> {
         capture_skip_hids.insert(h.clone());
     }
     for h in actions_by_hid.keys() {
+        capture_skip_hids.insert(h.clone());
+    }
+    for (h, _) in cc_analog_by_device.values() {
         capture_skip_hids.insert(h.clone());
     }
     // Some keyboards emit arrows on an Fn layer for control-bar keys.
@@ -3023,6 +3044,9 @@ fn main() -> Result<()> {
     let mut bend_up_amt_by_device: HashMap<u64, f32> = HashMap::new();
     let mut bend_down_amt_by_device: HashMap<u64, f32> = HashMap::new();
     let mut last_pb_by_dev_ch: HashMap<(u64, u8), i32> = HashMap::new();
+
+    // Per-board analog-CC last-sent dedup map. Uses u8::MAX as "never sent" sentinel.
+    let mut last_cc_analog_by_dev_ch: HashMap<(u64, u8), u8> = HashMap::new();
 
     // Live HUD state published for /wtn/live.
     let live_state_path = env_path_buf("XENWTN_LIVE_STATE_PATH", rt_dir.join("live.json"));
@@ -4411,6 +4435,49 @@ fn main() -> Result<()> {
                     if last != bend {
                         let _ = midi_out.send_pitchbend(ch, bend);
                         last_pb_by_dev_ch.insert(k, bend);
+                    }
+                }
+            }
+
+            // Per-board analog CC from a control-bar key (e.g., LeftMeta -> CC#4 on board0, CC#3 on board1).
+            if let Some((cc_hid, cc_num)) = cc_analog_by_device.get(&device_id) {
+                if &hid == cc_hid {
+                    let hold_i16 = if octave_hold_by_device.contains(&device_id) {
+                        1i16
+                    } else {
+                        0i16
+                    };
+                    let mut chans: HashSet<u8> = HashSet::new();
+                    for idx in 0..(4u8 * 14u8) {
+                        if let Some(cell) = wtn.cell(wtn_board, idx as usize) {
+                            let base_ch = cell.chan_1based.saturating_sub(1);
+                            let shifted = (base_ch as i16) + (octave_shift as i16) + hold_i16;
+                            chans.insert(shifted.clamp(0, 15) as u8);
+                        }
+                    }
+
+                    let value: u8 = if kind == "up" {
+                        0
+                    } else {
+                        (analog.clamp(0.0, 1.0) * 127.0).round() as u8
+                    };
+
+                    for ch in &chans {
+                        let k = (device_id, *ch);
+                        let last = last_cc_analog_by_dev_ch
+                            .get(&k)
+                            .copied()
+                            .unwrap_or(u8::MAX);
+                        if last != value {
+                            let _ = midi_out.send_cc(*ch, *cc_num as u32, value);
+                            last_cc_analog_by_dev_ch.insert(k, value);
+                        }
+                    }
+
+                    if kind == "up" {
+                        for ch in 0u8..16u8 {
+                            last_cc_analog_by_dev_ch.remove(&(device_id, ch));
+                        }
                     }
                 }
             }

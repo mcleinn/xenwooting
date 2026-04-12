@@ -232,6 +232,16 @@ pub struct BoardConfig {
     pub meta_x: i32,
     #[serde(default)]
     pub meta_y: i32,
+
+    /// HID key on this board that drives analog MIDI CC output (e.g. "LeftMeta").
+    /// If unset, defaults to "LeftMeta" when a cc_analog_cc default applies for this wtn_board.
+    #[serde(default)]
+    pub cc_analog_hid: Option<String>,
+
+    /// MIDI CC number (0..127) to send from cc_analog_hid scaled by the key's analog depth.
+    /// If unset, defaults per wtn_board: 0 -> 4, 1 -> 3; other boards disabled unless set.
+    #[serde(default)]
+    pub cc_analog_cc: Option<u8>,
 }
 
 impl BoardConfig {
@@ -244,6 +254,20 @@ impl BoardConfig {
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid device_id '{}': {}", s, e))?;
         Ok(Some(id))
+    }
+
+    pub fn cc_analog(&self) -> Option<(String, u8)> {
+        let default_cc: Option<u8> = match self.wtn_board {
+            0 => Some(4),
+            1 => Some(3),
+            _ => None,
+        };
+        let cc = self.cc_analog_cc.or(default_cc)?;
+        let hid = self
+            .cc_analog_hid
+            .clone()
+            .unwrap_or_else(|| "LeftMeta".to_string());
+        Some((hid, cc))
     }
 }
 
@@ -282,7 +306,6 @@ impl ActionBindings {
         // NOTE: HIDCodes does not include a dedicated "Fn" key. On some layouts the physical
         // key labeled Fn may present as another HID code (often RightAlt/RightMeta/etc.).
         // Treat these as defaults only; override in config after you confirm what your device emits.
-        by_action.insert("layout_prev".to_string(), "RightCtrl".to_string());
         by_action.insert("layout_next".to_string(), "RightAlt".to_string());
         by_action.insert("octave_down".to_string(), "LeftAlt".to_string());
         by_action.insert("octave_up".to_string(), "ContextMenu".to_string());
